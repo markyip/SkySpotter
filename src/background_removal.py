@@ -35,7 +35,7 @@ class BackgroundRemover:
             self._ensure_model()
             try:
                 import onnxruntime as ort
-                providers = ['CUDAExecutionProvider', 'DmlExecutionProvider', 'CPUExecutionProvider']
+                providers = ['CoreMLExecutionProvider', 'CUDAExecutionProvider', 'TensorrtExecutionProvider', 'DmlExecutionProvider', 'CPUExecutionProvider']
                 available_providers = ort.get_available_providers()
                 selected = [p for p in providers if p in available_providers]
                 self.session = ort.InferenceSession(self.model_path, providers=selected)

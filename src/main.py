@@ -6173,6 +6173,23 @@ class RAWImageViewer(QMainWindow):
         self.search_bottom_button.hide()
         left_buttons_layout.addWidget(self.search_bottom_button, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
 
+        self.auto_sort_bottom_button = QPushButton()
+        self.auto_sort_bottom_button.setFlat(True)
+        self.auto_sort_bottom_button.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        if qta is not None:
+            try:
+                self.auto_sort_bottom_button.setIcon(qta.icon("fa5s.magic", color="#B0B0B0"))
+                self.auto_sort_bottom_button.setIconSize(QSize(20, 20))
+            except Exception:
+                self.auto_sort_bottom_button.setText("Auto-Sort")
+        else:
+            self.auto_sort_bottom_button.setText("Auto-Sort")
+        self.auto_sort_bottom_button.setStyleSheet(bottom_icon_btn_style)
+        self.auto_sort_bottom_button.clicked.connect(self._on_auto_sort_clicked)
+        self.auto_sort_bottom_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.auto_sort_bottom_button.hide()
+        left_buttons_layout.addWidget(self.auto_sort_bottom_button, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
+
         # Search panel: expands from search button (gallery mode only)
         self.search_expand_container = QWidget()
         self.search_expand_container.setSizePolicy(
@@ -6832,6 +6849,106 @@ class RAWImageViewer(QMainWindow):
         self._gallery_search_user_collapsed_while_busy = False
         self.status_bar.showMessage(f"Semantic model download failed: {error_msg}", 7000)
 
+class AutoSortWorkerSignals(QObject):
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+
+class AutoSortWorker(QRunnable):
+    def __init__(self, folder_path, image_files, extensions):
+        super().__init__()
+        self.folder_path = folder_path
+        self.image_files = image_files
+        self.extensions = extensions
+        self.signals = AutoSortWorkerSignals()
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        try:
+            import os
+            import shutil
+            from semantic_search import MilitaryAircraftClassifier
+            import logging
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            logger = logging.getLogger(__name__)
+
+            classifier = MilitaryAircraftClassifier()
+            total = len(self.image_files)
+            completed = 0
+
+            def process_image(fp):
+                if self._is_cancelled:
+                    return None
+                try:
+                    pred_str, conf, _ = classifier.classify(fp)
+                    if pred_str and pred_str != "Unknown":
+                        target_dir = os.path.join(self.folder_path, pred_str)
+                        os.makedirs(target_dir, exist_ok=True)
+                        target_path = os.path.join(target_dir, os.path.basename(fp))
+                        
+                        base, ext = os.path.splitext(os.path.basename(fp))
+                        counter = 1
+                        while os.path.exists(target_path):
+                            target_path = os.path.join(target_dir, f"{base}_{counter}{ext}")
+                            counter += 1
+                            
+                        shutil.move(fp, target_path)
+                    return True
+                except Exception as e:
+                    logger.error(f"Failed to auto-sort {fp}: {e}")
+                    return False
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [executor.submit(process_image, fp) for fp in self.image_files]
+                for future in as_completed(futures):
+                    if self._is_cancelled:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
+                    completed += 1
+                    self.signals.progress.emit(completed, total)
+
+            self.signals.finished.emit()
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
+    def _on_auto_sort_clicked(self):
+        if not self.current_folder or not self.image_files:
+            return
+        
+        reply = QMessageBox.question(self, 'Auto-Sort Aircraft', 
+            f"This will classify and move {len(self.image_files)} images into subfolders based on aircraft model.\\n\\nThis process takes roughly 1 second per image. Proceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+            
+        if reply == QMessageBox.StandardButton.No:
+            return
+
+        self._hide_all_loading_indicators()
+        self.loading_overlay.show_loading(f"Auto-sorting 0/{len(self.image_files)} images...")
+        self.loading_overlay.show()
+
+        self._auto_sort_worker = AutoSortWorker(self.current_folder, list(self.image_files), self.get_supported_extensions())
+        self._auto_sort_worker.signals.progress.connect(self._on_auto_sort_progress)
+        self._auto_sort_worker.signals.finished.connect(self._on_auto_sort_finished)
+        self._auto_sort_worker.signals.error.connect(self._on_auto_sort_error)
+        QThreadPool.globalInstance().start(self._auto_sort_worker)
+
+    def _on_auto_sort_progress(self, current, total):
+        if hasattr(self, 'loading_overlay') and self.loading_overlay:
+            self.loading_overlay.show_loading(f"Auto-sorting {current}/{total} images...")
+
+    def _on_auto_sort_finished(self):
+        self._hide_all_loading_indicators()
+        QMessageBox.information(self, "Success", "Auto-Sort completed successfully!")
+        if self.current_folder:
+            self.load_folder_images(self.current_folder, start_view='gallery')
+
+    def _on_auto_sort_error(self, err):
+        self._hide_all_loading_indicators()
+        self.show_error("Auto-Sort Error", f"An error occurred: {err}")
+
     def _on_search_bottom_clicked(self):
         if getattr(self, "view_mode", "single") != "gallery":
             return
@@ -7224,6 +7341,8 @@ class RAWImageViewer(QMainWindow):
             self.view_mode_button.show()
         if hasattr(self, "search_bottom_button"):
             self.search_bottom_button.hide()
+        if hasattr(self, "auto_sort_bottom_button"):
+            self.auto_sort_bottom_button.hide()
         if hasattr(self, "search_expand_container") and self.search_expand_container:
             self.search_expand_container.hide()
         # Update icon if using qtawesome
@@ -7422,6 +7541,8 @@ class RAWImageViewer(QMainWindow):
             self.sort_toggle_button.show()
         if hasattr(self, "search_bottom_button"):
             self.search_bottom_button.show()
+        if hasattr(self, "auto_sort_bottom_button"):
+            self.auto_sort_bottom_button.show()
         # Restore search panel state
         if hasattr(self, "search_expand_container") and self.search_expand_container:
             expanded = getattr(self, "_search_panel_expanded", False)
@@ -14147,23 +14268,38 @@ class RAWImageViewer(QMainWindow):
                     self_inner.start_view = start_view
                     self_inner.signals = signals
 
-                def _scan_top_level_only(self_inner, path):
-                    """List image files in path only; do not descend into subfolders."""
-                    with os.scandir(path) as it:
-                        for entry in it:
-                            if entry.name.startswith('.'):
-                                continue
-                            try:
-                                if not entry.is_file(follow_symlinks=False):
+                def _scan_up_to_1_level_deep(self_inner, path):
+                    """List image files in path and immediate subfolders (1 level deep)."""
+                    try:
+                        with os.scandir(path) as it:
+                            for entry in it:
+                                if entry.name.startswith('.'):
                                     continue
-                                ext = os.path.splitext(entry.name)[1].lower()
-                                if ext not in self_inner.extensions:
+                                try:
+                                    if entry.is_dir(follow_symlinks=False):
+                                        try:
+                                            with os.scandir(entry.path) as sub_it:
+                                                for sub_entry in sub_it:
+                                                    if sub_entry.name.startswith('.'):
+                                                        continue
+                                                    if sub_entry.is_file(follow_symlinks=False):
+                                                        ext = os.path.splitext(sub_entry.name)[1].lower()
+                                                        if ext in self_inner.extensions:
+                                                            stat = sub_entry.stat()
+                                                            if stat.st_size > 0:
+                                                                yield sub_entry.path, stat
+                                        except (OSError, PermissionError):
+                                            pass
+                                    elif entry.is_file(follow_symlinks=False):
+                                        ext = os.path.splitext(entry.name)[1].lower()
+                                        if ext in self_inner.extensions:
+                                            stat = entry.stat()
+                                            if stat.st_size > 0:
+                                                yield entry.path, stat
+                                except (OSError, PermissionError):
                                     continue
-                                stat = entry.stat()
-                                if stat.st_size > 0:
-                                    yield entry.path, stat
-                            except (OSError, PermissionError):
-                                continue
+                    except (OSError, PermissionError):
+                        pass
 
                 def run(self_inner):
                     import time
@@ -14173,7 +14309,7 @@ class RAWImageViewer(QMainWindow):
                         image_files = []
                         file_stats = {}
                         seen_paths = set()
-                        for full_path, stat_info in self_inner._scan_top_level_only(
+                        for full_path, stat_info in self_inner._scan_up_to_1_level_deep(
                             self_inner.folder_path
                         ):
                             ap = os.path.abspath(full_path)

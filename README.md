@@ -1,11 +1,11 @@
-# RAWviewer v2.0.1
+# SkySpotter v2.0.1 (Aviation Specialist Edition)
 
 <p align="center">
-  <img src="icons/appicon.ico" alt="RAWviewer Icon" width="256">
+  <img src="icons/appicon.ico" alt="SkySpotter Icon" width="256">
 </p>
 
 ![Version](https://img.shields.io/badge/version-2.0.1-blue)
-![Downloads](https://img.shields.io/github/downloads/markyip/RAWviewer/total) 
+![Downloads](https://img.shields.io/github/downloads/markyip/SkySpotter/total) 
 ![License](https://img.shields.io/badge/license-MIT-green)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-orange?logo=buy-me-a-coffee)](https://www.buymeacoffee.com/markyip)
 
@@ -19,9 +19,9 @@ You're an aviation photographer who just returned from RIAT or spent a day at th
   - You have to zoom in manually to check sharpness.
   - There's no easy way to filter out blurry images.
 
-I've been there myself — I still haven't finished editing my **500GB of RIAT 2024 photos** because of how tedious this process is. That frustration is exactly what inspired me to build **RAWviewer**.
+I've been there myself — I still haven't finished editing my **500GB of RIAT 2024 photos** because of how tedious this process is. That frustration is exactly what inspired me to build **SkySpotter**.
 
-RAWviewer is a lightweight, focused image viewer built specifically for photographers who shoot a lot — especially in aviation, wildlife, or sports.
+SkySpotter is a lightweight, focused image viewer built specifically for photographers who shoot a lot — especially in aviation, wildlife, or sports.
 
 - Instant file previewing: No import steps — just drag & drop.
 - Zoom in with a single key to check sharpness immediately.
@@ -31,8 +31,8 @@ RAWviewer is a lightweight, focused image viewer built specifically for photogra
 
 This is a **pre-filtering tool**, letting you go through hundreds of RAW files efficiently **before** committing to editing them in Lightroom or Photoshop.
 
-## 🔍 What is RAWviewer?
-**RAWviewer** is a fast, modern, cross-platform image viewer for Windows and macOS, built with PyQt6. It supports advanced zooming, panning, and direct file association, allowing RAW files to be opened with a double-click.
+## 🔍 What is SkySpotter?
+**SkySpotter** is a fast, modern, cross-platform image viewer for Windows and macOS, built with PyQt6. It supports advanced zooming, panning, and direct file association, allowing RAW files to be opened with a double-click.
 
 ## ✨ Features
 
@@ -41,7 +41,7 @@ This is a **pre-filtering tool**, letting you go through hundreds of RAW files e
 - **High-Fidelity Thumbnails**: Uses high-quality **LANCZOS resampling** and **2x oversampling** for crystal-clear previews on Retina and 4K displays.
 - **Smart Prefetching**: Predictively loads relevant images in the background for zero-latency navigation
 - **Memory-First Cache (Default)**: Uses fast in-memory caching by default with no disk/SQLite writes
-- **Optional Persistent Cache**: Set `RAWVIEWER_PERSISTENT_CACHE=1` to re-enable disk/SQLite cache persistence
+- **Optional Persistent Cache**: Set `SKYSPOTTER_PERSISTENT_CACHE=1` to re-enable disk/SQLite cache persistence
 - **Gallery View**: Justified grid layout with virtualized rendering, EXIF-aware ordering, and current-image positioning
 - **Gallery search (macOS + Core ML bundle)**: Free-text semantic ranking plus structured metadata filters (`camera:`, ISO, GPS, **`format:`** / **`ext:`**, and more — see README table below)
 - **Wide RAW format support**: Canon (CR2, CR3), Nikon (NEF), Sony (ARW), Adobe DNG, and many more
@@ -66,18 +66,18 @@ This is a **pre-filtering tool**, letting you go through hundreds of RAW files e
 ### Download Executable
 
 #### Windows
-1. Download the latest release from the [Releases Page](https://github.com/markyip/RAWviewer/releases/latest)
-2. Download `RAWviewer.exe` directly (no zip extraction needed)
-3. Double-click `RAWviewer.exe` to launch
+1. Download the latest release from the [Releases Page](https://github.com/markyip/SkySpotter/releases/latest)
+2. Download `SkySpotter.exe` directly (no zip extraction needed)
+3. Double-click `SkySpotter.exe` to launch
 4. **Optional**: Create a desktop shortcut or pin to taskbar
 
 #### macOS
-1. Download the latest release from the [Releases Page](https://github.com/markyip/RAWviewer/releases/latest)
-2. Download and extract `RAWviewer-v2.0.1-macOS.zip`
-3. Drag `RAWviewer.app` to your **Applications** folder.
+1. Download the latest release from the [Releases Page](https://github.com/markyip/SkySpotter/releases/latest)
+2. Download and extract `SkySpotter-v2.0.1-macOS.zip`
+3. Drag `SkySpotter.app` to your **Applications** folder.
 4. **CRITICAL FIRST STEP:** Because this is an open-source app not signed via the paid Apple Developer program, macOS Gatekeeper will incorrectly label it as "Damaged" or block it. **You must run this command in your Terminal once** to remove the download quarantine flag:
    ```bash
-   xattr -cr /Applications/RAWviewer.app
+   xattr -cr /Applications/SkySpotter.app
    ```
 5. You can now double-click to launch it normally from Applications or Launchpad!
 
@@ -117,7 +117,7 @@ Separate tokens with spaces. Filters use `key:value` or comparison forms.
 | Date prefix | `date:2024-05` |
 | GPS / faces | `has:gps` · `no:gps` · `has:face` · `people` · `person` · `no:face` |
 
-Optional: **stronger semantic models** (advanced). The app bundle uses **MobileCLIP2-S0** for speed and size. From the same MobileCLIP2 family, **S2** or **B** checkpoints usually score better on open-vocabulary retrieval at the cost of a larger Core ML package and slower indexing—export with `python scripts/export_mobileclip2_coreml.py --model MobileCLIP2-S2` (today’s `--for-app` flow names files `mobileclip2_s0_*`; you can replace those mlpackages after export or adjust filenames to match). You can also set environment variable **`RAWVIEWER_MOBILECLIP_VARIANT=s2`** to prefer Apple’s downloadable **MobileCLIP S2** Core ML models (a different architecture than MobileCLIP2, but often strong for general photo text queries).
+Optional: **stronger semantic models** (advanced). The app bundle uses **MobileCLIP2-S0** for speed and size. From the same MobileCLIP2 family, **S2** or **B** checkpoints usually score better on open-vocabulary retrieval at the cost of a larger Core ML package and slower indexing—export with `python scripts/export_mobileclip2_coreml.py --model MobileCLIP2-S2` (today’s `--for-app` flow names files `mobileclip2_s0_*`; you can replace those mlpackages after export or adjust filenames to match). You can also set environment variable **`SKYSPOTTER_MOBILECLIP_VARIANT=s2`** to prefer Apple’s downloadable **MobileCLIP S2** Core ML models (a different architecture than MobileCLIP2, but often strong for general photo text queries).
 
 Bundled macOS Core ML models are discovered automatically in common app/resource paths.  
 Both naming schemes are supported:
@@ -164,7 +164,7 @@ When focus/subject indicator is enabled (`F`):
 
 ## 🧠 Training a Custom Image Classifier (e.g., Bird Watching, Cars)
 
-RAWviewer is equipped with scripts that make it incredibly easy to train a custom image classifier on your own datasets (e.g., classifying bird species instead of aircraft).
+SkySpotter is equipped with scripts that make it incredibly easy to train a custom image classifier on your own datasets (e.g., classifying bird species instead of aircraft).
 
 1. **Organize Your Data**: Create a folder (e.g., `./CustomDataSet`) and inside it, create a subfolder for each class (e.g., `./CustomDataSet/Eagle/`, `./CustomDataSet/Sparrow/`). Place your training images inside their respective subfolders.
 2. **Background Removal (Highly Recommended)**: Training your model on images with backgrounds removed forces the model to learn the true shape of the subject rather than background context (e.g., blue skies vs. trees). You can use our `scripts/batch_bg_pipeline.py` to strip the backgrounds and tightly crop your images before training.
@@ -194,7 +194,7 @@ build_windows.bat
 **Option 2: Manual build**
 ```bash
 # Activate virtual environment (if using one)
-rawviewer_env\Scripts\activate
+skyspotter_env\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
@@ -227,16 +227,16 @@ All dependencies are listed in `requirements.txt`:
 
 ### Windows
 - **"Windows protected your PC"**: Click "More info" → "Run anyway"
-- **Antivirus warnings**: Add RAWviewer to your antivirus exclusions
+- **Antivirus warnings**: Add SkySpotter to your antivirus exclusions
 - **Performance issues**: Try running as administrator
 - **AttributeError with stdout**: This is normal for windowed builds - the application runs without a console window
 
 ### macOS
-- **"App is damaged and should be moved to the Trash" / "Apple could not verify RAWviewer is free of malware"**: 
+- **"App is damaged and should be moved to the Trash" / "Apple could not verify SkySpotter is free of malware"**: 
   - **Why it happens**: Apple heavily restricts apps downloaded outside the App Store that aren't signed with a paid developer certificate. On newer macOS versions (especially Apple Silicon M1/M2/M3), macOS breaks the app's ad-hoc signature and aggressively blocks opening it.
   - **The Fix (Fastest)**: Open your **Terminal** app and run the following command to remove the quarantine flag:
     ```bash
-    xattr -cr /Applications/RAWviewer.app
+    xattr -cr /Applications/SkySpotter.app
     ```
     *(Note: If you placed the app somewhere other than the Applications folder, update the path accordingly).*
 
@@ -249,40 +249,40 @@ If you are on macOS 12 or older, OR if you simply want to permanently bypass all
 1. **Install Python 3.10, 3.11, or 3.12** (We recommend the official installer from [python.org](https://www.python.org/downloads/macos/)).
 2. **Open Terminal** and run these commands to download and build:
    ```bash
-   git clone https://github.com/markyip/RAWviewer.git
-   cd RAWviewer
+   git clone https://github.com/markyip/SkySpotter.git
+   cd SkySpotter
    ./build_macos.sh
    ```
-This will automatically create a perfectly compatible, warning-free `RAWviewer.app` inside the `dist/` folder!
+This will automatically create a perfectly compatible, warning-free `SkySpotter.app` inside the `dist/` folder!
 
 #### 🔧 Local Build Troubleshooting
 - **Error: "No matching distribution found for pyexiv2"**
   - **Why it happens**: You are using an older version of Python (like macOS Monterey's default Python 3.9) on an Apple Silicon (M1/M2) Mac. `pyexiv2` does not provide pre-compiled packages for that specific combination.
   - **The Fix**: 
     1. Install a newer version of Python (e.g., Python 3.11).
-    2. **CRITICAL:** If you previously ran the build script, it created a virtual environment stuck on the old Python version. Delete it by running `rm -rf rawviewer_env`.
+    2. **CRITICAL:** If you previously ran the build script, it created a virtual environment stuck on the old Python version. Delete it by running `rm -rf skyspotter_env`.
     3. Re-run `./build_macos.sh` (If it still uses 3.9, explicitly point to your new Python, e.g., `/usr/local/bin/python3 ./build_macos.sh`).
 
 - **Error: Massive C++ compilation failures / PyQt6 missing wheels**
   - **Why it happens**: You are using a bleeding-edge version of Python (like Python 3.14). It takes the open-source community several months to build pre-compiled packages for brand-new Python versions. Without a wheel, the installer attempts to compile massive UI frameworks like PyQt6 from raw C++ source code, which usually fails.
-  - **The Fix**: Roll back to a widely supported "sweet spot" version like **Python 3.11** or **3.12**, where every single required library has highly stable, pre-compiled macOS packages ready to download instantly. Remember to delete your old `rawviewer_env` folder before rebuilding!
+  - **The Fix**: Roll back to a widely supported "sweet spot" version like **Python 3.11** or **3.12**, where every single required library has highly stable, pre-compiled macOS packages ready to download instantly. Remember to delete your old `skyspotter_env` folder before rebuilding!
 
 - **Homebrew delays on macOS 12 Monterey or older**: 
   - Homebrew has officially dropped "binary bottle" support for Monterey. However, **it still works**. When the build script attempts to `brew install inih gettext`, Homebrew will simply compile them from source on your machine. This is completely normal but may take 2-3 extra minutes.
 
 - **Permission Denied / Cannot Read Folder**: Modern macOS requires explicit permission for apps to access the Desktop or Documents. 
   1. Go to **System Settings** > **Privacy & Security** > **Full Disk Access**.
-  2. Click the **+** button and add `RAWviewer.app`.
+  2. Click the **+** button and add `SkySpotter.app`.
   3. Toggle it to **ON**.
 
 - **"Semantic search unavailable" / asks to download models even in packaged app**:
-  1. Open `RAWviewer.app/Contents/Resources/models/mobileclip2_coreml/`.
+  1. Open `SkySpotter.app/Contents/Resources/models/mobileclip2_coreml/`.
   2. Confirm either **S2** pair (`mobileclip_s2_*`) or **S0 app-export** pair (`mobileclip2_s0_*`) exists, plus `bpe_simple_vocab_16e6.txt.gz`.
   3. If missing, rebuild with `models/mobileclip2_coreml/` present before running `python build.py`.
 
 ## 🚧 Upcoming Features
 
-We're continuously working to improve RAWviewer. Here are some features planned for future releases:
+We're continuously working to improve SkySpotter. Here are some features planned for future releases:
 
 - **Batch Operations**: Select and process multiple images at once
 
@@ -296,7 +296,7 @@ We're continuously working to improve RAWviewer. Here are some features planned 
 
 ## 🏛️ Architecture
 
-RAWviewer uses a modern, optimized architecture:
+SkySpotter uses a modern, optimized architecture:
 
 - **ImageLoadManager**: Manages all image loading tasks using a thread pool and priority queue
 - **UnifiedImageProcessor**: Handles all image types (RAW, JPEG, TIFF, etc.) with a unified interface
@@ -322,8 +322,8 @@ If you encounter any issues:
 
 ## ☕ Thank You / Buy Me a Coffee
 
-If you find RAWviewer useful and it's become part of your workflow, feel free to **buy me a coffee** ☕ or chip in to help fund my **RIAT tickets for next year**
+If you find SkySpotter useful and it's become part of your workflow, feel free to **buy me a coffee** ☕ or chip in to help fund my **RIAT tickets for next year**
 
 ---
 
-**Enjoy viewing your RAW photos with RAWviewer!** 📸
+**Enjoy viewing your RAW photos with SkySpotter!** 📸

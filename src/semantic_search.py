@@ -658,6 +658,7 @@ class MobileCLIPONNXBackend:
         
         # Prioritize high-performance providers
         providers = [
+            "CoreMLExecutionProvider",
             "CUDAExecutionProvider", 
             "TensorrtExecutionProvider", 
             "DmlExecutionProvider", 
@@ -915,6 +916,7 @@ class MilitaryAircraftClassifier:
                 so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
                 # Prioritize high-performance providers: CUDA (NVIDIA), TensorRT, then DirectML (Windows Generic)
                 providers = [
+                    "CoreMLExecutionProvider",
                     "CUDAExecutionProvider", 
                     "TensorrtExecutionProvider", 
                     "DmlExecutionProvider", 
