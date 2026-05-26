@@ -14884,7 +14884,7 @@ def main():
 
             # Set application properties
             app.setApplicationName("SkySpotter")
-            app.setApplicationVersion("2.0.1")
+            app.setApplicationVersion("1.0.0")
 
             # Create and show main window
             safe_print("Creating RAWImageViewer...", flush=True)
