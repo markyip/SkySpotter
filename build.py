@@ -201,7 +201,6 @@ def install_dependencies():
         'pyqtgraph',  # Optional/Future dependency included in requirements.txt
         'reverse-geocoder',  # Offline city/country lookup from GPS EXIF
         'pycountry',         # ISO country code -> full country name
-        'onnxruntime',       # Cross-platform model execution (Aviation Specialist)
         'tokenizers',        # Lightweight tokenizer for SigLIP (Aviation Specialist)
         'sentencepiece',     # SigLIP tokenizer dependency
         'protobuf',          # ONNX/Transformers dependency
@@ -213,7 +212,9 @@ def install_dependencies():
         # Windows semantic backend will move to ONNX; keep sentence-transformers out of
         # the default macOS test build so PyTorch is not bundled.
         dependencies.append('sentence-transformers')
+        dependencies.append('onnxruntime-directml')
     elif system_name == "Darwin":
+        dependencies.append('onnxruntime-silicon')
         dependencies.append('huggingface-hub')
         dependencies.append('pyobjc-framework-CoreML')
         dependencies.append('pyobjc-framework-Quartz')
