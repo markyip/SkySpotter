@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import QWidget, QScrollArea, QLabel
 from PyQt6.QtCore import Qt, QTimer, QRect, QEvent, QSize
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QBrush, QColor, QFont, QTransform
 
-from rawviewer_ui.widgets import ThumbnailLabel, ImageLoaded
+from SkySpotter_ui.widgets import ThumbnailLabel, ImageLoaded
 from image_cache import LRUCache
 from image_load_manager import get_image_load_manager, Priority
 from common_image_loader import get_image_aspect_ratio, is_raw_file
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 def _focus_gallery_switch_logs() -> bool:
-    return os.environ.get("RAWVIEWER_FOCUS_GALLERY_SWITCH", "0").strip().lower() in {
+    return os.environ.get("SkySpotter_FOCUS_GALLERY_SWITCH", "0").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -931,6 +931,13 @@ class JustifiedGallery(QWidget):
                     w.setText("")
 
             w.show()
+            # Update Tooltip with AI detection info if available
+            meta = self._metadata_cache.get(path)
+            if meta and isinstance(meta, dict) and meta.get('detected_aircraft'):
+                w.setToolTip(f"AI: {meta.get('detected_aircraft')}")
+            else:
+                w.setToolTip(os.path.basename(path))
+
             thumb_missing = not cache_hit
             
             m = self._metadata_cache.get(path)

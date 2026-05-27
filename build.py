@@ -4,7 +4,7 @@ Build script for RAW Image Viewer Windows/macOS executable
 Handles dependency installation and executable creation.
 """
 
-VERSION = "2.0.1"
+VERSION = "1.0.0"
 
 import os
 import subprocess
@@ -12,6 +12,7 @@ import platform
 import shutil
 import time
 import sys
+import json
 from pathlib import Path
 
 # Repository root (directory containing this script)
@@ -20,8 +21,8 @@ REPO_ROOT = Path(__file__).resolve().parent
 
 def _project_venv_python() -> Path:
     if platform.system() == "Windows":
-        return REPO_ROOT / "rawviewer_env" / "Scripts" / "python.exe"
-    return REPO_ROOT / "rawviewer_env" / "bin" / "python3"
+        return REPO_ROOT / "SkySpotter_env" / "Scripts" / "python.exe"
+    return REPO_ROOT / "SkySpotter_env" / "bin" / "python3"
 
 
 def _running_inside_project_venv() -> bool:
@@ -38,14 +39,14 @@ def _is_externally_managed_python() -> bool:
 
 def _should_use_project_venv_for_build() -> bool:
     """
-    Prefer ./rawviewer_env so ``pip install`` / PyInstaller do not hit system Python limits.
+    Prefer ./SkySpotter_env so ``pip install`` / PyInstaller do not hit system Python limits.
 
     - macOS: always (matches ``build_macos.sh``; Homebrew 3.14 may block pip without an
       ``EXTERNALLY-MANAGED`` file under ``sys.prefix``).
     - Linux: when PEP 668 marker is present.
-    Set ``RAWVIEWER_USE_SYSTEM_PYTHON_BUILD=1`` to skip and use the current interpreter.
+    Set ``SkySpotter_USE_SYSTEM_PYTHON_BUILD=1`` to skip and use the current interpreter.
     """
-    if os.environ.get("RAWVIEWER_USE_SYSTEM_PYTHON_BUILD", "").strip().lower() in (
+    if os.environ.get("SkySpotter_USE_SYSTEM_PYTHON_BUILD", "").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -62,25 +63,25 @@ def _should_use_project_venv_for_build() -> bool:
 
 def ensure_project_venv_and_reexec() -> None:
     """
-    Create ./rawviewer_env if needed and re-exec this script with that interpreter.
+    Create ./SkySpotter_env if needed and re-exec this script with that interpreter.
 
-    Skips when already using ./rawviewer_env (e.g. ``./build_macos.sh``) or when
-    ``RAWVIEWER_USE_SYSTEM_PYTHON_BUILD=1``.
+    Skips when already using ./SkySpotter_env (e.g. ``./build_macos.sh``) or when
+    ``SkySpotter_USE_SYSTEM_PYTHON_BUILD=1``.
     """
     if not _should_use_project_venv_for_build():
         return
     vpy = _project_venv_python()
-    venv_dir = REPO_ROOT / "rawviewer_env"
+    venv_dir = REPO_ROOT / "SkySpotter_env"
     if not vpy.is_file():
         if platform.system() == "Darwin":
             venv_msg = (
-                "[INFO] Creating ./rawviewer_env — macOS builds default to an isolated venv "
+                "[INFO] Creating ./SkySpotter_env ??macOS builds default to an isolated venv "
                 "(reliable pip/PyInstaller vs Homebrew Python). "
-                "Set RAWVIEWER_USE_SYSTEM_PYTHON_BUILD=1 to opt out."
+                "Set SkySpotter_USE_SYSTEM_PYTHON_BUILD=1 to opt out."
             )
         else:
             venv_msg = (
-                "[INFO] Creating ./rawviewer_env — system Python is PEP 668 externally managed; "
+                "[INFO] Creating ./SkySpotter_env ??system Python is PEP 668 externally managed; "
                 "pip cannot install into it."
             )
         print(venv_msg)
@@ -90,10 +91,10 @@ def ensure_project_venv_and_reexec() -> None:
         ).returncode
         if rc != 0 or not vpy.is_file():
             print(
-                "[ERROR] Could not create ./rawviewer_env. From the repo root try:\n"
+                "[ERROR] Could not create ./SkySpotter_env. From the repo root try:\n"
                 "  ./build_macos.sh\n"
-                "or:  python3 -m venv rawviewer_env && ./rawviewer_env/bin/python3 -m pip install -U pip && "
-                "./rawviewer_env/bin/python3 build.py"
+                "or:  python3 -m venv SkySpotter_env && ./SkySpotter_env/bin/python3 -m pip install -U pip && "
+                "./SkySpotter_env/bin/python3 build.py"
             )
             sys.exit(1)
     script = Path(__file__).resolve()
@@ -152,20 +153,20 @@ def update_macos_plist(app_path):
             plist['CFBundleDocumentTypes'].append(doc_type)
             
         # Set a unique Bundle Identifier
-        plist['CFBundleIdentifier'] = 'com.markyip.rawviewer'
-        plist['CFBundleName'] = 'RAWviewer'
-        plist['CFBundleDisplayName'] = 'RAW Image Viewer'
-        plist['CFBundleExecutable'] = 'RAWviewer'
+        plist['CFBundleIdentifier'] = 'com.markyip.skyspotter'
+        plist['CFBundleName'] = 'SkySpotter'
+        plist['CFBundleDisplayName'] = 'SkySpotter Aviation Specialist'
+        plist['CFBundleExecutable'] = 'SkySpotter'
         plist['CFBundlePackageType'] = 'APPL'
         plist['CFBundleShortVersionString'] = VERSION
         
         # Add macOS permission usage descriptions
-        plist['NSDesktopFolderUsageDescription'] = 'RAWviewer needs access to your Desktop to display images.'
-        plist['NSDocumentsFolderUsageDescription'] = 'RAWviewer needs access to your Documents folder to display images.'
-        plist['NSDownloadsFolderUsageDescription'] = 'RAWviewer needs access to your Downloads folder to display images.'
-        plist['NSRemovableVolumesUsageDescription'] = 'RAWviewer needs access to external volumes to display images from cameras or cards.'
-        plist['NSPhotoLibraryUsageDescription'] = 'RAWviewer needs access to your photo library to display images.'
-        plist['NSAppleEventsUsageDescription'] = 'RAWviewer needs to receive file open events from the system.'
+        plist['NSDesktopFolderUsageDescription'] = 'SkySpotter needs access to your Desktop to display images.'
+        plist['NSDocumentsFolderUsageDescription'] = 'SkySpotter needs access to your Documents folder to display images.'
+        plist['NSDownloadsFolderUsageDescription'] = 'SkySpotter needs access to your Downloads folder to display images.'
+        plist['NSRemovableVolumesUsageDescription'] = 'SkySpotter needs access to external volumes to display images from cameras or cards.'
+        plist['NSPhotoLibraryUsageDescription'] = 'SkySpotter needs access to your photo library to display images.'
+        plist['NSAppleEventsUsageDescription'] = 'SkySpotter needs to receive file open events from the system.'
         
         # macOS specific flags
         plist['LSMinimumSystemVersion'] = '10.15.0'
@@ -199,7 +200,12 @@ def install_dependencies():
         'qtawesome', # Required for icons in main.py
         'pyqtgraph',  # Optional/Future dependency included in requirements.txt
         'reverse-geocoder',  # Offline city/country lookup from GPS EXIF
-        'pycountry',  # ISO country code -> full country name
+        'pycountry',         # ISO country code -> full country name
+        'tokenizers',        # Lightweight tokenizer for SigLIP (Aviation Specialist)
+        'sentencepiece',     # SigLIP tokenizer dependency
+        'protobuf',          # ONNX/Transformers dependency
+        'torchvision',       # Optimized image processing for ViT
+        'onnxscript',        # Required for ONNX model export
     ]
 
     if system_name == "Windows":
@@ -208,6 +214,7 @@ def install_dependencies():
         dependencies.append('mediapipe')
         dependencies.append('opencv-python-headless')
     elif system_name == "Darwin":
+        dependencies.append('onnxruntime-silicon')
         dependencies.append('huggingface-hub')
         dependencies.append('pyobjc-framework-CoreML')
         dependencies.append('pyobjc-framework-Quartz')
@@ -283,11 +290,11 @@ def main():
 
     system_name = platform.system()
     if system_name == 'Windows':
-        print("RAWviewer Windows Build Script")
+        print("SkySpotter Windows Build Script")
     elif system_name == 'Darwin':
-        print(f"RAWviewer macOS Build Script v{VERSION}")
+        print(f"SkySpotter macOS Build Script v{VERSION}")
     else:
-        print(f"RAWviewer Build Script v{VERSION} ({system_name})")
+        print(f"SkySpotter Build Script v{VERSION} ({system_name})")
     print("==============================")
     print("")
 
@@ -301,7 +308,7 @@ def main():
         _darwin_preflight_pyexiv2_import()
 
     print("")
-    print("Building RAWviewer executable...")
+    print("Building SkySpotter executable...")
 
     # Import PyQt6 after installation
     try:
@@ -313,16 +320,16 @@ def main():
     # Clean previous builds
     print("Cleaning previous builds...")
     
-    # Try to kill any running RAWviewer.exe processes on Windows
+    # Try to kill any running SkySpotter.exe processes on Windows
     if platform.system() == 'Windows':
         try:
             result = subprocess.run(
-                ['taskkill', '/F', '/IM', 'RAWviewer.exe', '/T'],
+                ['taskkill', '/F', '/IM', 'SkySpotter.exe', '/T'],
                 capture_output=True,
                 text=True
             )
             if result.returncode == 0:
-                print("Closed running RAWviewer.exe instances")
+                print("Closed running SkySpotter.exe instances")
                 time.sleep(1)  # Wait a moment for file handles to release
         except Exception as e:
             print(f"[WARNING] Could not close running instances: {e}")
@@ -343,7 +350,7 @@ def main():
         try:
             print("Cleaning dist directory...")
             # Try to delete the exe file specifically first
-            exe_name = 'RAWviewer.exe' if platform.system() == 'Windows' else 'RAWviewer'
+            exe_name = 'SkySpotter.exe' if platform.system() == 'Windows' else 'SkySpotter'
             exe_path = os.path.join('dist', exe_name)
             if os.path.exists(exe_path):
                 try:
@@ -351,7 +358,7 @@ def main():
                     print(f"  Removed {exe_name}")
                 except PermissionError:
                     print("[ERROR] Cannot delete {exe_name} - it may be running.")
-                    print("  Please close RAWviewer and try again.")
+                    print("  Please close SkySpotter and try again.")
                     sys.exit(1)
                 except Exception as e:
                     print(f"[WARNING] Could not delete {exe_name}: {e}")
@@ -366,12 +373,14 @@ def main():
         except Exception as e:
             print(f"[WARNING] Error cleaning dist directory: {e}")
     # Platform-agnostic icon
+    is_aviation = os.environ.get("SkySpotter_AVIATION_BUILD", "").strip().lower() in ("1", "true", "yes")
+    
     if platform.system() == 'Windows':
-        icon_file = os.path.join('icons', 'appicon.ico')
+        icon_file = os.path.join('icons', 'appicon_aviation.ico' if is_aviation else 'appicon.ico')
     elif platform.system() == 'Darwin':
-        icon_file = os.path.join('icons', 'appicon.icns')
+        icon_file = os.path.join('icons', 'appicon_aviation.icns' if is_aviation else 'appicon.icns')
     else:
-        icon_file = os.path.join('icons', 'appicon.ico')  # fallback
+        icon_file = os.path.join('icons', 'appicon_aviation.ico' if is_aviation else 'appicon.ico')  # fallback
     icon_path = os.path.abspath(icon_file)
     if not os.path.exists(icon_path):
         print(f"[WARNING] Icon file not found: {icon_path}")
@@ -415,12 +424,12 @@ def main():
         sys.executable, "-m", "PyInstaller",
         "--windowed",
         "--paths", src_path,
-        "--hidden-import", "rawviewer_ui.gallery_view",
-        "--hidden-import", "rawviewer_ui.widgets",
+        "--hidden-import", "SkySpotter_ui.gallery_view",
+        "--hidden-import", "SkySpotter_ui.widgets",
         "--hidden-import", "natsort",
         "--hidden-import", "send2trash",
         "--hidden-import", "metadata_backend",
-        "--name", "RAWviewer"
+        "--name", "SkySpotter"
     ]
     try:
         import pyexiv2  # noqa: F401
@@ -433,6 +442,29 @@ def main():
             "[WARNING] pyexiv2 not importable; build continues without pyexiv2 bundling. "
             "Install pyexiv2 before packaging for EXIF read/write in the app."
         )
+    
+    # Bundling ONNX Runtime for lightweight specialist models (cross-platform)
+    try:
+        import onnxruntime
+        cmd_base.extend(["--hidden-import", "onnxruntime", "--collect-all", "onnxruntime"])
+        print("[INFO] PyInstaller: bundling onnxruntime with --collect-all.")
+    except ImportError:
+        print("[WARNING] onnxruntime not found; specialist models may be disabled.")
+
+    # Bundling HuggingFace Hub and Tokenizers for on-demand model acquisition
+    try:
+        import huggingface_hub
+        cmd_base.extend(["--hidden-import", "huggingface_hub", "--collect-all", "huggingface_hub"])
+        print("[INFO] PyInstaller: bundling huggingface_hub with --collect-all.")
+    except ImportError:
+        print("[WARNING] huggingface_hub not found; model download will fail.")
+
+    try:
+        import tokenizers
+        cmd_base.extend(["--hidden-import", "tokenizers", "--collect-all", "tokenizers"])
+        print("[INFO] PyInstaller: bundling tokenizers with --collect-all.")
+    except ImportError:
+        print("[WARNING] tokenizers not found; specialist search will fail.")
 
     if platform.system() == "Darwin":
         cmd_base.extend([
@@ -449,7 +481,6 @@ def main():
             "--exclude-module", "transformers",
             "--exclude-module", "sklearn",
             "--exclude-module", "scipy",
-            "--exclude-module", "tokenizers",
             "--exclude-module", "safetensors",
         ])
     elif platform.system() == "Windows":
@@ -483,7 +514,7 @@ def main():
     
     if platform.system() == 'Darwin':
         cmd_base.append("--onedir")
-        cmd_base.extend(["--osx-bundle-identifier", "com.markyip.rawviewer"])
+        cmd_base.extend(["--osx-bundle-identifier", "com.markyip.skyspotter"])
     else:
         cmd_base.append("--onefile")
         
@@ -507,11 +538,26 @@ def main():
         print("[ERROR] Build failed.")
         sys.exit(1)
     if platform.system() == 'Windows':
-        exe_path = Path('dist/RAWviewer.exe')
+        exe_path = Path('dist/SkySpotter/SkySpotter.exe')
     else:
-        exe_path = Path('dist/RAWviewer.app')
+        exe_path = Path('dist/SkySpotter.app')
     if exe_path.exists():
         print(f"[SUCCESS] Executable created: {exe_path}")
+        
+        # Windows-specific post-build steps: Uninstall script and Installer
+        if platform.system() == 'Windows':
+            print("Preparing Windows distribution extras...")
+            dist_dir = REPO_ROOT / "dist" / "SkySpotter"
+            
+            # 1. Copy uninstall.bat to dist folder
+            uninst_src = REPO_ROOT / "uninstall.bat"
+            if uninst_src.exists():
+                shutil.copy2(uninst_src, dist_dir / "uninstall.bat")
+                print(f"  Copied uninstall.bat to {dist_dir}")
+            
+            # 2. Build Installer EXE
+            build_installer()
+
         if platform.system() == 'Darwin':
             print("Patching macOS Info.plist...")
             update_macos_plist(str(exe_path))
@@ -524,6 +570,44 @@ def main():
         
     if platform.system() == 'Windows' and exe_path.exists():
         print("Build completed successfully.")
+
+
+
+def build_installer():
+    """Build the standalone installer EXE on Windows"""
+    print("")
+    print("Building SkySpotter Installer...")
+    
+    if platform.system() != 'Windows':
+        print("[SKIP] Installer build only supported on Windows.")
+        return
+
+    installer_script = REPO_ROOT / "installer.py"
+    if not installer_script.exists():
+        print(f"[ERROR] Installer script not found: {installer_script}")
+        return
+
+    icon_path = REPO_ROOT / "icons" / "appicon.ico"
+    
+    cmd = [
+        sys.executable, "-m", "PyInstaller",
+        "--onefile",
+        "--windowed",
+        "--name", "SkySpotter_Setup",
+        "--icon", str(icon_path) if icon_path.exists() else "",
+        "--add-data", f"dist/SkySpotter;SkySpotter",
+        "--clean",
+        "installer.py"
+    ]
+    
+    # Remove empty strings from cmd (like if icon_path didn't exist)
+    cmd = [c for c in cmd if c]
+    
+    print(f"Running: {' '.join(cmd)}")
+    if run_command(cmd):
+        print("[SUCCESS] Installer created: dist/SkySpotter_Setup.exe")
+    else:
+        print("[ERROR] Installer build failed.")
 
 
 if __name__ == '__main__':

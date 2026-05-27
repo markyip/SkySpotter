@@ -1,5 +1,5 @@
 @echo off
-echo Running RAWviewer in debug mode...
+echo Running SkySpotter in debug mode...
 echo All debug logs will be displayed in this console window.
 echo.
 echo Press Ctrl+C to stop the application.
@@ -17,6 +17,7 @@ set RAWVIEWER_USE_PROCESS_POOL=0
 set RAWVIEWER_VERBOSE_INFO_LOGS=0
 set RAWVIEWER_VERBOSE_CONSOLE=0
 set RAWVIEWER_FOCUS_GALLERY_SWITCH=1
+set RAWVIEWER_FILE_LOG=1
 echo.
 echo ========================================
 echo Starting Python application...

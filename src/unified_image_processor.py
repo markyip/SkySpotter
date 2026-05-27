@@ -27,7 +27,7 @@ from common_image_loader import (
 
 
 def _verbose_orientation_logs() -> bool:
-    return os.environ.get("RAWVIEWER_VERBOSE_ORIENTATION_LOGS", "0").strip().lower() in {
+    return os.environ.get("SkySpotter_VERBOSE_ORIENTATION_LOGS", "0").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -78,7 +78,7 @@ class UnifiedImageProcessor:
             if cached is not None:
                 # Keep cache hits cheap for gallery scrolling. The old self-healing orientation
                 # check touched EXIF/SQLite on every hit; enable it only when repairing caches.
-                if os.environ.get("RAWVIEWER_VALIDATE_THUMB_CACHE") == "1":
+                if os.environ.get("SkySpotter_VALIDATE_THUMB_CACHE") == "1":
                     exif_data = self.exif_extractor.extract_exif_data(file_path)
                     orientation = exif_data.get('orientation', 1) if exif_data else 1
                     if orientation in (6, 8) and hasattr(cached, 'shape'):
@@ -217,14 +217,12 @@ class UnifiedImageProcessor:
                     # Check for orientation mismatch (Portrait metadata but Landscape cached image)
                     if orientation in (6, 8) and w > h:
                         if _verbose_orientation_logs():
-                            # print(f"[ORIENTATION] UnifiedImageProcessor: Cached full_image for {os.path.basename(file_path)} is UNROTATED (stale). Re-processing.")
-                            pass
+                            print(f"[ORIENTATION] UnifiedImageProcessor: Cached full_image for {os.path.basename(file_path)} is UNROTATED (stale). Re-processing.")
                         cached_image = None
                     
                     if cached_image is not None:
                         if _verbose_orientation_logs():
-                            # print(f"[ORIENTATION] Using VALID cached full_image for {os.path.basename(file_path)}. Shape: {w}x{h}")
-                            pass
+                            print(f"[ORIENTATION] Using VALID cached full_image for {os.path.basename(file_path)}. Shape: {w}x{h}")
                         return cached_image
                 else:
                     return cached_image
@@ -235,14 +233,12 @@ class UnifiedImageProcessor:
             cached_pixmap = self.cache.get_pixmap(file_path)
             if cached_pixmap is not None:
                 if _verbose_orientation_logs():
-                    # print(f"[ORIENTATION] Using cached pixmap for {os.path.basename(file_path)} (non-RAW file)")
-                    pass
+                    print(f"[ORIENTATION] Using cached pixmap for {os.path.basename(file_path)} (non-RAW file)")
                 return cached_pixmap
         else:
             # For RAW files, don't use cached pixmap - always process fresh
             if _verbose_orientation_logs():
-                # print(f"[ORIENTATION] RAW file {os.path.basename(file_path)} - skipping pixmap cache, will process as RAW")
-                pass
+                print(f"[ORIENTATION] RAW file {os.path.basename(file_path)} - skipping pixmap cache, will process as RAW")
         
         # 處理圖像
         if is_raw:
@@ -339,9 +335,8 @@ class UnifiedImageProcessor:
                 exif_data = self.exif_extractor.extract_exif_data(file_path)
             
             orientation = exif_data.get('orientation', 1) if exif_data else 1
-            if os.environ.get("RAWVIEWER_VERBOSE_ORIENTATION_LOGS") == "1":
-                # print(f"[ORIENTATION] UnifiedImageProcessor (RAW): {os.path.basename(file_path)} final_orientation={orientation}")
-                pass
+            if os.environ.get("SkySpotter_VERBOSE_ORIENTATION_LOGS") == "1":
+                print(f"[ORIENTATION] UnifiedImageProcessor (RAW): {os.path.basename(file_path)} final_orientation={orientation}")
                 
             if orientation != 1 and rgb_image is not None:
                 rgb_image = self._apply_orientation_correction(rgb_image, orientation, exif_data)
@@ -458,33 +453,28 @@ class UnifiedImageProcessor:
         """
         if image_array is None:
             if _verbose_orientation_logs():
-                # print(f"[ORIENTATION] Error: image_array is None in _apply_orientation_correction")
-                pass
+                print(f"[ORIENTATION] Error: image_array is None in _apply_orientation_correction")
             return None
             
         original_shape = image_array.shape
         if _verbose_orientation_logs():
-            # print(f"[ORIENTATION] Before correction: shape = {original_shape}")
-            pass
+            print(f"[ORIENTATION] Before correction: shape = {original_shape}")
         
         if orientation == 1:
-            if os.environ.get("RAWVIEWER_VERBOSE_ORIENTATION_LOGS") == "1":
-                # print(f"[ORIENTATION] Numpy operation: No operation (orientation = 1)")
-                pass
+            if os.environ.get("SkySpotter_VERBOSE_ORIENTATION_LOGS") == "1":
+                print(f"[ORIENTATION] Numpy operation: No operation (orientation = 1)")
             return image_array
             
         # SAFETY CHECK: If the image dimensions already match the "corrected" dimensions
         # (e.g. it's already a portrait image but EXIF still says Orientation 6), 
         # it might have been pre-rotated by the loader/camera.
         h, w = image_array.shape[:2]
-        if os.environ.get("RAWVIEWER_VERBOSE_ORIENTATION_LOGS") == "1":
-            # print(f"[ORIENTATION] UnifiedImageProcessor: Applying correction for Orientation {orientation} to {w}x{h} image")
-            pass
+        if os.environ.get("SkySpotter_VERBOSE_ORIENTATION_LOGS") == "1":
+            print(f"[ORIENTATION] UnifiedImageProcessor: Applying correction for Orientation {orientation} to {w}x{h} image")
 
         if orientation in (5, 6, 7, 8) and h > w:
-            if os.environ.get("RAWVIEWER_VERBOSE_ORIENTATION_LOGS") == "1":
-                # print(f"[ORIENTATION] UnifiedImageProcessor: Image is already portrait ({w}x{h}), skipping manual rotation for Orientation {orientation}")
-                pass
+            if os.environ.get("SkySpotter_VERBOSE_ORIENTATION_LOGS") == "1":
+                print(f"[ORIENTATION] UnifiedImageProcessor: Image is already portrait ({w}x{h}), skipping manual rotation for Orientation {orientation}")
             return image_array
         if orientation in (3, 4) and h < w:
             # For 180 flips, this is less certain, but we keep it as a placeholder
@@ -496,46 +486,39 @@ class UnifiedImageProcessor:
         if orientation == 2:
             # Mirror left-right
             if _verbose_orientation_logs():
-                # print(f"[ORIENTATION] Numpy operation: np.fliplr(image_array) - Mirror left-right")
-                pass
+                print(f"[ORIENTATION] Numpy operation: np.fliplr(image_array) - Mirror left-right")
             result = np.fliplr(image_array)
         elif orientation == 3:
             # Rotate 180°
             if _verbose_orientation_logs():
-                # print(f"[ORIENTATION] Numpy operation: np.rot90(image_array, 2) - Rotate 180°")
-                pass
+                print(f"[ORIENTATION] Numpy operation: np.rot90(image_array, 2) - Rotate 180°")
             result = np.rot90(image_array, 2)
         elif orientation == 4:
             # Mirror top-bottom
             if _verbose_orientation_logs():
-                # print(f"[ORIENTATION] Numpy operation: np.flipud(image_array) - Mirror top-bottom")
-                pass
+                print(f"[ORIENTATION] Numpy operation: np.flipud(image_array) - Mirror top-bottom")
             result = np.flipud(image_array)
         elif orientation == 5:
             # Mirror LR + rotate 270° CW (k=1 CCW)
             if _verbose_orientation_logs():
-                # print(f"[ORIENTATION] Numpy operation: np.rot90(np.fliplr(image_array), 1) - Mirror LR + rotate 90° CCW")
-                pass
+                print(f"[ORIENTATION] Numpy operation: np.rot90(np.fliplr(image_array), 1) - Mirror LR + rotate 90° CCW")
             result = np.rot90(np.fliplr(image_array), 1)
         elif orientation == 6:
             # Orientation 6: Image is rotated 90° CW.
             # We need to rotate it 90° CW (k=3) to fix it.
             if _verbose_orientation_logs():
-                # print(f"[ORIENTATION] Numpy operation: np.rot90(image_array, 3) - Rotate 90° CW")
-                pass
+                print(f"[ORIENTATION] Numpy operation: np.rot90(image_array, 3) - Rotate 90° CW")
             result = np.rot90(image_array, 3)
         elif orientation == 7:
             # Mirror LR + rotate 90° CW
             if _verbose_orientation_logs():
-                # print(f"[ORIENTATION] Numpy operation: np.rot90(np.fliplr(image_array), 3) - Mirror LR + rotate 270° CCW (90° CW)")
-                pass
+                print(f"[ORIENTATION] Numpy operation: np.rot90(np.fliplr(image_array), 3) - Mirror LR + rotate 270° CCW (90° CW)")
             result = np.rot90(np.fliplr(image_array), 3)
         elif orientation == 8:
             # Orientation 8: Image is rotated 270° CW (90° CCW).
             # We need to rotate it 90° CCW (k=1) to fix it.
             if _verbose_orientation_logs():
-                # print(f"[ORIENTATION] Numpy operation: np.rot90(image_array, 1) - Rotate 90° CCW")
-                pass
+                print(f"[ORIENTATION] Numpy operation: np.rot90(image_array, 1) - Rotate 90° CCW")
             result = np.rot90(image_array, 1)
         else:
             # Unknown orientation
@@ -543,8 +526,7 @@ class UnifiedImageProcessor:
         
         final_shape = result.shape
         if _verbose_orientation_logs():
-            # print(f"[ORIENTATION] After correction: shape = {final_shape}")
-            pass
+            print(f"[ORIENTATION] After correction: shape = {final_shape}")
         return result
 
 

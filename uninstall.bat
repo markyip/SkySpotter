@@ -1,8 +1,7 @@
 @echo off
-:: RAWviewer Uninstaller v1.0
 setlocal
-:: RAWviewer Silent Uninstaller
-:: This script handles the automated removal of RAWviewer triggered by Windows Settings.
+:: SkySpotter Silent Uninstaller
+:: This script handles the automated removal of SkySpotter triggered by Windows Settings.
 
 :: Standardize Path: Get current directory WITHOUT trailing backslash
 set "BASE_DIR=%~dp0"
@@ -14,7 +13,7 @@ if "%~1"=="__CLEANUP__" goto :CLEANUP
 :: 2. Migration to TEMP
 :: Since we can't delete the folder while this script is running from it,
 :: we copy ourselves to TEMP and launch from there.
-set "TEMP_SCRIPT=%TEMP%\uninstall_rawviewer_%RANDOM%.bat"
+set "TEMP_SCRIPT=%TEMP%\uninstall_skyspotter_%RANDOM%.bat"
 copy /y "%~f0" "%TEMP_SCRIPT%" >nul
 
 :: Launch the second stage HIDDEN via PowerShell
@@ -30,22 +29,22 @@ timeout /t 2 /nobreak >nul
 
 :: 3. Kill Processes
 :: Force-kill any lingering processes
-taskkill /F /T /IM RAWviewer.exe >nul 2>&1
-taskkill /F /T /IM RAWviewer_Setup.exe >nul 2>&1
-taskkill /F /T /IM RAWviewer_Uninstaller.exe >nul 2>&1
+taskkill /F /T /IM SkySpotter.exe >nul 2>&1
+taskkill /F /T /IM SkySpotter_Setup.exe >nul 2>&1
+taskkill /F /T /IM SkySpotter_Uninstaller.exe >nul 2>&1
 
 :: Fallback: PowerShell commandline match for python windowless processes
 powershell -Command "Get-CimInstance Win32_Process -Filter \"Name = 'python.exe' OR Name = 'pythonw.exe'\" | Where-Object { $_.CommandLine -match 'src[/\\]main\.py' -or $_.CommandLine -match 'src[/\\]bootstrap\.py' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >nul 2>&1
 
 :: 4. Remove Registry Keys
-reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\RAWviewer" /f >nul 2>&1
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\SkySpotter" /f >nul 2>&1
 
 :: 5. Remove Shortcuts
-set "DESKTOP=%USERPROFILE%\Desktop"
-if exist "%DESKTOP%\RAWviewer.lnk" del /f /q "%DESKTOP%\RAWviewer.lnk" >nul 2>&1
-
 set "START_MENU_PROG=%APPDATA%\Microsoft\Windows\Start Menu\Programs"
-if exist "%START_MENU_PROG%\RAWviewer.lnk" del /f /q "%START_MENU_PROG%\RAWviewer.lnk" >nul 2>&1
+if exist "%START_MENU_PROG%\SkySpotter.lnk" del /f /q "%START_MENU_PROG%\SkySpotter.lnk" >nul 2>&1
+
+set "DESKTOP_LNK=%USERPROFILE%\Desktop"
+if exist "%DESKTOP_LNK%\SkySpotter.lnk" del /f /q "%DESKTOP_LNK%\SkySpotter.lnk" >nul 2>&1
 
 :: 6. Wipe App Directory (with retry loop)
 set "RETRY=0"
