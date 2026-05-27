@@ -15,7 +15,6 @@ You're an aviation photographer who just returned from RIAT or spent a day at th
 
 ## ✨ Core AI Features
 
-<<<<<<< HEAD
 - Instant file previewing: No import steps — just drag & drop.
 - Zoom in with a single key to check sharpness immediately.
 - Stay in zoomed mode while browsing with arrow keys.
@@ -24,17 +23,24 @@ You're an aviation photographer who just returned from RIAT or spent a day at th
 
 This is a **pre-filtering tool**, letting you go through hundreds of RAW files efficiently **before** committing to editing them in Lightroom or Photoshop.
 
-## 🔍 What is RAWviewer?
-**RAWviewer** is a fast, modern, cross-platform image viewer for Windows and macOS, built with PyQt6. It supports advanced zooming, panning, and direct file association, allowing RAW files to be opened with a double-click.
+## 🔍 What is SkySpotter?
+**SkySpotter** is a fast, modern, cross-platform image viewer for Windows and macOS, built with PyQt6. It supports advanced zooming, panning, and direct file association, allowing RAW files to be opened with a double-click.
 
 ## ✨ Features
 
+- **Automated Aircraft Classification**: Our custom Vision Transformer (ViT) model recognizes over 100+ military aircraft types (e.g., F-35, AH-64, B-2, Eurofighter Typhoon).
+- **One-Click Auto-Sort**: Simply click the **Magic Wand** icon in the gallery toolbar. SkySpotter will analyze every image in your folder and automatically sort them into dedicated subfolders based on the aircraft model detected!
+- **AI Background Removal**: To maximize identification accuracy, SkySpotter features an integrated U-2-Net model that strips away complex backgrounds (like skies and trees) so the classifier can focus purely on the aircraft's silhouette.
+- **Attention-Adjusted Cropping**: The AI reads your camera's EXIF focus points to crop tightly around the subject before classification, ensuring it doesn't get confused by tiny aircraft in large frames.
+- **Hardware Acceleration**:
+  - **macOS**: Built-in Apple Neural Engine / Metal support via the `CoreMLExecutionProvider`.
+  - **Windows**: Full GPU acceleration support via `TensorrtExecutionProvider` and DirectML.
 - **Cross-platform support**: Windows and macOS
 - **Ultra-Fast Performance**: Instant folder loading (scans thousands of images in milliseconds) using optimized algorithms
 - **High-Fidelity Thumbnails**: Uses high-quality **LANCZOS resampling** and **2x oversampling** for crystal-clear previews on Retina and 4K displays.
 - **Smart Prefetching**: Predictively loads relevant images in the background for zero-latency navigation
 - **Memory-First Cache (Default)**: Uses fast in-memory caching by default with no disk/SQLite writes
-- **Optional Persistent Cache**: Set `RAWVIEWER_PERSISTENT_CACHE=1` to re-enable disk/SQLite cache persistence
+- **Optional Persistent Cache**: Set `SkySpotter_PERSISTENT_CACHE=1` to re-enable disk/SQLite cache persistence
 - **Gallery View**: Justified grid layout with virtualized rendering, EXIF-aware ordering, and current-image positioning
 - **Gallery search (macOS + Core ML bundle)**: Free-text semantic ranking plus structured metadata filters (`camera:`, ISO, GPS, **`format:`** / **`ext:`**, and more — see README table below)
 - **Wide RAW format support**: Canon (CR2, CR3), Nikon (NEF), Sony (ARW), Adobe DNG, and many more
@@ -53,31 +59,17 @@ This is a **pre-filtering tool**, letting you go through hundreds of RAW files e
 - **Platform-specific chrome**: On Windows, the bottom bar omits Share (no stable system share without WinRT interop); **Share** remains on macOS.
 - **Non-destructive visual rotate**: Rotate in viewer by 90° steps without modifying original files (including RAW), with gallery-visible tiles refreshed immediately.
 - **Precision Focus Area Detection**: Overlays the camera's focus point(s) using manufacturer-specific MakerNote data (Canon, Nikon, Sony) plus EXIF SubjectArea/SubjectLocation with orientation-aware mapping and robust coordinate scaling.
-=======
-- **Automated Aircraft Classification**: Our custom Vision Transformer (ViT) model recognizes over 100+ military aircraft types (e.g., F-35, AH-64, B-2, Eurofighter Typhoon).
-- **One-Click Auto-Sort**: Simply click the **Magic Wand** icon in the gallery toolbar. SkySpotter will analyze every image in your folder and automatically sort them into dedicated subfolders based on the aircraft model detected!
-- **AI Background Removal**: To maximize identification accuracy, SkySpotter features an integrated U-2-Net model that strips away complex backgrounds (like skies and trees) so the classifier can focus purely on the aircraft's silhouette.
-- **Attention-Adjusted Cropping**: The AI reads your camera's EXIF focus points to crop tightly around the subject before classification, ensuring it doesn't get confused by tiny aircraft in large frames.
-- **Hardware Acceleration**:
-  - **macOS**: Built-in Apple Neural Engine / Metal support via the `CoreMLExecutionProvider`.
-  - **Windows**: Full GPU acceleration support via `TensorrtExecutionProvider` and DirectML.
->>>>>>> origin/main
 
 ## 🚀 Quick Start
 
 ### Download Executable
 
 #### Windows
-<<<<<<< HEAD
-1. Download the latest release from the [Releases Page](https://github.com/markyip/RAWviewer/releases/latest)
-2. Download `RAWviewer.exe` directly (no zip extraction needed)
-3. Double-click `RAWviewer.exe` to initiate the installation process. It will automatically download the necessary dependencies and AI models to a destination of your choice.
-4. Launch RAWviewer from the Desktop shortcut created during installation! (You can safely delete the original `RAWviewer.exe` installer afterwards).
-=======
 
 1. Download the latest release from the [Releases Page](https://github.com/markyip/SkySpotter/releases/latest)
-2. Double-click `SkySpotter.exe` to launch
->>>>>>> origin/main
+2. Download `SkySpotter.exe` directly (no zip extraction needed)
+3. Double-click `SkySpotter.exe` to initiate the installation process. It will automatically download the necessary dependencies and AI models to a destination of your choice.
+4. Launch SkySpotter from the Desktop shortcut created during installation! (You can safely delete the original `SkySpotter.exe` installer afterwards).
 
 #### macOS
 
