@@ -1,12 +1,20 @@
 # RAWviewer Release Notes
 
-## 🚀 Version 2.0.1
-**Release Date: May 23, 2026**
+## 🚀 Version 2.1.0
+**Release Date: May 28, 2026**
+
+🎯 What's New
+- **Bottom Film Strip (Single View)**: Added an overlay film strip with hot-zone reveal, shared thumbnail caching, and improved hover/dismiss behavior (including immediate hide when pointer leaves or enters the bottom menu area).
+- **Semantic + Face Indexing Stability**: Semantic indexing now prioritizes search readiness, with face-count backfill running in a safer background pass and better progress reporting for large folders.
+- **RAW Decode Resilience**: Improved fallback behavior for problematic RAW files during indexing and thumbnail paths to reduce repeated failures and avoid retry loops.
+- **Installer Reliability & Size Hygiene**: Installer now rebuilds the Pixi environment cleanly and avoids carrying stale local logs into fresh installs.
 
 🛠️ Fixes & improvements
 - **Google Pixel DNG Support**: Fixed critical crashes in the `QImageReader` and `EXIFExtractor` fallbacks that prevented Google Pixel DNG files from rendering on macOS.
 - **Gallery Aspect Ratio Fix**: Fixed a bug where thumbnail crops were improperly bypassed, ensuring that all gallery tiles now correctly display cropped square previews without distorted aspect ratios or zoomed-in glitches.
 - **DNG Single-View Zoom Stability**: Reworked DNG single-image loading to use a full-resolution-first path and tightened pending zoom-state handling, fixing intermittent cases where Space / double-click changed zoom status text without actually zooming the image.
+- **Logging Path Unification**: Runtime logs/fatal dumps now target `%LOCALAPPDATA%\\RAWviewer\\logs` to prevent project-local log growth in packaged installs.
+- **Dependency Cleanup**: Trimmed unused installer/runtime dependencies and restored required network dependency for Hugging Face model download flow.
 
 ---
 
