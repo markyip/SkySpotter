@@ -1,0 +1,3 @@
+chore: align SkySpotter workflow and docs
+
+Document the pixi rembg PoC flow, clean generated artifacts, and include current classifier and UI integration updates for main branch sync.

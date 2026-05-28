@@ -1,7 +1,7 @@
 [workspace]
-name = "rawviewer"
+name = "skyspotter"
 version = "1.0.0"
-description = "RAWviewer - Professional RAW Image Viewer with Semantic Search"
+description = "SkySpotter - Aviation Specialist Image Viewer"
 authors = ["Mark Yip"]
 channels = ["conda-forge"]
 platforms = ["win-64"]
@@ -9,6 +9,7 @@ platforms = ["win-64"]
 [tasks]
 start = "python src/main.py"
 start-windowless = "pythonw src/main.py"
+poc-legacy-rembg = "python scripts/poc_aircraft_detection_legacy.py --input-dir \"D:\\Development\\F-35\" --output-dir \"D:\\Development\\SkySpotter\\poc_f35_output_legacy_pixi\""
 
 [dependencies]
 python = ">=3.10,<3.13"
@@ -17,7 +18,7 @@ pip = "*"
 [pypi-dependencies]
 PyQt6 = ">=6.6.0"
 rawpy = ">=0.25.0"
-numpy = ">=2.0.0"
+numpy = ">=2.0.0,<2.4"
 Pillow = ">=10.0.0"
 send2trash = ">=1.8.0"
 natsort = ">=8.4.0"
@@ -35,3 +36,9 @@ mediapipe = "*"
 opencv-python-headless = "*"
 huggingface_hub = "*"
 requests = "*"
+rembg = "*"
+numba = "<0.62"
+torch = "*"
+transformers = "*"
+scikit-image = "*"
+tqdm = "*"

@@ -5,14 +5,15 @@ echo.
 echo Press Ctrl+C to stop the application.
 echo.
 
-REM Activate virtual environment if it exists
-if exist "rawviewer_env\Scripts\activate.bat" (
-    call rawviewer_env\Scripts\activate.bat
+REM Prefer Pixi environment for reproducible local development
+where pixi >nul 2>nul
+if %ERRORLEVEL% EQU 0 (
+    set SKYSPOTTER_USE_PIXI=1
+) else (
+    set SKYSPOTTER_USE_PIXI=0
 )
 
-REM Run the application with Python to see console output
-REM Use errorlevel to check if the application crashed
-REM Force unbuffered output with -u flag
+REM Run the application with debug output
 set RAWVIEWER_USE_PROCESS_POOL=0
 set RAWVIEWER_VERBOSE_INFO_LOGS=0
 set RAWVIEWER_VERBOSE_CONSOLE=0
@@ -23,7 +24,13 @@ echo ========================================
 echo Starting Python application...
 echo ========================================
 echo.
-python -u src/main.py %*
+if %SKYSPOTTER_USE_PIXI% EQU 1 (
+    echo Using Pixi environment...
+    pixi run python -u src/main.py %*
+) else (
+    echo Pixi not found, falling back to system Python...
+    python -u src/main.py %*
+)
 set EXIT_CODE=%ERRORLEVEL%
 
 echo.

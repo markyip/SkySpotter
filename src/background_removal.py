@@ -6,6 +6,12 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+
+def _skyspotter_cache_root() -> str:
+    return os.path.expanduser(
+        os.environ.get("SkySpotter_CACHE_DIR", "~/.skyspotter_cache")
+    )
+
 class BackgroundRemover:
     """
     ONNX-based background removal utilizing the U2-Net architecture.
@@ -15,7 +21,7 @@ class BackgroundRemover:
     MODEL_FILENAME = "u2net.onnx"
 
     def __init__(self):
-        self.model_dir = os.path.expanduser("~/.rawviewer_cache/bg_models")
+        self.model_dir = os.path.join(_skyspotter_cache_root(), "bg_models")
         self.model_path = os.path.join(self.model_dir, self.MODEL_FILENAME)
         self.session = None
 
@@ -41,6 +47,22 @@ class BackgroundRemover:
                 self.session = ort.InferenceSession(self.model_path, providers=selected)
                 logger.info(f"[BG Removal] ONNX session initialized with providers: {selected}")
             except Exception as e:
+                msg = str(e).lower()
+                if "invalid_protobuf" in msg or "protobuf parsing failed" in msg:
+                    # Corrupted partial download; remove and retry one time.
+                    try:
+                        if os.path.exists(self.model_path):
+                            os.remove(self.model_path)
+                    except OSError:
+                        pass
+                    self._ensure_model()
+                    import onnxruntime as ort
+                    providers = ['CoreMLExecutionProvider', 'CUDAExecutionProvider', 'TensorrtExecutionProvider', 'DmlExecutionProvider', 'CPUExecutionProvider']
+                    available_providers = ort.get_available_providers()
+                    selected = [p for p in providers if p in available_providers]
+                    self.session = ort.InferenceSession(self.model_path, providers=selected)
+                    logger.info(f"[BG Removal] Re-downloaded model and initialized providers: {selected}")
+                    return
                 logger.error(f"[BG Removal] Failed to initialize ONNX session: {e}")
                 raise
 

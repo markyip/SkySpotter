@@ -78,7 +78,7 @@ venv/
 .hf_cache_mobileclip/
 artifacts/mobileclip2_coreml/
 
-# Bundled MobileCLIP2 Core ML (large); export with scripts/export_mobileclip2_coreml.py --for-app
+# Bundled MobileCLIP2 Core ML (large)
 models/mobileclip2_coreml/**
 !models/mobileclip2_coreml/.gitkeep
 
@@ -124,3 +124,13 @@ scratch/
 # Aviation Specialist AI
 aviation_model_v2/
 old_semantic.py
+
+# Local PoC outputs / generated artifacts
+poc_f35_output_legacy/
+poc_f35_output_legacy_pixi/
+poc_f35_output_legacy_pixi5/
+poc_f35_output_legacy_sample20/
+
+# Local cache / index artifacts
+.skyspotter_cache/
+semantic_index.db

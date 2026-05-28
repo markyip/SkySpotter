@@ -554,9 +554,6 @@ def main():
             if uninst_src.exists():
                 shutil.copy2(uninst_src, dist_dir / "uninstall.bat")
                 print(f"  Copied uninstall.bat to {dist_dir}")
-            
-            # 2. Build Installer EXE
-            build_installer()
 
         if platform.system() == 'Darwin':
             print("Patching macOS Info.plist...")
@@ -573,41 +570,7 @@ def main():
 
 
 
-def build_installer():
-    """Build the standalone installer EXE on Windows"""
-    print("")
-    print("Building SkySpotter Installer...")
-    
-    if platform.system() != 'Windows':
-        print("[SKIP] Installer build only supported on Windows.")
-        return
 
-    installer_script = REPO_ROOT / "installer.py"
-    if not installer_script.exists():
-        print(f"[ERROR] Installer script not found: {installer_script}")
-        return
-
-    icon_path = REPO_ROOT / "icons" / "appicon.ico"
-    
-    cmd = [
-        sys.executable, "-m", "PyInstaller",
-        "--onefile",
-        "--windowed",
-        "--name", "SkySpotter_Setup",
-        "--icon", str(icon_path) if icon_path.exists() else "",
-        "--add-data", f"dist/SkySpotter;SkySpotter",
-        "--clean",
-        "installer.py"
-    ]
-    
-    # Remove empty strings from cmd (like if icon_path didn't exist)
-    cmd = [c for c in cmd if c]
-    
-    print(f"Running: {' '.join(cmd)}")
-    if run_command(cmd):
-        print("[SUCCESS] Installer created: dist/SkySpotter_Setup.exe")
-    else:
-        print("[ERROR] Installer build failed.")
 
 
 if __name__ == '__main__':

@@ -20,6 +20,12 @@ from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtCore import QObject, pyqtSignal
 
 
+def _skyspotter_cache_root() -> str:
+    return os.path.expanduser(
+        os.environ.get("SkySpotter_CACHE_DIR", "~/.skyspotter_cache")
+    )
+
+
 class LRUCache:
     """Thread-safe LRU cache implementation."""
 
@@ -126,7 +132,7 @@ class PersistentEXIFCache:
 
     def __init__(self, cache_dir: str = None):
         if cache_dir is None:
-            cache_dir = os.path.expanduser("~/.rawviewer_cache")
+            cache_dir = _skyspotter_cache_root()
         os.makedirs(cache_dir, exist_ok=True)
 
         self.db_path = os.path.join(cache_dir, "exif_cache.db")
@@ -461,7 +467,7 @@ class PersistentThumbnailCache:
     
     def __init__(self, cache_dir: str = None):
         if cache_dir is None:
-            cache_dir = os.path.expanduser("~/.rawviewer_cache")
+            cache_dir = _skyspotter_cache_root()
         os.makedirs(cache_dir, exist_ok=True)
         
         self.cache_dir = os.path.join(cache_dir, "thumbnails")
@@ -702,7 +708,7 @@ class PersistentPreviewCache(PersistentThumbnailCache):
     
     def __init__(self, cache_dir: str = None):
         if cache_dir is None:
-            cache_dir = os.path.expanduser("~/.rawviewer_cache")
+            cache_dir = _skyspotter_cache_root()
         # Use 'previews' subdirectory
         self.base_cache_dir = cache_dir 
         super().__init__(cache_dir) # Init with base dir, will setup 'thumbnails'
@@ -800,7 +806,7 @@ class ImageCache(QObject):
         self.persistent_cache_enabled = persistent_cache_enabled
         if self.persistent_cache_enabled:
             if cache_dir is None:
-                cache_dir = os.path.expanduser("~/.rawviewer_cache")
+                cache_dir = _skyspotter_cache_root()
             os.makedirs(cache_dir, exist_ok=True)
             self.cache_dir = cache_dir
         else:

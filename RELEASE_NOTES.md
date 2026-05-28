@@ -1,5 +1,17 @@
 # RAWviewer Release Notes
 
+## 🚧 Unreleased (SkySpotter main)
+
+🧹 Project housekeeping
+- Removed unused CoreML helper scripts: `scripts/download_mobileclip_coreml.py` and `scripts/export_mobileclip2_coreml.py`.
+- Cleaned generated PoC output folders from repository working tree.
+- Updated `.gitignore` to exclude local PoC outputs and local cache/index artifacts.
+
+📘 Documentation updates
+- README now documents the recommended pixi workflow (`pixi install`, `pixi run start`).
+- README classifier section updated to prioritize `aviation_model_processed/` checkpoint flow.
+- Added explicit `poc-legacy-rembg` task usage and notes about fail-fast `rembg` behavior.
+
 ## 🚀 Version 2.0.1
 **Release Date: May 23, 2026**
 

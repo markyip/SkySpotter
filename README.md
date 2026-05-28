@@ -97,6 +97,15 @@ This is a **pre-filtering tool**, letting you go through hundreds of RAW files e
 - Python 3.8 or higher
 - pip (Python package manager)
 
+### Recommended dev environment (pixi)
+
+For consistent model tooling and `rembg` behavior, use pixi in this repo:
+
+```bash
+pixi install
+pixi run start
+```
+
 ### Windows
 
 **Option 1: Using batch script (recommended)**
@@ -210,8 +219,22 @@ SkySpotter is equipped with scripts that make it incredibly easy to train a cust
 
 1. **Organize Your Data**: Create a folder (e.g., `./CustomDataSet/Eagle/`, `./CustomDataSet/Sparrow/`).
 2. **Background Removal**: Use `scripts/batch_bg_pipeline.py` to strip the backgrounds and tightly crop your images before training.
-3. **Train the Model**: Run `python scripts/train_aviation_specialist.py`.
-4. **Export to ONNX**: Run `python scripts/export_to_onnx.py`. Replace the default `.onnx` model in `src/models/` with your new one!
+3. **Train the Model**: Run `python scripts/train_processed_aircraft.py` (or `python scripts/train_aviation_specialist.py` for the legacy path).
+4. **Use the checkpoint directly**: Place your trained checkpoint in `aviation_model_processed/` (contains `config.json`, `model.safetensors`, `preprocessor_config.json`, `labels.txt`).
+
+### Legacy PoC (rembg-focused)
+
+To reproduce the cleaner preprocessing path used in the latest validations:
+
+```bash
+pixi run poc-legacy-rembg
+```
+
+This runs `scripts/poc_aircraft_detection_legacy.py` with `rembg` (`isnet-general-use`) and writes:
+- pipeline images: `poc_f35_output_legacy_pixi/pipeline_images`
+- CSV report: `poc_f35_output_legacy_pixi/top3_detection_scores.csv`
+
+By default the script fails fast when `rembg` is unavailable (to avoid silent fallback differences). Use `--allow-fallback-bg` only when you intentionally want fallback behavior.
 
 ## 📁 Supported Image Formats
 
