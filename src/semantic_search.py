@@ -811,6 +811,8 @@ class MilitaryAircraftClassifier:
         self._torch_processor = None
         self._torch_device = None
         self._rembg_session = None
+        strict_rembg = os.environ.get("SkySpotter_STRICT_REMBG", "").strip().lower()
+        self._strict_rembg = strict_rembg in {"1", "true", "yes", "on"}
         self._load_labels()
         # Ensure classifier labels come from the selected checkpoint when available.
         self._sync_labels_from_checkpoint()
@@ -886,7 +888,12 @@ class MilitaryAircraftClassifier:
 
             self._torch_processor = ViTImageProcessor.from_pretrained(self._local_checkpoint_dir)
             self._torch_model = ViTForImageClassification.from_pretrained(self._local_checkpoint_dir)
-            self._torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                self._torch_device = torch.device("mps")
+            elif torch.cuda.is_available():
+                self._torch_device = torch.device("cuda")
+            else:
+                self._torch_device = torch.device("cpu")
             self._torch_model.to(self._torch_device)
             self._torch_model.eval()
 
@@ -903,9 +910,10 @@ class MilitaryAircraftClassifier:
                 pass
 
             logger.warning(
-                "[MODEL] Classifier backend='hf-checkpoint' checkpoint='%s' device='%s'",
+                "[MODEL] Classifier backend='hf-checkpoint' checkpoint='%s' device='%s' strict_rembg=%s",
                 self._local_checkpoint_dir,
                 str(self._torch_device),
+                self._strict_rembg,
             )
             return True
         except Exception as e:
@@ -919,12 +927,17 @@ class MilitaryAircraftClassifier:
 
             if self._rembg_session is None:
                 self._rembg_session = new_session("isnet-general-use")
+                logger.info("[AVIATION AI] rembg session initialized: isnet-general-use")
             return remove(image, session=self._rembg_session, alpha_matting=False)
-        except Exception:
+        except Exception as e:
+            if self._strict_rembg:
+                logger.warning("[AVIATION AI] strict rembg mode: rembg failed (%s), skip classification", e)
+                raise
             # Fallback to current app background remover.
             try:
                 from background_removal import get_background_remover
 
+                logger.warning("[AVIATION AI] rembg unavailable, fallback to background_removal pipeline: %s", e)
                 bg = get_background_remover().remove_background(image.convert("RGB"))
                 rgba = bg.convert("RGBA")
                 rgba.putalpha(Image.new("L", rgba.size, 255))
@@ -989,9 +1002,19 @@ class MilitaryAircraftClassifier:
         return label, conf
 
     def _ensure_model(self, progress_callback=None):
+        # Checkpoint-only mode: do not download/export/use ONNX fallback models.
         checkpoint_model = None
         if self._local_checkpoint_dir:
             checkpoint_model = os.path.join(self._local_checkpoint_dir, "model.safetensors")
+        if not checkpoint_model or not os.path.exists(checkpoint_model):
+            logger.warning(
+                "[MODEL] Checkpoint-only mode: missing model.safetensors under '%s'; classifier disabled.",
+                self._local_checkpoint_dir or "none",
+            )
+            return
+        self._sync_labels_from_checkpoint()
+        return
+
         needs_local_export = False
         if checkpoint_model and os.path.exists(checkpoint_model):
             if not os.path.exists(self.onnx_path):
@@ -1181,6 +1204,11 @@ class MilitaryAircraftClassifier:
                 if label and conf >= 0.40:
                     return label
                 return ""
+
+            logger.warning(
+                "[MODEL] Checkpoint-only mode: classifier skipped because checkpoint backend is unavailable."
+            )
+            return ""
 
             import onnxruntime as ort
             if self._session is None:

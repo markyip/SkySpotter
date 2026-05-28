@@ -4,12 +4,14 @@
 
 🧹 Project housekeeping
 - Removed unused CoreML helper scripts: `scripts/download_mobileclip_coreml.py` and `scripts/export_mobileclip2_coreml.py`.
+- Removed legacy aircraft ONNX artifacts: `src/models/super_specialist.onnx` and `src/models/super_specialist_quantized.onnx`.
 - Cleaned generated PoC output folders from repository working tree.
 - Updated `.gitignore` to exclude local PoC outputs and local cache/index artifacts.
 
 📘 Documentation updates
 - README now documents the recommended pixi workflow (`pixi install`, `pixi run start`).
 - README classifier section updated to prioritize `aviation_model_processed/` checkpoint flow.
+- README now documents checkpoint-only aircraft inference behavior (no ONNX fallback).
 - Added explicit `poc-legacy-rembg` task usage and notes about fail-fast `rembg` behavior.
 
 ## 🚀 Version 2.0.1

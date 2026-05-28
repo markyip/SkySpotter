@@ -26,7 +26,7 @@ from torchvision.transforms import (
 )
 
 # --- CONFIGURATION ---
-DATA_PATH = r"./Processed"
+DATA_PATH = os.environ.get("SkySpotter_TRAIN_DATA_PATH", r"./training_data/classified_images")
 # We use the high-resolution 384px ViT as our foundation
 MODEL_ID = "google/vit-base-patch16-384"
 OUTPUT_DIR = "./aviation_model_processed"
@@ -119,6 +119,13 @@ def train():
         label2id=label2id,
         ignore_mismatched_sizes=True 
     )
+    if torch.cuda.is_available():
+        accel = f"CUDA ({torch.cuda.get_device_name(0)})"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        accel = "MPS (Apple Metal)"
+    else:
+        accel = "CPU"
+    print(f"--- Training accelerator: {accel} ---")
 
     # 5. Training Arguments
     training_args = TrainingArguments(
@@ -138,6 +145,7 @@ def train():
         metric_for_best_model="accuracy",
         save_total_limit=1,
         fp16=torch.cuda.is_available(),
+        bf16=(not torch.cuda.is_available() and hasattr(torch.backends, "mps") and torch.backends.mps.is_available()),
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         dataloader_persistent_workers=True,

@@ -106,6 +106,29 @@ pixi install
 pixi run start
 ```
 
+### macOS: MPS + STRICT_REMBG
+
+On Apple Silicon Macs, SkySpotter can use PyTorch MPS acceleration for aircraft
+checkpoint inference.
+
+Set strict rembg mode to avoid silent fallback behavior during aircraft
+identification:
+
+```bash
+export SkySpotter_STRICT_REMBG=1
+pixi run start
+```
+
+What this does:
+- Prefers Torch device order: `mps` -> `cuda` -> `cpu`.
+- Forces `rembg` (`isnet-general-use`) for the legacy aircraft preprocessing path.
+- If `rembg` initialization fails in strict mode, that classification attempt is skipped instead of silently falling back to the alternate background removal pipeline.
+
+How to verify in logs:
+- Model device line includes `device='mps'` when MPS is active.
+- rembg init line appears as `rembg session initialized: isnet-general-use`.
+- strict mode is shown as `strict_rembg=True` in classifier backend logs.
+
 ### Windows
 
 **Option 1: Using batch script (recommended)**
@@ -217,10 +240,40 @@ If you are on macOS 12 or older, OR if you simply want to permanently bypass all
 
 SkySpotter is equipped with scripts that make it incredibly easy to train a custom image classifier on your own datasets (e.g., classifying bird species or cars).
 
-1. **Organize Your Data**: Create a folder (e.g., `./CustomDataSet/Eagle/`, `./CustomDataSet/Sparrow/`).
-2. **Background Removal**: Use `scripts/batch_bg_pipeline.py` to strip the backgrounds and tightly crop your images before training.
-3. **Train the Model**: Run `python scripts/train_processed_aircraft.py` (or `python scripts/train_aviation_specialist.py` for the legacy path).
-4. **Use the checkpoint directly**: Place your trained checkpoint in `aviation_model_processed/` (contains `config.json`, `model.safetensors`, `preprocessor_config.json`, `labels.txt`).
+1. **Prepare your dataset root**: Use `training_data/classified_images/` (created in this repo). Add one subfolder per class label.
+   - Example:
+     - `training_data/classified_images/F35/`
+     - `training_data/classified_images/F16/`
+     - `training_data/classified_images/AH64/`
+   - A starter template is included at `training_data/classified_images/README.md`.
+2. **Optional preprocessing**: Use `scripts/batch_bg_pipeline.py` to remove background and crop subject-focused training images.
+3. **Train the model** (pixi environment + one-click launcher):
+   - Windows:
+     ```bat
+     train_model.bat
+     ```
+   - macOS/Linux:
+     ```bash
+     ./train_model.sh
+     ```
+   - Direct command:
+   ```bash
+   pixi run python scripts/train_processed_aircraft.py
+   ```
+   (Legacy path is still available via `scripts/train_aviation_specialist.py`.)
+4. **Deploy checkpoint output**: Put the trained checkpoint files in `aviation_model_processed/`:
+   - `config.json`
+   - `model.safetensors`
+   - `preprocessor_config.json`
+   - `labels.txt`
+5. **Runtime behavior**: Aircraft identification is checkpoint-only. If checkpoint loading fails, classification is skipped (no ONNX fallback).
+
+### Training acceleration (GPU)
+
+- **Windows/NVIDIA**: Training uses CUDA automatically when available (`torch.cuda.is_available()`).
+- **Apple Silicon**: Training uses MPS (Metal) when CUDA is unavailable and MPS is available.
+- **Fallback**: If neither CUDA nor MPS is available, training runs on CPU.
+- The trainer prints the detected accelerator at startup (for example: `CUDA (...)`, `MPS (Apple Metal)`, or `CPU`).
 
 ### Legacy PoC (rembg-focused)
 
