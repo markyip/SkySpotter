@@ -112,8 +112,8 @@ def build_processed_dataset(
     source_dir: Path,
     dest_dir: Path,
     *,
-    min_width: int = 350,
-    min_height: int = 350,
+    min_width: int = 400,
+    min_height: int = 400,
     load_image: Callable[[Path], Image.Image],
     focus_point_fn: Optional[Callable[[Path, int, int], Optional[Tuple[float, float]]]] = None,
     progress_callback=None,
@@ -162,7 +162,7 @@ def build_processed_dataset(
                         progress_callback(src_path, status)
                     continue
                 w, h = cropped.size
-                if w < min_width or h < min_height:
+                if w < min_width and h < min_height:
                     skipped += 1
                     if progress_callback:
                         progress_callback(src_path, f"too_small({w}x{h})")

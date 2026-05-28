@@ -57,8 +57,8 @@ def run(
     input_dir: Path,
     output_dir: Path,
     model_dir: Path,
-    min_width: int = 350,
-    min_height: int = 350,
+    min_width: int = 400,
+    min_height: int = 400,
     max_images: int = 0,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -136,7 +136,7 @@ def run(
 
                 w, h = cropped.size
                 cropped.save(out_img)
-                if w < min_width or h < min_height:
+                if w < min_width and h < min_height:
                     row[1] = f"too_small({w}x{h})"
                     writer.writerow(row)
                     f.flush()
@@ -190,8 +190,8 @@ def main():
         default=str(DEFAULT_MODEL_DIR),
         help=f"Checkpoint directory (default: {DEFAULT_MODEL_DIR})",
     )
-    parser.add_argument("--min-width", type=int, default=350)
-    parser.add_argument("--min-height", type=int, default=350)
+    parser.add_argument("--min-width", type=int, default=400)
+    parser.add_argument("--min-height", type=int, default=400)
     parser.add_argument("--max-images", type=int, default=0)
     args = parser.parse_args()
 

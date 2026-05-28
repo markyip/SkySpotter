@@ -802,6 +802,14 @@ class MobileCLIPONNXBackend:
         return arr
 
 
+def _classifier_min_crop_size() -> int:
+    """Classify when either crop side reaches this many px; skip only if both are smaller."""
+    try:
+        return max(1, int(os.environ.get("SkySpotter_CLASSIFIER_MIN_CROP_SIZE", "400")))
+    except (TypeError, ValueError):
+        return 400
+
+
 class MilitaryAircraftClassifier:
     """Specialist ViT classifier for precise military aircraft identification."""
     HUB_REPO_ID = "dima806/military_aircraft_image_detection"
@@ -1039,6 +1047,20 @@ class MilitaryAircraftClassifier:
             except Exception:
                 return image.convert("RGBA")
 
+    def _crop_below_classify_minimum(self, cropped_rgb: Image.Image, file_path: str) -> bool:
+        min_px = _classifier_min_crop_size()
+        w, h = cropped_rgb.size
+        if w >= min_px or h >= min_px:
+            return False
+        logger.info(
+            "[AVIATION AI] Skip classify (crop %dx%d, both sides < %dpx): %s",
+            w,
+            h,
+            min_px,
+            os.path.basename(file_path),
+        )
+        return True
+
     def _legacy_focus_blob_crop(self, file_path: str, image_rgba: Image.Image) -> tuple[Image.Image, str]:
         """Match legacy PoC blob-selection logic (focus-overlap first, else largest blob)."""
         try:
@@ -1225,6 +1247,8 @@ class MilitaryAircraftClassifier:
         ).convert("RGB")
         rgba = self._legacy_bg_remove(src)
         cropped_rgb, mode = self._legacy_focus_blob_crop(file_path, rgba)
+        if self._crop_below_classify_minimum(cropped_rgb, file_path):
+            return ""
         label, conf, _ = self._predict_im(cropped_rgb)
         logger.info(
             "[AVIATION AI] ONNX pipeline mode=%s label=%s conf=%.3f file=%s",
@@ -1445,6 +1469,8 @@ class MilitaryAircraftClassifier:
                 ).convert("RGB")
                 rgba = self._legacy_bg_remove(src)
                 cropped_rgb, mode = self._legacy_focus_blob_crop(file_path, rgba)
+                if self._crop_below_classify_minimum(cropped_rgb, file_path):
+                    return ""
                 label, conf = self._predict_with_torch(cropped_rgb)
                 logger.info(
                     "[AVIATION AI] PyTorch pipeline mode=%s label=%s conf=%.3f file=%s",
