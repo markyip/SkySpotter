@@ -1,4 +1,5 @@
 @echo off
+call "%~dp0_root.bat"
 setlocal
 
 REM Optional override:

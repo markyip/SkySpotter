@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 
 def main():
     parser = argparse.ArgumentParser(description="Plot Hugging Face training history")
-    parser.add_argument("--model-dir", type=str, default="./aviation_model_processed", 
+    parser.add_argument("--model-dir", type=str, default="./app_model", 
                         help="Path to the trained model directory containing trainer_state.json")
     args = parser.parse_args()
 

@@ -952,10 +952,10 @@ class JustifiedGallery(QWidget):
                     w.setText("")
 
             w.show()
-            # Update Tooltip with AI detection info if available
             meta = self._metadata_cache.get(path)
-            if meta and isinstance(meta, dict) and meta.get('detected_aircraft'):
-                w.setToolTip(f"AI: {meta.get('detected_aircraft')}")
+            if meta and isinstance(meta, dict):
+                aircraft = (meta.get("detected_aircraft") or "").strip()
+                w.setToolTip(aircraft if aircraft else os.path.basename(path))
             else:
                 w.setToolTip(os.path.basename(path))
 

@@ -40,12 +40,17 @@ class BackgroundRemover:
         if self.session is None:
             self._ensure_model()
             try:
-                import onnxruntime as ort
-                providers = ['CoreMLExecutionProvider', 'CUDAExecutionProvider', 'TensorrtExecutionProvider', 'DmlExecutionProvider', 'CPUExecutionProvider']
-                available_providers = ort.get_available_providers()
-                selected = [p for p in providers if p in available_providers]
-                self.session = ort.InferenceSession(self.model_path, providers=selected)
-                logger.info(f"[BG Removal] ONNX session initialized with providers: {selected}")
+                from onnxruntime_providers import (
+                    create_onnxruntime_session,
+                    onnxruntime_providers_prefer_dml,
+                )
+
+                providers = onnxruntime_providers_prefer_dml()
+                self.session = create_onnxruntime_session(self.model_path, providers)
+                logger.info(
+                    "[BG Removal] ONNX session initialized with providers: %s",
+                    self.session.get_providers(),
+                )
             except Exception as e:
                 msg = str(e).lower()
                 if "invalid_protobuf" in msg or "protobuf parsing failed" in msg:
@@ -56,12 +61,17 @@ class BackgroundRemover:
                     except OSError:
                         pass
                     self._ensure_model()
-                    import onnxruntime as ort
-                    providers = ['CoreMLExecutionProvider', 'CUDAExecutionProvider', 'TensorrtExecutionProvider', 'DmlExecutionProvider', 'CPUExecutionProvider']
-                    available_providers = ort.get_available_providers()
-                    selected = [p for p in providers if p in available_providers]
-                    self.session = ort.InferenceSession(self.model_path, providers=selected)
-                    logger.info(f"[BG Removal] Re-downloaded model and initialized providers: {selected}")
+                    from onnxruntime_providers import (
+                        create_onnxruntime_session,
+                        onnxruntime_providers_prefer_dml,
+                    )
+
+                    providers = onnxruntime_providers_prefer_dml()
+                    self.session = create_onnxruntime_session(self.model_path, providers)
+                    logger.info(
+                        "[BG Removal] Re-downloaded model; providers: %s",
+                        self.session.get_providers(),
+                    )
                     return
                 logger.error(f"[BG Removal] Failed to initialize ONNX session: {e}")
                 raise

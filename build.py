@@ -41,7 +41,7 @@ def _should_use_project_venv_for_build() -> bool:
     """
     Prefer ./SkySpotter_env so ``pip install`` / PyInstaller do not hit system Python limits.
 
-    - macOS: always (matches ``build_macos.sh``; Homebrew 3.14 may block pip without an
+    - macOS: always (matches ``scripts/launchers/build_macos.sh``; Homebrew 3.14 may block pip without an
       ``EXTERNALLY-MANAGED`` file under ``sys.prefix``).
     - Linux: when PEP 668 marker is present.
     Set ``SkySpotter_USE_SYSTEM_PYTHON_BUILD=1`` to skip and use the current interpreter.
@@ -65,7 +65,7 @@ def ensure_project_venv_and_reexec() -> None:
     """
     Create ./SkySpotter_env if needed and re-exec this script with that interpreter.
 
-    Skips when already using ./SkySpotter_env (e.g. ``./build_macos.sh``) or when
+    Skips when already using ./SkySpotter_env (e.g. ``scripts/launchers/build_macos.sh``) or when
     ``SkySpotter_USE_SYSTEM_PYTHON_BUILD=1``.
     """
     if not _should_use_project_venv_for_build():
@@ -92,7 +92,7 @@ def ensure_project_venv_and_reexec() -> None:
         if rc != 0 or not vpy.is_file():
             print(
                 "[ERROR] Could not create ./SkySpotter_env. From the repo root try:\n"
-                "  ./build_macos.sh\n"
+                "  ./scripts/launchers/build_macos.sh\n"
                 "or:  python3 -m venv SkySpotter_env && ./SkySpotter_env/bin/python3 -m pip install -U pip && "
                 "./SkySpotter_env/bin/python3 build.py"
             )
@@ -198,7 +198,7 @@ def install_dependencies():
         'psutil',  # Added for system memory info in image_cache
         'numpy',   # Required for image processing (used in all modules)
         'qtawesome', # Required for icons in main.py
-        'pyqtgraph',  # Optional/Future dependency included in requirements.txt
+        'pyqtgraph',
         'reverse-geocoder',  # Offline city/country lookup from GPS EXIF
         'pycountry',         # ISO country code -> full country name
         'tokenizers',        # Lightweight tokenizer for SigLIP (Aviation Specialist)
@@ -372,6 +372,16 @@ def main():
                 print(f"[WARNING] Could not fully clean dist directory: {e}")
         except Exception as e:
             print(f"[WARNING] Error cleaning dist directory: {e}")
+
+    # Prevent stale local logs from being packed into installer payload ("src;src").
+    logs_dir = Path("src") / "logs"
+    if logs_dir.exists():
+        try:
+            print("Cleaning src/logs before packaging...")
+            shutil.rmtree(logs_dir)
+        except Exception as e:
+            print(f"[WARNING] Could not clean src/logs: {e}")
+
     # Platform-agnostic icon
     is_aviation = os.environ.get("SkySpotter_AVIATION_BUILD", "").strip().lower() in ("1", "true", "yes")
     
@@ -554,6 +564,9 @@ def main():
             if uninst_src.exists():
                 shutil.copy2(uninst_src, dist_dir / "uninstall.bat")
                 print(f"  Copied uninstall.bat to {dist_dir}")
+            
+            # 2. Build Installer EXE
+            build_installer()
 
         if platform.system() == 'Darwin':
             print("Patching macOS Info.plist...")
@@ -568,9 +581,41 @@ def main():
     if platform.system() == 'Windows' and exe_path.exists():
         print("Build completed successfully.")
 
+def build_installer():
+    """Build the standalone installer EXE on Windows"""
+    print("")
+    print("Building SkySpotter Installer...")
+    
+    if platform.system() != 'Windows':
+        print("[SKIP] Installer build only supported on Windows.")
+        return
 
+    installer_script = REPO_ROOT / "installer.py"
+    if not installer_script.exists():
+        print(f"[ERROR] Installer script not found: {installer_script}")
+        return
 
-
+    icon_path = REPO_ROOT / "icons" / "appicon.ico"
+    
+    cmd = [
+        sys.executable, "-m", "PyInstaller",
+        "--onefile",
+        "--windowed",
+        "--name", "SkySpotter_Setup",
+        "--icon", str(icon_path) if icon_path.exists() else "",
+        "--add-data", f"dist/SkySpotter;SkySpotter",
+        "--clean",
+        "installer.py"
+    ]
+    
+    # Remove empty strings from cmd (like if icon_path didn't exist)
+    cmd = [c for c in cmd if c]
+    
+    print(f"Running: {' '.join(cmd)}")
+    if run_command(cmd):
+        print("[SUCCESS] Installer created: dist/SkySpotter_Setup.exe")
+    else:
+        print("[ERROR] Installer build failed.")
 
 
 if __name__ == '__main__':

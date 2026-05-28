@@ -192,6 +192,31 @@ def _redirect_stdio_to_file_if_needed():
 _redirect_stdio_to_file_if_needed()
 
 
+def _skyspotter_log_dir():
+    """Return SkySpotter's persistent log directory for this platform (created if possible)."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(
+            os.path.expanduser("~"), "AppData", "Local"
+        )
+        log_dir = os.path.join(base, "SkySpotter", "logs")
+    elif sys.platform == "darwin":
+        log_dir = os.path.join(
+            os.path.expanduser("~/Library/Application Support"),
+            "SkySpotter",
+            "logs",
+        )
+    else:
+        data_home = os.environ.get("XDG_DATA_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "share"
+        )
+        log_dir = os.path.join(data_home, "SkySpotter", "logs")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError:
+        pass
+    return log_dir
+
+
 def _enable_fatal_crash_dump_if_needed():
     """
     Enable low-level fatal crash dumps (access violation/segfault) very early.
@@ -208,7 +233,7 @@ def _enable_fatal_crash_dump_if_needed():
         candidates = [
             os.path.join(base_dir, "src", "logs"),
             os.path.join(base_dir, "logs"),
-            os.path.join(os.environ.get("LOCALAPPDATA", "C:\\"), "RAWviewer", "logs"),
+            _skyspotter_log_dir(),
         ]
         dump_dir = None
         for d in candidates:
@@ -684,15 +709,13 @@ def global_exception_handler(exc_type, exc_value, exc_traceback):
     logger = logging.getLogger(__name__)
     logger.critical("Uncaught Exception:\n" + tb_text)
     
-    # Write to a persistent crash report file in LocalAppData
+    # Write to a persistent crash report file in the platform app-data log directory
     try:
-        app_data = os.environ.get('LOCALAPPDATA', 'C:\\')
-        log_dir = os.path.join(app_data, "RAWviewer", "logs")
-        os.makedirs(log_dir, exist_ok=True)
+        log_dir = _skyspotter_log_dir()
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         crash_file = os.path.join(log_dir, f'crash_report_{timestamp}.txt')
         with open(crash_file, "w", encoding="utf-8") as f:
-            f.write(f"RAWviewer Crash Report - {timestamp}\n")
+            f.write(f"SkySpotter Crash Report - {timestamp}\n")
             f.write("="*50 + "\n\n")
             f.write(tb_text)
     except Exception as e:
@@ -2066,6 +2089,12 @@ class SemanticIndexSignals(QObject):
     progress = pyqtSignal(object, int, int, str)  # token, current, total, basename
     done = pyqtSignal(object, object)             # token, result dict
     error = pyqtSignal(object, str)               # token, error
+
+class AircraftAutoSortSignals(QObject):
+    progress = pyqtSignal(str)
+    done = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
 
 class SemanticAssetDownloadSignals(QObject):
     """Signal carrier for background semantic backend asset download."""
@@ -4013,9 +4042,11 @@ class _LegacyGalleryCompatBlock:
 # Refactored: Legacy code (RAWProcessor, JustifiedGallery) removed.
 # Components moved to src/ui/ and src/enhanced_raw_processor.py
 
+APP_BRAND = "SkySpotter"
+
 class CustomTitleBar(QFrame):
     """Material Design 3 style custom title bar for frameless window."""
-    def __init__(self, parent=None, title="RAW Image Viewer"):
+    def __init__(self, parent=None, title=APP_BRAND):
         super().__init__(parent)
         self.parent = parent
         self.setFixedHeight(40)  # Smaller height
@@ -4194,9 +4225,16 @@ class CustomTitleBar(QFrame):
 
 class CustomConfirmDialog(QDialog):
     """Material Design 3 style confirmation dialog with custom title bar."""
-    def __init__(self, parent=None, title="Confirm Delete", message="", informative_text=""):
+    def __init__(
+        self,
+        parent=None,
+        title="Confirm Delete",
+        message="",
+        informative_text="",
+        confirm_label="Delete",
+    ):
         super().__init__(parent)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setModal(True)
         
@@ -4225,7 +4263,22 @@ class CustomConfirmDialog(QDialog):
         content_layout = QVBoxLayout(content_widget)
         content_layout.setContentsMargins(24, 24, 24, 24)
         content_layout.setSpacing(16)
-        
+
+        dialog_body_width = 372  # 420 dialog width minus horizontal margins
+
+        if title:
+            title_label = QLabel(title)
+            title_label.setWordWrap(True)
+            title_label.setStyleSheet("""
+                QLabel {
+                    color: #E0E0E0;
+                    font-size: 17px;
+                    font-weight: 600;
+                    font-family: 'Roboto', 'Segoe UI', sans-serif;
+                }
+            """)
+            content_layout.addWidget(title_label)
+
         # Message text (no icon)
         message_label = QLabel(message)
         message_label.setWordWrap(True)
@@ -4242,6 +4295,10 @@ class CustomConfirmDialog(QDialog):
         if informative_text:
             info_label = QLabel(informative_text)
             info_label.setWordWrap(True)
+            info_label.setMinimumWidth(dialog_body_width)
+            info_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
             info_label.setStyleSheet("""
                 QLabel {
                     color: #B0B0B0;
@@ -4250,7 +4307,20 @@ class CustomConfirmDialog(QDialog):
                     line-height: 1.5;
                 }
             """)
-            content_layout.addWidget(info_label)
+            info_scroll = QScrollArea()
+            info_scroll.setWidgetResizable(True)
+            info_scroll.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            info_scroll.setFrameShape(QFrame.Shape.NoFrame)
+            info_scroll.setStyleSheet(
+                "QScrollArea { background: transparent; border: none; }"
+            )
+            info_scroll.setWidget(info_label)
+            info_label.adjustSize()
+            scroll_h = min(280, max(96, info_label.sizeHint().height() + 12))
+            info_scroll.setFixedHeight(scroll_h)
+            content_layout.addWidget(info_scroll)
         
         # Buttons - horizontally centered
         button_layout = QHBoxLayout()
@@ -4285,33 +4355,53 @@ class CustomConfirmDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
         button_layout.addWidget(cancel_btn)
         
-        # Delete button (MD3 style - filled, with warning color)
-        delete_btn = QPushButton("Delete")
-        delete_btn.setFixedHeight(40)
-        delete_btn.setMinimumWidth(100)
-        delete_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        delete_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #FF5252;
-                color: white;
-                border: none;
-                border-radius: 20px;
-                font-size: 14px;
-                font-weight: 500;
-                font-family: 'Roboto', 'Segoe UI', sans-serif;
-                padding: 0px 24px;
-            }
-            QPushButton:hover {
-                background-color: #FF6B6B;
-            }
-            QPushButton:pressed {
-                background-color: #FF4444;
-            }
-        """)
-        delete_btn.clicked.connect(self.accept)
-        delete_btn.setDefault(True)
-        delete_btn.setFocus()
-        button_layout.addWidget(delete_btn)
+        # Confirm button (destructive red for delete; primary blue otherwise)
+        confirm_btn = QPushButton(confirm_label)
+        confirm_btn.setFixedHeight(40)
+        confirm_btn.setMinimumWidth(100)
+        confirm_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        if confirm_label == "Delete":
+            confirm_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #FF5252;
+                    color: white;
+                    border: none;
+                    border-radius: 20px;
+                    font-size: 14px;
+                    font-weight: 500;
+                    font-family: 'Roboto', 'Segoe UI', sans-serif;
+                    padding: 0px 24px;
+                }
+                QPushButton:hover {
+                    background-color: #FF6B6B;
+                }
+                QPushButton:pressed {
+                    background-color: #FF4444;
+                }
+            """)
+        else:
+            confirm_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #4A90D9;
+                    color: white;
+                    border: none;
+                    border-radius: 20px;
+                    font-size: 14px;
+                    font-weight: 500;
+                    font-family: 'Roboto', 'Segoe UI', sans-serif;
+                    padding: 0px 24px;
+                }
+                QPushButton:hover {
+                    background-color: #5BA0E8;
+                }
+                QPushButton:pressed {
+                    background-color: #3A80C9;
+                }
+            """)
+        confirm_btn.clicked.connect(self.accept)
+        confirm_btn.setDefault(True)
+        confirm_btn.setFocus()
+        button_layout.addWidget(confirm_btn)
         
         # Add stretch after buttons to center them
         button_layout.addStretch()
@@ -4319,21 +4409,37 @@ class CustomConfirmDialog(QDialog):
         content_layout.addLayout(button_layout)
         main_layout.addWidget(content_widget)
         
-        # Set container size and position
-        self.container.setFixedSize(420, 220)
         container_layout = QVBoxLayout(self)
         container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.addWidget(self.container)
-        
-        # Set dialog size (slightly larger for shadow effect)
-        self.setFixedSize(420, 220)
-        
-        # Center on parent
-        if parent:
-            parent_geometry = parent.geometry()
-            dialog_x = parent_geometry.x() + (parent_geometry.width() - self.width()) // 2
-            dialog_y = parent_geometry.y() + (parent_geometry.height() - self.height()) // 2
-            self.move(dialog_x, dialog_y)
+
+        self.container.adjustSize()
+        hint = self.container.sizeHint()
+        screen = None
+        app = QApplication.instance()
+        if app is not None:
+            screen = app.primaryScreen()
+        max_dialog_h = 600
+        if screen is not None:
+            max_dialog_h = max(320, int(screen.availableGeometry().height() * 0.75))
+        width = max(420, min(560, hint.width() + 4))
+        height = max(200, min(max_dialog_h, hint.height() + 4))
+        self.container.setFixedSize(width, height)
+        self.setFixedSize(width, height)
+
+        # Center on parent (or screen)
+        if parent is not None:
+            center_global = parent.mapToGlobal(parent.rect().center())
+            self.move(
+                center_global.x() - self.width() // 2,
+                center_global.y() - self.height() // 2,
+            )
+        elif screen is not None:
+            ag = screen.availableGeometry()
+            self.move(
+                ag.x() + (ag.width() - self.width()) // 2,
+                ag.y() + (ag.height() - self.height()) // 2,
+            )
         
         # Store result
         self.result_value = False
@@ -4373,11 +4479,11 @@ class CustomConfirmDialog(QDialog):
 
 
 class MobileCLIPDownloadDialog(QDialog):
-    """RAWviewer-styled prompt for downloading optional MobileCLIP assets."""
+    """SkySpotter-styled prompt for downloading optional MobileCLIP assets."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setModal(True)
 
@@ -4406,10 +4512,18 @@ class MobileCLIPDownloadDialog(QDialog):
         """)
         main_layout.addWidget(title_label)
 
-        message_label = QLabel(
-            "RAWviewer can download the MobileCLIP Core ML assets now. "
-            "This is a one-time download used for local, offline semantic indexing."
-        )
+        if sys.platform == "darwin":
+            download_blurb = (
+                "SkySpotter can download the MobileCLIP Core ML assets now. "
+                "This is a one-time download used for local, offline semantic indexing."
+            )
+        else:
+            download_blurb = (
+                "SkySpotter can download the semantic search models now "
+                "(SigLIP ONNX, about 400 MB). This is a one-time download used for "
+                "local, offline gallery search."
+            )
+        message_label = QLabel(download_blurb)
         message_label.setWordWrap(True)
         message_label.setStyleSheet("""
             QLabel {
@@ -4577,7 +4691,7 @@ class SingleImageViewOverlay(QWidget):
             self._schedule_hide_filmstrip()
 
     def _schedule_hide_filmstrip(self) -> None:
-        self._hide_filmstrip_timer.start(450)
+        self._hide_filmstrip_timer.start(0)
 
     def _hide_filmstrip_if_inactive(self) -> None:
         if self._filmstrip_pointer_active:
@@ -4591,7 +4705,7 @@ class SingleImageViewOverlay(QWidget):
 
     def _pointer_in_bottom_hotzone(self) -> bool:
         pos = self.mapFromGlobal(QCursor.pos())
-        return pos.y() >= self.height() - self._BOTTOM_HOTZONE
+        return self.rect().contains(pos) and (pos.y() >= self.height() - self._BOTTOM_HOTZONE)
 
     def _local_pos_from_global(self, global_pos) -> QPoint:
         if hasattr(global_pos, "toPoint"):
@@ -4603,7 +4717,7 @@ class SingleImageViewOverlay(QWidget):
         if not self._filmstrip.isEnabled():
             return
         pos = self._local_pos_from_global(global_pos)
-        in_hot = pos.y() >= self.height() - self._BOTTOM_HOTZONE
+        in_hot = self.rect().contains(pos) and (pos.y() >= self.height() - self._BOTTOM_HOTZONE)
         over_strip = self._filmstrip.isVisible() and self._filmstrip.geometry().contains(pos)
         if in_hot or over_strip or self._filmstrip.underMouse():
             self._hide_filmstrip_timer.stop()
@@ -4620,6 +4734,8 @@ class SingleImageViewOverlay(QWidget):
             self._layout_filmstrip()
             self._filmstrip.raise_()
             self._hist.raise_()
+            if hasattr(self._filmstrip, "center_on_current"):
+                QTimer.singleShot(0, lambda: self._filmstrip.center_on_current())
             if hasattr(self._filmstrip, "refresh_visible_thumbnails"):
                 QTimer.singleShot(0, lambda: self._filmstrip.refresh_visible_thumbnails(
                     refresh_cache=True
@@ -5038,6 +5154,12 @@ class RAWImageViewer(QMainWindow):
         self._semantic_search_corpus_files = []
         self._semantic_index_active_token = None
         self._semantic_indexing_in_progress = False
+        self._pending_aircraft_auto_sort = False
+        self._aircraft_auto_sort_in_progress = False
+        self._aircraft_auto_sort_active_token = None
+        self._aircraft_auto_sort_signals = None
+        self._aircraft_auto_sort_active_token = None
+        self._aircraft_auto_sort_signals = None
         self._face_index_active_token = None
         self._face_indexing_in_progress = False
         self._face_index_signals = None
@@ -5518,6 +5640,35 @@ class RAWImageViewer(QMainWindow):
         path = files[index]
         if _norm_path(path) == _norm_path(getattr(self, "current_file_path", "")):
             return
+
+        # Maintain zoom state if not in fit-to-window mode
+        if not getattr(self, "fit_to_window", True):
+            self._preserve_nav_zoom_active = True
+            self._maintain_zoom_on_navigation = True
+            if hasattr(self, "_zoom_anchor_for_navigation_restore"):
+                self._restore_zoom_center = self._zoom_anchor_for_navigation_restore()
+            self._restore_zoom_level = getattr(self, "current_zoom_level", 1.0)
+            if getattr(self, "current_pixmap", None):
+                self._restore_pixmap_size = self.current_pixmap.size()
+            try:
+                if not hasattr(self, 'scroll_area') or self.scroll_area is None:
+                    self._restore_start_scroll_x = 0
+                    self._restore_start_scroll_y = 0
+                else:
+                    self._restore_start_scroll_x = self.scroll_area.horizontalScrollBar().value()
+                    self._restore_start_scroll_y = self.scroll_area.verticalScrollBar().value()
+            except Exception:
+                self._restore_start_scroll_x = 0
+                self._restore_start_scroll_y = 0
+        else:
+            self._preserve_nav_zoom_active = False
+            if hasattr(self, '_maintain_zoom_on_navigation'):
+                delattr(self, '_maintain_zoom_on_navigation')
+            self._restore_zoom_center = None
+            self._restore_zoom_level = None
+            self._restore_start_scroll_x = None
+            self._restore_start_scroll_y = None
+
         self.current_file_index = index
         self.load_raw_image(path)
 
@@ -6096,7 +6247,7 @@ class RAWImageViewer(QMainWindow):
         # Set window to frameless for custom title bar only on Windows
         if platform.system() == 'Windows':
             self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
-        self.setWindowTitle('RAWviewer v2.0.1')
+        self.setWindowTitle(APP_BRAND)
         
         # Set simple background style (no rounded corners - simplifies window resizing)
         self.setStyleSheet("""
@@ -6160,7 +6311,7 @@ class RAWImageViewer(QMainWindow):
         
         # Create custom title bar only on Windows
         if platform.system() == 'Windows':
-            self.title_bar = CustomTitleBar(self, title="RAWviewer v2.0.1")
+            self.title_bar = CustomTitleBar(self, title=APP_BRAND)
         else:
             self.title_bar = None
         
@@ -6271,15 +6422,14 @@ class RAWImageViewer(QMainWindow):
         self.image_label.setText(
             "No image loaded\n\n"
             "Click 📁 or drag and drop a folder or image to load it\n"
-            "Press Space to toggle between fit-to-window and 100% zoom\n"
-            "Double-click image to zoom in/out\n"
+            "Press Space or Double-click to toggle fit-to-window / 100% zoom\n"
             "Click and drag to pan when zoomed\n"
             "Use Left/Right arrow keys to navigate between images (preserves zoom if zoomed in)\n"
             "Bottom bar: Share and other controls when images are loaded\n"
             "Press Down Arrow to move the current image to Discard folder\n"
             "Press Delete to remove the current image\n"
-            "Press H to show or hide histogram\n"
-            "Press F — show dashed focus / subject outline from EXIF (amber = maker AF; lime = Subject / CIPA)\n"
+            "H — Show/hide histogram\n"
+            "F — Show/hide focus point\n"
             "Scroll wheel (fit-to-window): Scroll down = previous image, Scroll up = next image\n"
             "Horizontal wheel (zoom mode): Scroll left/right to pan the image"
         )
@@ -6528,7 +6678,9 @@ class RAWImageViewer(QMainWindow):
         self.gallery_search_status_label.hide()
 
         self.gallery_search_input = QLineEdit()
-        self.gallery_search_input.setPlaceholderText("Search gallery")
+        self.gallery_search_input.setPlaceholderText(
+            "Filter gallery (camera:, iso, aircraft:F-35, …)"
+        )
         self.gallery_search_input.setClearButtonEnabled(True)
         self.gallery_search_input.setMinimumWidth(140)
         self.gallery_search_input.setMaximumWidth(260)
@@ -6594,10 +6746,29 @@ class RAWImageViewer(QMainWindow):
             }
         """)
 
+        self.magic_wand_button = QPushButton()
+        self.magic_wand_button.setFlat(True)
+        self.magic_wand_button.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        if qta is not None:
+            try:
+                self.magic_wand_button.setIcon(qta.icon("fa5s.magic", color="#B0B0B0"))
+                self.magic_wand_button.setIconSize(QSize(20, 20))
+            except Exception:
+                self.magic_wand_button.setText("Sort")
+        else:
+            self.magic_wand_button.setText("Sort")
+        self.magic_wand_button.setStyleSheet(bottom_icon_btn_style)
+        self.magic_wand_button.setToolTip("Auto-sort by aircraft type")
+        self.magic_wand_button.clicked.connect(self._on_magic_wand_clicked)
+        self.magic_wand_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.magic_wand_button.hide()
+
         self.right_status_actions = QWidget()
         right_status_actions_layout = QHBoxLayout(self.right_status_actions)
         right_status_actions_layout.setContentsMargins(0, 0, 0, 0)
         right_status_actions_layout.setSpacing(8)
+        right_status_actions_layout.addWidget(
+            self.magic_wand_button, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
         right_status_actions_layout.addWidget(
             self.share_bottom_button, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
         right_status_actions_layout.addWidget(
@@ -7036,7 +7207,7 @@ class RAWImageViewer(QMainWindow):
             indexed_files,
         )
         self._gallery_search_placeholder_saved = self.gallery_search_input.placeholderText()
-        self.gallery_search_input.setPlaceholderText("EXIF only")
+        self.gallery_search_input.setPlaceholderText("Filter while indexing…")
         QThreadPool.globalInstance().start(worker)
 
     def _on_semantic_index_progress(self, token, i, n, message):
@@ -7084,9 +7255,16 @@ class RAWImageViewer(QMainWindow):
             ):
                 self.gallery_search_input.setFocus()
         self._gallery_search_user_collapsed_while_busy = False
+        from semantic_search import semantic_embeddings_enabled
+
+        label = (
+            "Aircraft indexing complete"
+            if not semantic_embeddings_enabled()
+            else "Semantic index ready"
+        )
         self.status_bar.showMessage(
-            "Semantic index ready: "
-            f"indexed {result.get('indexed', 0)}, skipped {result.get('skipped', 0)}, "
+            f"{label}: indexed {result.get('indexed', 0)}, "
+            f"skipped {result.get('skipped', 0)}, "
             f"failed {result.get('failed', 0)}",
             5000,
         )
@@ -7096,6 +7274,8 @@ class RAWImageViewer(QMainWindow):
         )
         if corpus:
             self._start_face_index_background(corpus)
+        self._update_magic_wand_visibility()
+        self._refresh_gallery_aircraft_metadata(corpus)
 
     def _start_face_index_background(self, corpus_files) -> None:
         """Second pass: face_count backfill after semantic search is usable."""
@@ -7184,6 +7364,288 @@ class RAWImageViewer(QMainWindow):
         self._set_gallery_search_status("")
         self.status_bar.showMessage(f"Face scan failed: {error}", 5000)
 
+    def _set_magic_wand_enabled(self, enabled: bool) -> None:
+        btn = getattr(self, "magic_wand_button", None)
+        if btn is not None:
+            btn.setEnabled(bool(enabled))
+
+    def _refresh_gallery_aircraft_metadata(self, file_paths=None) -> None:
+        """Merge indexed aircraft labels into gallery metadata and refresh visible tiles."""
+        paths = list(
+            file_paths
+            or getattr(self, "_semantic_search_corpus_files", None)
+            or getattr(self, "image_files", None)
+            or []
+        )
+        if not paths:
+            return
+        try:
+            index = self._get_semantic_index()
+            labels = index.get_detected_aircraft_for_paths(paths)
+        except Exception as e:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "[GALLERY] Could not load aircraft labels for refresh: %s", e
+            )
+            return
+        if not labels:
+            return
+        bulk = getattr(self, "_gallery_bulk_metadata", None) or {}
+        for fp, aircraft in labels.items():
+            ac = (aircraft or "").strip()
+            if not ac:
+                continue
+            if fp not in bulk:
+                bulk[fp] = {}
+            bulk[fp]["detected_aircraft"] = ac
+        self._gallery_bulk_metadata = bulk
+        if getattr(self, "view_mode", "single") != "gallery":
+            return
+        gj = getattr(self, "gallery_justified", None)
+        if gj is None or not getattr(self, "image_files", None):
+            return
+        try:
+            gj.set_images(self.image_files, bulk)
+        except Exception as e:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "[GALLERY] Gallery aircraft tooltip refresh failed: %s", e
+            )
+
+    def _folder_has_sortable_aircraft_labels(self) -> bool:
+        """True when at least one image has a non-empty aircraft label from indexing."""
+        if getattr(self, "view_mode", "single") != "gallery":
+            return False
+        folder = getattr(self, "current_folder", None)
+        if not folder or not os.path.isdir(folder):
+            return False
+        corpus = list(
+            getattr(self, "_semantic_search_corpus_files", None)
+            or getattr(self, "image_files", None)
+            or []
+        )
+        if not corpus:
+            return False
+        try:
+            index = self._get_semantic_index()
+            labels = index.get_detected_aircraft_for_paths(corpus)
+        except Exception:
+            return False
+        skip = {"unknown", "unidentified", "n/a", "none", ""}
+        for path in corpus:
+            label = (labels.get(path) or "").strip().lower()
+            if label and label not in skip:
+                return True
+        return False
+
+    def _update_magic_wand_visibility(self) -> None:
+        btn = getattr(self, "magic_wand_button", None)
+        if btn is None:
+            return
+        if getattr(self, "view_mode", "single") != "gallery":
+            btn.hide()
+            return
+        if self._folder_has_sortable_aircraft_labels():
+            btn.show()
+            self._set_magic_wand_enabled(
+                not getattr(self, "_aircraft_auto_sort_in_progress", False)
+            )
+        else:
+            btn.hide()
+
+    def _on_magic_wand_clicked(self) -> None:
+        if getattr(self, "_aircraft_auto_sort_in_progress", False):
+            return
+        folder = getattr(self, "current_folder", None)
+        if not folder or not os.path.isdir(folder):
+            self.status_bar.showMessage("Open a folder first", 3000)
+            return
+        if getattr(self, "_semantic_indexing_in_progress", False):
+            self.status_bar.showMessage(
+                "Wait for indexing to finish before auto-sort", 4000
+            )
+            return
+        corpus = list(
+            getattr(self, "_semantic_search_corpus_files", None)
+            or getattr(self, "image_files", None)
+            or []
+        )
+        if not corpus:
+            self.status_bar.showMessage("No images in this folder", 3000)
+            return
+        try:
+            index = self._get_semantic_index()
+            labels = index.get_detected_aircraft_for_paths(corpus)
+        except Exception as e:
+            self.show_error("Auto-sort", f"Could not read aircraft labels:\n{e}")
+            return
+        skip_labels = {"unknown", "unidentified", "n/a", "none", ""}
+        labeled = [
+            p
+            for p in corpus
+            if (labels.get(p) or "").strip().lower() not in skip_labels
+        ]
+        if not labeled:
+            self.show_error(
+                "Auto-sort",
+                "No AI aircraft labels found yet.\n\n"
+                "Wait until gallery indexing finishes (aircraft classification runs "
+                "during indexing), then try again.",
+            )
+            return
+        dialog = CustomConfirmDialog(
+            parent=self,
+            title="Auto-sort by aircraft",
+            message="Move images into subfolders based on detected aircraft type?",
+            informative_text=(
+                f"Folder: {os.path.basename(folder)}\n"
+                f"Images with labels: {len(labeled)} of {len(corpus)}\n\n"
+                f"Files will be moved to:\n"
+                f"  {folder}/<aircraft label>/filename\n\n"
+                "Images without a label stay where they are. "
+                "The gallery will show images in the folder and one level of "
+                "subfolders after sorting (not deeper nested paths)."
+            ),
+            confirm_label="Sort",
+        )
+        dialog.exec()
+        if not dialog.result_value:
+            return
+        self._start_aircraft_auto_sort(folder, corpus, labels)
+
+    def _start_aircraft_auto_sort(self, folder, file_paths, labels_map) -> None:
+        token = time.time_ns()
+        self._aircraft_auto_sort_active_token = token
+        self._aircraft_auto_sort_in_progress = True
+        self._update_magic_wand_visibility()
+        signals = AircraftAutoSortSignals()
+        self._aircraft_auto_sort_signals = signals
+        signals.progress.connect(self._on_aircraft_auto_sort_progress)
+        signals.done.connect(self._on_aircraft_auto_sort_done)
+        signals.error.connect(self._on_aircraft_auto_sort_error)
+
+        class _AircraftAutoSortWorker(QRunnable):
+            def __init__(self_inner, active_token, root_folder, paths, labels, sigs):
+                super().__init__()
+                self_inner.token = active_token
+                self_inner.root_folder = root_folder
+                self_inner.paths = paths
+                self_inner.labels = labels
+                self_inner.signals = sigs
+
+            def run(self_inner):
+                import shutil
+
+                try:
+                    moved = 0
+                    skipped = 0
+                    errors = []
+                    total = len(self_inner.paths)
+                    for i, path in enumerate(self_inner.paths):
+                        base = os.path.basename(path)
+                        self_inner.signals.progress.emit(
+                            f"Sorting {i + 1}/{total}: {base}"
+                        )
+                        label = (self_inner.labels.get(path) or "").strip()
+                        if not label or label.lower() in {
+                            "unknown",
+                            "unidentified",
+                            "n/a",
+                            "none",
+                        }:
+                            skipped += 1
+                            continue
+                        safe = RAWImageViewer._sanitize_aircraft_folder_name(label)
+                        if not safe:
+                            skipped += 1
+                            continue
+                        dest_dir = os.path.join(self_inner.root_folder, safe)
+                        parent_norm = os.path.normpath(os.path.dirname(path))
+                        if parent_norm == os.path.normpath(dest_dir):
+                            skipped += 1
+                            continue
+                        try:
+                            os.makedirs(dest_dir, exist_ok=True)
+                        except OSError as exc:
+                            errors.append(f"{base}: {exc}")
+                            continue
+                        dest_path = os.path.join(dest_dir, base)
+                        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(
+                            os.path.abspath(dest_path)
+                        ):
+                            skipped += 1
+                            continue
+                        if os.path.exists(dest_path):
+                            stem, ext = os.path.splitext(dest_path)
+                            n = 1
+                            while os.path.exists(dest_path):
+                                dest_path = f"{stem}_{n}{ext}"
+                                n += 1
+                        try:
+                            shutil.move(path, dest_path)
+                            moved += 1
+                        except OSError as exc:
+                            errors.append(f"{base}: {exc}")
+
+                    self_inner.signals.done.emit(
+                        {
+                            "token": self_inner.token,
+                            "folder": self_inner.root_folder,
+                            "moved": moved,
+                            "skipped": skipped,
+                            "errors": errors,
+                        }
+                    )
+                except Exception as exc:
+                    self_inner.signals.error.emit(str(exc))
+
+        self.status_bar.showMessage("Auto-sorting by aircraft type...")
+        worker = _AircraftAutoSortWorker(token, folder, list(file_paths), labels_map, signals)
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_aircraft_auto_sort_progress(self, message: str) -> None:
+        if getattr(self, "_aircraft_auto_sort_in_progress", False):
+            self.status_bar.showMessage(str(message))
+
+    def _on_aircraft_auto_sort_done(self, result: dict) -> None:
+        if result.get("token") != getattr(self, "_aircraft_auto_sort_active_token", None):
+            return
+        try:
+            folder = result.get("folder")
+            moved = int(result.get("moved", 0))
+            skipped = int(result.get("skipped", 0))
+            errors = result.get("errors") or []
+            msg = f"Auto-sort complete: moved {moved}, skipped {skipped}"
+            if errors:
+                msg += f", {len(errors)} error(s)"
+            self.status_bar.showMessage(msg, 6000)
+            if folder and os.path.isdir(folder):
+                view = getattr(self, "view_mode", "gallery")
+                start_view = view if view in ("gallery", "single") else "gallery"
+                self.load_folder_images(folder, start_view=start_view)
+            if errors:
+                preview = "\n".join(str(e) for e in errors[:12])
+                if len(errors) > 12:
+                    preview += f"\n… and {len(errors) - 12} more"
+                self.show_error("Auto-sort errors", preview)
+        finally:
+            self._aircraft_auto_sort_in_progress = False
+            self._aircraft_auto_sort_active_token = None
+            self._aircraft_auto_sort_signals = None
+            self._update_magic_wand_visibility()
+
+    def _on_aircraft_auto_sort_error(self, error: str) -> None:
+        try:
+            self.status_bar.showMessage(f"Auto-sort failed: {error}", 6000)
+            self.show_error("Auto-sort", str(error))
+        finally:
+            self._aircraft_auto_sort_in_progress = False
+            self._aircraft_auto_sort_active_token = None
+            self._aircraft_auto_sort_signals = None
+            self._update_magic_wand_visibility()
+
     def _on_semantic_index_error(self, token, error):
         if token != self._semantic_index_active_token:
             return
@@ -7242,21 +7704,21 @@ class RAWImageViewer(QMainWindow):
                 except Exception as e:
                     self_inner.signals.error.emit(self_inner.token, str(e))
 
-        self._set_gallery_search_status("Downloading MobileCLIP semantic assets...")
+        self._set_gallery_search_status("Downloading semantic search models...")
         worker = _SemanticAssetDownloadWorker(token, index, list(corpus_files), signals)
         QThreadPool.globalInstance().start(worker)
 
     def _on_semantic_asset_download_progress(self, token, message):
         if not self._semantic_asset_download_in_progress:
             return
-        self._set_gallery_search_status(message or "Downloading MobileCLIP semantic assets...")
+        self._set_gallery_search_status(message or "Downloading semantic search models...")
 
     def _on_semantic_asset_download_done(self, token, asset_path, corpus_files):
         if not self._semantic_asset_download_in_progress:
             return
         self._semantic_asset_download_in_progress = False
         self._semantic_asset_download_signals = None
-        self.status_bar.showMessage(f"MobileCLIP assets ready: {asset_path}", 4000)
+        self.status_bar.showMessage(f"Semantic models ready: {asset_path}", 4000)
         self._start_semantic_index_build_background(corpus_files)
 
     def _on_semantic_asset_download_error(self, token, error):
@@ -7264,9 +7726,9 @@ class RAWImageViewer(QMainWindow):
             return
         self._semantic_asset_download_in_progress = False
         self._semantic_asset_download_signals = None
-        self._set_gallery_search_status("MobileCLIP asset download failed")
+        self._set_gallery_search_status("Semantic model download failed")
         self._gallery_search_user_collapsed_while_busy = False
-        self.status_bar.showMessage(f"MobileCLIP download failed: {error}", 7000)
+        self.status_bar.showMessage(f"Semantic model download failed: {error}", 7000)
 
     def _on_search_bottom_clicked(self):
         if getattr(self, "view_mode", "single") != "gallery":
@@ -7300,30 +7762,49 @@ class RAWImageViewer(QMainWindow):
             return
             
         try:
+            from semantic_search import semantic_embeddings_enabled
+
             index = self._get_semantic_index()
-            backend_available = index.semantic_backend_available()
             coverage = self._is_semantic_index_ready(corpus_files)
-            
             ready = int(coverage.get("ready", 0)) == 1
+            indexed = int(coverage.get("indexed", 0))
+            total = int(coverage.get("total", len(corpus_files)))
+
+            if not semantic_embeddings_enabled():
+                self._set_gallery_search_status(
+                    "Aircraft & camera filters"
+                )
+                if not ready and indexed < total:
+                    self._start_semantic_index_build_background(corpus_files, coverage=coverage)
+                elif ready:
+                    self.status_bar.showMessage("Aircraft labels ready", 2500)
+                return
+
+            backend_available = index.semantic_backend_available()
             if not backend_available:
                 backend_error = index.semantic_backend_error()
-                if "Missing MobileCLIP" in backend_error and index.mobileclip_supports_hub_download():
-                    if not getattr(self, "_mobileclip_download_dismissed_this_session", False):
-                        dialog = MobileCLIPDownloadDialog(self)
-                        if dialog.exec() == QDialog.DialogCode.Accepted:
-                            self._start_semantic_asset_download_background(corpus_files)
-                        else:
-                            self._mobileclip_download_dismissed_this_session = True
+                missing_models = (
+                    "Missing" in backend_error
+                    or "vision_model" in backend_error
+                    or "text_model" in backend_error
+                )
+                if (
+                    missing_models
+                    and index.mobileclip_supports_hub_download()
+                    and not getattr(self, "_mobileclip_download_dismissed_this_session", False)
+                ):
+                    dialog = MobileCLIPDownloadDialog(self)
+                    if dialog.exec() == QDialog.DialogCode.Accepted:
+                        self._start_semantic_asset_download_background(corpus_files)
+                    else:
+                        self._mobileclip_download_dismissed_this_session = True
                 else:
                     self._set_gallery_search_status(f"EXIF search only. Backend: {backend_error}")
-            elif coverage.get("indexed", 0) > 0:
-                indexed = int(coverage.get("indexed", 0))
-                total = int(coverage.get("total", len(corpus_files)))
+            elif indexed > 0:
                 if ready:
                     self.status_bar.showMessage("Semantic index ready", 2500)
                 else:
                     self.status_bar.showMessage(f"Semantic index available ({indexed}/{total}).", 3500)
-                # Ensure we finish indexing the rest in the background
                 if indexed < total:
                     self._start_semantic_index_build_background(corpus_files, coverage=coverage)
             else:
@@ -7410,9 +7891,11 @@ class RAWImageViewer(QMainWindow):
                 base_files = list(self.image_files)
             if self._semantic_search_backup_files is None:
                 self._semantic_search_backup_files = list(base_files)
+            from semantic_search import semantic_embeddings_enabled
+
             if getattr(self, "_semantic_indexing_in_progress", False):
                 self.status_bar.showMessage(
-                    "Searching while indexing… EXIF/metadata covers whole album; semantic ranking improves as indexing progresses.",
+                    "Searching while indexing… filters work now; aircraft labels fill in as indexing progresses.",
                     4500,
                 )
             else:
@@ -7427,6 +7910,16 @@ class RAWImageViewer(QMainWindow):
             used_semantic_backend = False
             if not semantic_query:
                 hits = metadata_hits
+            elif not semantic_embeddings_enabled():
+                if metadata_hits:
+                    hits = metadata_hits
+                else:
+                    hits = index.search_text(
+                        query,
+                        base_files,
+                        top_k=min(500, len(base_files)),
+                        min_score=0.0,
+                    )
             elif not index.semantic_backend_available():
                 hits = []
                 self.status_bar.showMessage(
@@ -7448,7 +7941,13 @@ class RAWImageViewer(QMainWindow):
                 self.image_files = []
                 self.current_file_index = -1
                 self.current_file_path = None
-                backend_missing = bool(semantic_query) and not index.semantic_backend_available()
+                from semantic_search import semantic_embeddings_enabled as _see
+
+                backend_missing = (
+                    bool(semantic_query)
+                    and _see()
+                    and not index.semantic_backend_available()
+                )
                 empty_msg = (
                     "Semantic search unavailable" if backend_missing else "No matching images"
                 )
@@ -7495,8 +7994,10 @@ class RAWImageViewer(QMainWindow):
             top = hits[0]
             if used_semantic_backend:
                 message = f"Semantic search: {len(ranked_paths)} result(s) | top score {top.score:.3f}"
+            elif semantic_query and not semantic_embeddings_enabled():
+                message = f"Aircraft/EXIF filter: {len(ranked_paths)} result(s)"
             else:
-                message = f"EXIF search: {len(ranked_paths)} result(s)"
+                message = f"Gallery filter: {len(ranked_paths)} result(s)"
             self.status_bar.showMessage(message, 5000)
             self._last_semantic_query = query
         except Exception as e:
@@ -7581,18 +8082,22 @@ class RAWImageViewer(QMainWindow):
         if not self._is_semantic_index_incomplete(folder):
             return
         try:
+            from semantic_search import semantic_embeddings_enabled
+
             index = self._get_semantic_index()
-            if not index.semantic_backend_available():
+            if semantic_embeddings_enabled() and not index.semantic_backend_available():
                 return
             coverage = self._is_semantic_index_ready(corpus)
             if int(coverage.get("ready", 0)) == 1:
                 self._set_semantic_index_incomplete(folder, False)
                 self._start_face_index_background(corpus)
+                self._update_magic_wand_visibility()
                 return
             pending = index.get_pending_paths(corpus)
             if not pending:
                 self._set_semantic_index_incomplete(folder, False)
                 self._start_face_index_background(corpus)
+                self._update_magic_wand_visibility()
                 return
             QTimer.singleShot(
                 800,
@@ -7634,6 +8139,8 @@ class RAWImageViewer(QMainWindow):
     # GALLERY FUNCTIONALITY COMMENTED OUT
     def toggle_view_mode(self):
         """Toggle between single image view and gallery view"""
+        if getattr(self, '_is_delete_dialog_open', False):
+            return
         import logging
         logger = logging.getLogger(__name__)
         logger.debug("[MODESWITCH] toggle_view_mode called; current=%s", self.view_mode)
@@ -7719,6 +8226,8 @@ class RAWImageViewer(QMainWindow):
             self.view_mode_button.show()
         if hasattr(self, "search_bottom_button"):
             self.search_bottom_button.hide()
+        if hasattr(self, "magic_wand_button"):
+            self.magic_wand_button.hide()
         if hasattr(self, "search_expand_container") and self.search_expand_container:
             self.search_expand_container.hide()
         # Update icon if using qtawesome
@@ -7857,10 +8366,9 @@ class RAWImageViewer(QMainWindow):
         
         # Update title bar to show current folder name instead of file name
         if hasattr(self, 'current_folder') and self.current_folder:
-            folder_name = os.path.basename(self.current_folder)
-            title = f"RAW Image Viewer - {folder_name}"
+            title = os.path.basename(self.current_folder)
         else:
-            title = "RAW Image Viewer"
+            title = APP_BRAND
         
         self.setWindowTitle(title)
         if hasattr(self, 'title_bar') and self.title_bar is not None:
@@ -7898,6 +8406,7 @@ class RAWImageViewer(QMainWindow):
             self.sort_toggle_button.show()
         if hasattr(self, "search_bottom_button"):
             self.search_bottom_button.show()
+        self._update_magic_wand_visibility()
         # Restore search panel state
         if hasattr(self, "search_expand_container") and self.search_expand_container:
             expanded = getattr(self, "_search_panel_expanded", False)
@@ -8111,6 +8620,9 @@ class RAWImageViewer(QMainWindow):
                                     bulk_metadata[fp]["original_height"] = meta.get("height")
                                 if "orientation" not in bulk_metadata[fp] and meta.get("orientation"):
                                     bulk_metadata[fp]["orientation"] = meta.get("orientation")
+                                aircraft = (meta.get("detected_aircraft") or "").strip()
+                                if aircraft:
+                                    bulk_metadata[fp]["detected_aircraft"] = aircraft
                 except Exception as ex:
                     logger.warning(f"[GALLERY] Could not pre-seed semantic metadata: {ex}")
 
@@ -9513,15 +10025,13 @@ class RAWImageViewer(QMainWindow):
     def _keyboard_shortcuts_help_text(self):
         """Plain-text shortcuts list for tooltips and the shortcuts dialog."""
         return (
-            "Space — Toggle fit-to-window / 100% zoom\n"
-            "Double-click — Toggle fit-to-window / 100% zoom\n"
+            "Space / Double-click — Toggle fit-to-window / 100% zoom\n"
             "Trackpad Pinch / Ctrl+Scroll — Smooth zoom in/out\n"
             "Left / Right Arrow — Previous / next image\n"
             "Down Arrow — Move image to Discard folder\n"
             "Delete — Delete current image\n"
-            "H — Show or hide histogram (single-image view)\n"
-            "F — Focus / subject outline from EXIF (amber = maker AF; lime = Subject / CIPA). "
-            "With outline on, from fit: Space centers on the box; double-click zooms to the click. Zoomed: Space/double-click = fit.\n\n"
+            "H — Show/hide histogram\n"
+            "F — Show/hide focus point\n\n"
             "You can drag and drop files or folders onto the window."
         )
 
@@ -10212,8 +10722,12 @@ class RAWImageViewer(QMainWindow):
             # proper concurrency control
             
             # Reset flags when loading new image
-            # Assume preview-first until a full-resolution buffer is confirmed on-screen.
-            self._is_half_size_displayed = True
+            # Assume preview-first until a full-resolution buffer is confirmed on-screen, but ONLY for RAW files
+            raw_extensions = {'.cr2', '.cr3', '.nef', '.arw', '.dng', '.orf', '.rw2', 
+                             '.pef', '.srw', '.x3f', '.raf', '.3fr', '.fff', '.iiq', 
+                             '.cap', '.erf', '.mef', '.mos', '.nrw', '.rwl', '.srf'}
+            is_raw = os.path.splitext(requested_file_path)[1].lower() in raw_extensions
+            self._is_half_size_displayed = is_raw
             self._full_resolution_loading = False
             self._smooth_zoom_full_request_sent = False
             self._raw_status_exif_refresh_path = None
@@ -10282,11 +10796,14 @@ class RAWImageViewer(QMainWindow):
             # Note: current_file_path is now set above (after cleanup check)
             # to prevent false cancellations during normal navigation
             filename = os.path.basename(requested_file_path)
-            logger.debug(f"Setting window title to: {filename}")
-            self.setWindowTitle(f"RAW Image Viewer - {filename}")
+            folder_name = os.path.basename(os.path.dirname(requested_file_path))
+            title_text = f"{folder_name} / {filename}" if folder_name else filename
+
+            logger.debug(f"Setting window title to: {title_text}")
+            self.setWindowTitle(title_text)
             # Update custom title bar
             if hasattr(self, 'title_bar') and self.title_bar is not None:
-                self.title_bar.set_title(f"RAW Image Viewer - {filename}")
+                self.title_bar.set_title(title_text)
 
             # Reset EXIF data ready flag for new image
             self._exif_data_ready = False
@@ -10324,6 +10841,12 @@ class RAWImageViewer(QMainWindow):
                         pass
                     # Only preload after successful display (matches RAWviewer-1.0 behavior)
                     self._start_preloading()
+                    
+                    # Ensure EXIF is loaded even on cache hit
+                    if not self.image_cache.get_exif(requested_file_path):
+                        logger.info(f"[LOAD] Cache hit for image, but missing EXIF. Requesting EXIF load.")
+                        self.image_manager.request_load(requested_file_path, priority=False, stages={"exif"})
+                        
                     logger.info(f"[LOAD] Successfully displayed cached full image for {filename} (total: {time.time() - load_start:.3f}s)")
                     if hasattr(self, "loading_overlay"):
                         self.loading_overlay.hide_loading()
@@ -10381,6 +10904,12 @@ class RAWImageViewer(QMainWindow):
                         except ValueError:
                             pass
                         self._start_preloading()
+                        
+                        # Ensure EXIF is loaded even on cache hit
+                        if not self.image_cache.get_exif(requested_file_path):
+                            logger.info(f"[LOAD] Cache hit for pixmap, but missing EXIF. Requesting EXIF load.")
+                            self.image_manager.request_load(requested_file_path, priority=False, stages={"exif"})
+                            
                         logger.info(f"[LOAD] Successfully displayed cached pixmap for {filename} (total: {time.time() - load_start:.3f}s)")
                         if hasattr(self, "loading_overlay"):
                             self.loading_overlay.hide_loading()
@@ -10923,6 +11452,11 @@ class RAWImageViewer(QMainWindow):
         self._debounced_navigate("next", from_slideshow=True)
 
     def _on_slideshow_bottom_toggled(self, on: bool):
+        if getattr(self, '_is_delete_dialog_open', False):
+            b = getattr(self, "slideshow_bottom_button", None)
+            if b is not None:
+                b.setChecked(False)
+            return
         if on:
             if getattr(self, "view_mode", "single") != "single" or not self.image_files:
                 b = getattr(self, "slideshow_bottom_button", None)
@@ -11292,7 +11826,11 @@ class RAWImageViewer(QMainWindow):
                 # Check if this is a half_size image - if so, temporarily show fit-to-window
                 # and wait for full resolution before applying zoom
                 pixmap_max_dim = max(pixmap.width(), pixmap.height())
-                is_pixmap_half_size = pixmap_max_dim < 3000
+                raw_exts = {'.cr2', '.cr3', '.nef', '.arw', '.dng', '.orf', '.rw2', 
+                            '.pef', '.srw', '.x3f', '.raf', '.3fr', '.fff', '.iiq', 
+                            '.cap', '.erf', '.mef', '.mos', '.nrw', '.rwl', '.srf'}
+                is_raw = os.path.splitext(getattr(self, "current_file_path", ""))[-1].lower() in raw_exts
+                is_pixmap_half_size = (pixmap_max_dim < 3000) and is_raw
                 if is_pixmap_half_size:
                     logger.info(f"[DISPLAY_PIXMAP] Half-size image ({pixmap.width()}x{pixmap.height()}), "
                                "showing Fit preview until a full-resolution buffer arrives (avoid fake zoom upscale).")
@@ -11328,7 +11866,11 @@ class RAWImageViewer(QMainWindow):
             
             # If restoring zoom and currently displaying half_size, load full resolution FIRST
             pixmap_max_dim = max(pixmap.width(), pixmap.height())
-            is_pixmap_half_size = pixmap_max_dim < 3000
+            raw_exts = {'.cr2', '.cr3', '.nef', '.arw', '.dng', '.orf', '.rw2', 
+                        '.pef', '.srw', '.x3f', '.raf', '.3fr', '.fff', '.iiq', 
+                        '.cap', '.erf', '.mef', '.mos', '.nrw', '.rwl', '.srf'}
+            is_raw = os.path.splitext(getattr(self, "current_file_path", ""))[-1].lower() in raw_exts
+            is_pixmap_half_size = (pixmap_max_dim < 3000) and is_raw
             
             if (hasattr(self, '_is_half_size_displayed') and self._is_half_size_displayed) or is_pixmap_half_size:
                 if is_pixmap_half_size:
@@ -11440,6 +11982,13 @@ class RAWImageViewer(QMainWindow):
                 delattr(self, "_pending_zoom_center")
             if hasattr(self, "_pending_zoom_level"):
                 delattr(self, "_pending_zoom_level")
+            
+            # Apply saved scroll position before applying zoom and pan
+            if hasattr(self, '_restore_start_scroll_x') and hasattr(self, '_restore_start_scroll_y'):
+                if self._restore_start_scroll_x is not None and self._restore_start_scroll_y is not None:
+                    self.start_scroll_x = self._restore_start_scroll_x
+                    self.start_scroll_y = self._restore_start_scroll_y
+            
             self.apply_zoom_and_pan()
             self._finish_nav_zoom_preserve()
         
@@ -11791,8 +12340,15 @@ class RAWImageViewer(QMainWindow):
                     self.current_zoom_level = self._restore_zoom_level or 1.0
                     c = self._restore_zoom_center
                     self.zoom_center_point = c if c is not None else QPoint(pixmap.width() // 2, pixmap.height() // 2)
-                    self.start_scroll_x = self.scroll_area.horizontalScrollBar().value()
-                    self.start_scroll_y = self.scroll_area.verticalScrollBar().value()
+                    
+                    if hasattr(self, '_restore_start_scroll_x') and hasattr(self, '_restore_start_scroll_y'):
+                        if self._restore_start_scroll_x is not None and self._restore_start_scroll_y is not None:
+                            self.start_scroll_x = self._restore_start_scroll_x
+                            self.start_scroll_y = self._restore_start_scroll_y
+                    else:
+                        self.start_scroll_x = self.scroll_area.horizontalScrollBar().value()
+                        self.start_scroll_y = self.scroll_area.verticalScrollBar().value()
+                        
                     self.apply_zoom_and_pan()
                     self._restore_zoom_center = None
                     self._restore_zoom_level = None
@@ -12096,10 +12652,10 @@ class RAWImageViewer(QMainWindow):
                 self._clear_single_image_histogram()
                 self.status_bar.showMessage("Error loading image")
                 # Reset window title on error
-                self.setWindowTitle('RAW Image Viewer')
+                self.setWindowTitle(APP_BRAND)
                 # Update custom title bar
                 if hasattr(self, 'title_bar') and self.title_bar is not None:
-                    self.title_bar.set_title('RAW Image Viewer')
+                    self.title_bar.set_title(APP_BRAND)
             except Exception as ui_error:
                 logger.error(f"Error updating UI on processing error: {ui_error}")
         except Exception as e:
@@ -12211,6 +12767,9 @@ class RAWImageViewer(QMainWindow):
         return False
 
     def keyPressEvent(self, event):
+        if getattr(self, '_is_delete_dialog_open', False):
+            event.ignore()
+            return
         key = event.key()
         vm = getattr(self, "view_mode", "single")
 
@@ -12349,6 +12908,8 @@ class RAWImageViewer(QMainWindow):
         logger.debug(f"[NAV_FINISH] Navigation flag cleared - _navigation_in_progress={self._navigation_in_progress}")
 
     def navigate_to_previous_image(self):
+        if getattr(self, '_is_delete_dialog_open', False):
+            return
         import logging
         import traceback
         import time
@@ -12507,6 +13068,8 @@ class RAWImageViewer(QMainWindow):
                        f"(total duration: {outer_finally_time - nav_start_time:.3f}s) ==========")
 
     def navigate_to_next_image(self):
+        if getattr(self, '_is_delete_dialog_open', False):
+            return
         import logging
         import time
         import traceback
@@ -12735,8 +13298,12 @@ class RAWImageViewer(QMainWindow):
             informative_text=f"File: {filename}\n\nThis will move the file to the Recycle Bin."
         )
         
-        result = dialog.exec()
-        return dialog.result_value
+        self._is_delete_dialog_open = True
+        try:
+            dialog.exec()
+            return dialog.result_value
+        finally:
+            self._is_delete_dialog_open = False
 
     def perform_deletion(self):
         """Perform the actual file deletion"""
@@ -12806,10 +13373,10 @@ class RAWImageViewer(QMainWindow):
                 "Use File > Open to load another image"
             )
             self.status_bar.showMessage("No images remaining in folder")
-            self.setWindowTitle('RAW Image Viewer')
+            self.setWindowTitle(APP_BRAND)
             # Update custom title bar
             if hasattr(self, 'title_bar') and self.title_bar is not None:
-                self.title_bar.set_title('RAW Image Viewer')
+                self.title_bar.set_title(APP_BRAND)
             self.update_status_bar()
             return
 
@@ -12849,13 +13416,9 @@ class RAWImageViewer(QMainWindow):
         if not self.current_pixmap:
             # If image is currently loading, wait a bit and try again
             if hasattr(self, 'current_file_path') and self.current_file_path:
-                if hasattr(self, '_full_resolution_loading') and self._full_resolution_loading:
-                    logger.debug("Image is loading, spacebar toggle will be available once image is ready")
-                    return
-                # If we have a file path but no pixmap, the image might be loading
-                # Set a flag to toggle zoom once the image is ready
+                # Always set the pending flag so we don't drop the user's spacebar press
                 self._pending_zoom_toggle = True
-                logger.debug("Pixmap not ready yet, will toggle zoom once image is loaded")
+                logger.debug("Pixmap not ready yet or still loading, will toggle zoom once image is loaded")
                 return
             return
         self._stop_slideshow()
@@ -13354,6 +13917,65 @@ class RAWImageViewer(QMainWindow):
         return None
     
 
+    @staticmethod
+    def _iter_folder_images_shallow(folder_path, extensions, skip_dir_names=None):
+        """Yield images in folder_path and immediate child dirs only (not deeper)."""
+        skip = {s.lower() for s in (skip_dir_names or ("Discard",))}
+        ext_set = set(extensions)
+
+        def _yield_files_in_dir(dir_path: str):
+            try:
+                with os.scandir(dir_path) as it:
+                    for entry in it:
+                        if entry.name.startswith("."):
+                            continue
+                        try:
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+                            ext = os.path.splitext(entry.name)[1].lower()
+                            if ext not in ext_set:
+                                continue
+                            st = entry.stat()
+                            if st.st_size > 0:
+                                yield os.path.abspath(entry.path), st
+                        except (OSError, PermissionError):
+                            continue
+            except (OSError, PermissionError):
+                return
+
+        yield from _yield_files_in_dir(folder_path)
+
+        try:
+            with os.scandir(folder_path) as it:
+                for entry in it:
+                    if entry.name.startswith("."):
+                        continue
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                        if entry.name.lower() in skip:
+                            continue
+                    except OSError:
+                        continue
+                    yield from _yield_files_in_dir(entry.path)
+        except (OSError, PermissionError):
+            return
+
+    @staticmethod
+    def _sanitize_aircraft_folder_name(label: str) -> str:
+        """Make a Windows-safe subfolder name from an aircraft label."""
+        name = (label or "").strip()
+        if not name:
+            return ""
+        for ch in '<>:"/\\|?*':
+            name = name.replace(ch, "_")
+        name = name.strip(" .")
+        if not name:
+            return ""
+        if len(name) > 120:
+            name = name[:120].rstrip(" .")
+        return name or ""
+
     def get_supported_extensions(self):
         """Get list of supported image file extensions"""
         return [
@@ -13401,26 +14023,16 @@ class RAWImageViewer(QMainWindow):
             # Get supported extensions
             supported_extensions = self.get_supported_extensions()
 
-            # Top-level only: do not recurse into subfolders (Desktop / large trees stay fast).
             image_files = []
-
+            seen_paths = set()
             try:
-                with os.scandir(folder_path) as it:
-                    for entry in it:
-                        if entry.name.startswith("."):
-                            continue
-                        try:
-                            if not entry.is_file(follow_symlinks=False):
-                                continue
-                            file_ext = os.path.splitext(entry.name)[1].lower()
-                            if file_ext not in supported_extensions:
-                                continue
-                            stat = entry.stat()
-                            if stat.st_size <= 0:
-                                continue
-                            image_files.append(os.path.abspath(entry.path))
-                        except (OSError, PermissionError):
-                            continue
+                for full_path, _stat in self._iter_folder_images_shallow(
+                    folder_path, supported_extensions
+                ):
+                    if full_path in seen_paths:
+                        continue
+                    seen_paths.add(full_path)
+                    image_files.append(full_path)
             except OSError as e:
                 error_msg = f"Cannot read folder contents:\n{str(e)}"
                 logger.error(f"Error reading folder {folder_path}: {e}")
@@ -13492,15 +14104,14 @@ class RAWImageViewer(QMainWindow):
         message = (
             "No image loaded\n\n"
             "Click 📁 or drag and drop a folder or image to load it\n"
-            "Press Space to toggle between fit-to-window and 100% zoom\n"
-            "Double-click image to zoom in/out\n"
+            "Press Space or Double-click to toggle fit-to-window / 100% zoom\n"
             "Click and drag to pan when zoomed\n"
             "Use Left/Right arrow keys to navigate between images (preserves zoom if zoomed in)\n"
             "Bottom bar: Share and other controls when images are loaded\n"
             "Press Down Arrow to move the current image to Discard folder\n"
             "Press Delete to remove the current image\n"
-            "Press H to show or hide histogram\n"
-            "Press F — show dashed focus / subject outline from EXIF (amber = maker AF; lime = Subject / CIPA)\n"
+            "H — Show/hide histogram\n"
+            "F — Show/hide focus point\n"
             "Scroll wheel (fit-to-window): Scroll down = previous image, Scroll up = next image\n"
             "Horizontal wheel (zoom mode): Scroll left/right to pan the image"
         )
@@ -13521,9 +14132,9 @@ class RAWImageViewer(QMainWindow):
             
         if hasattr(self, 'status_bar'):
             self.status_bar.showMessage("Ready")
-        self.setWindowTitle('RAW Image Viewer')
+        self.setWindowTitle(APP_BRAND)
         if hasattr(self, 'title_bar') and self.title_bar is not None:
-            self.title_bar.set_title('RAW Image Viewer')
+            self.title_bar.set_title(APP_BRAND)
 
     def show_no_images_message(self, supported_extensions):
         """Display 'No images found' message in the main viewing area"""
@@ -13563,10 +14174,10 @@ class RAWImageViewer(QMainWindow):
         self.status_bar.showMessage("No images found")
         
         # Reset window title
-        self.setWindowTitle('RAW Image Viewer')
+        self.setWindowTitle(APP_BRAND)
         # Update custom title bar
         if hasattr(self, 'title_bar') and self.title_bar is not None:
-            self.title_bar.set_title('RAW Image Viewer')
+            self.title_bar.set_title(APP_BRAND)
 
     def show_error(self, title, message):
         """Show error message dialog"""
@@ -14291,6 +14902,8 @@ class RAWImageViewer(QMainWindow):
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.KeyPress:
+            if getattr(self, '_is_delete_dialog_open', False):
+                return True
             # Handle application-wide shortcuts even when sub-widgets (like viewport) have focus
             if self._handle_app_shortcut(event):
                 return True
@@ -14359,6 +14972,8 @@ class RAWImageViewer(QMainWindow):
 
         # Handle wheel events for navigation in single image view when fit-to-window
         if event.type() == QEvent.Type.Wheel:
+            if getattr(self, '_is_delete_dialog_open', False):
+                return True
             # Check if we're in single view mode and the event is from scroll area viewport
             if (hasattr(self, 'view_mode') and self.view_mode == 'single' and
                 hasattr(self, 'scroll_area') and obj == self.scroll_area.viewport()):
@@ -14528,26 +15143,9 @@ class RAWImageViewer(QMainWindow):
             self.show_error("Discard Error", error_msg)
 
     def _scan_folder_generator(self, folder_path, extensions, discard_folder='Discard'):
-        """Yield (path, stat) for supported images in folder_path only (no subfolders)."""
-        _ = discard_folder  # unused: subfolders are not scanned (kept for API compatibility)
-        try:
-            with os.scandir(folder_path) as it:
-                for entry in it:
-                    if entry.name.startswith('.'):
-                        continue
-                    if not entry.is_file(follow_symlinks=False):
-                        continue
-                    ext = os.path.splitext(entry.name)[1].lower()
-                    if ext not in extensions:
-                        continue
-                    try:
-                        stat = entry.stat()
-                        if stat.st_size > 0:
-                            yield entry.path, stat
-                    except OSError:
-                        pass
-        except (OSError, PermissionError):
-            pass
+        """Yield (path, stat) for images in folder and one level of child dirs."""
+        skip = (discard_folder,) if discard_folder else ("Discard",)
+        yield from self._iter_folder_images_shallow(folder_path, extensions, skip)
 
     def _on_folder_load_error(self, token, title, message):
         if token != getattr(self, "_folder_load_generation", None):
@@ -14688,6 +15286,7 @@ class RAWImageViewer(QMainWindow):
             self._hide_all_loading_indicators()
             self.save_session_state()
             self._maybe_resume_semantic_indexing()
+            self._update_magic_wand_visibility()
         except Exception as e:
             logger.error(f"Error updating gallery view for folder {folder_path}: {e}", exc_info=True)
             self._hide_all_loading_indicators()
@@ -14757,24 +15356,6 @@ class RAWImageViewer(QMainWindow):
                     self_inner.start_view = start_view
                     self_inner.signals = signals
 
-                def _scan_top_level_only(self_inner, path):
-                    """List image files in path only; do not descend into subfolders."""
-                    with os.scandir(path) as it:
-                        for entry in it:
-                            if entry.name.startswith('.'):
-                                continue
-                            try:
-                                if not entry.is_file(follow_symlinks=False):
-                                    continue
-                                ext = os.path.splitext(entry.name)[1].lower()
-                                if ext not in self_inner.extensions:
-                                    continue
-                                stat = entry.stat()
-                                if stat.st_size > 0:
-                                    yield entry.path, stat
-                            except (OSError, PermissionError):
-                                continue
-
                 def run(self_inner):
                     import time
                     from datetime import datetime
@@ -14783,8 +15364,8 @@ class RAWImageViewer(QMainWindow):
                         image_files = []
                         file_stats = {}
                         seen_paths = set()
-                        for full_path, stat_info in self_inner._scan_top_level_only(
-                            self_inner.folder_path
+                        for full_path, stat_info in RAWImageViewer._iter_folder_images_shallow(
+                            self_inner.folder_path, self_inner.extensions
                         ):
                             ap = os.path.abspath(full_path)
                             if ap in seen_paths:
@@ -15341,7 +15922,7 @@ def main():
                 safe_print("  [Windows] AppUserModelID set", flush=True)
 
             # Set application properties
-            app.setApplicationName("RAW Image Viewer")
+            app.setApplicationName(APP_BRAND)
             app.setApplicationVersion("2.0.1")
 
             # Create and show main window

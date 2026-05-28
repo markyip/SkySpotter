@@ -34,6 +34,12 @@ import metadata_backend
 from exif_subject_area import pixmap_ltwh_focus_hint
 
 from raw_file_extensions import RAW_FILE_EXTENSIONS
+from onnxruntime_providers import (
+    create_onnxruntime_session,
+    dml_available,
+    onnxruntime_providers_prefer_dml,
+    prefer_directml_classifier,
+)
 
 try:
     import pycountry
@@ -43,11 +49,80 @@ except Exception:
 
 ProgressCallback = Optional[Callable[[int, int, str], None]]
 
+# SkySpotter default: ViT aircraft labels + EXIF gallery filters only (no SigLIP download).
+AVIATION_INDEX_MODEL_ID = "aviation-classifier-vit"
+
+
+def semantic_embeddings_enabled() -> bool:
+    """CLIP/SigLIP text-image embeddings (~800MB ONNX). Opt-in via SkySpotter_ENABLE_SEMANTIC_SEARCH=1."""
+    return os.environ.get("SkySpotter_ENABLE_SEMANTIC_SEARCH", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _resolve_classifier_torch_device():
+    """
+    Pick ViT inference device. Override with SkySpotter_CLASSIFIER_DEVICE=cpu|cuda|mps.
+
+    Note: pixi's default `torch` wheel is often CPU-only on Windows; CUDA requires a
+    GPU-enabled PyTorch install (see README).
+    """
+    import torch
+
+    override = os.environ.get("SkySpotter_CLASSIFIER_DEVICE", "").strip().lower()
+    if override == "cpu":
+        return torch.device("cpu")
+    if override == "cuda":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        logger.warning(
+            "[MODEL] SkySpotter_CLASSIFIER_DEVICE=cuda but torch.cuda.is_available() is False; using CPU"
+        )
+        return torch.device("cpu")
+    if override == "mps":
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        logger.warning(
+            "[MODEL] SkySpotter_CLASSIFIER_DEVICE=mps but MPS is unavailable; using CPU"
+        )
+        return torch.device("cpu")
+
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+_classifier_device_logged = False
+
 
 def _skyspotter_cache_root() -> str:
     return os.path.expanduser(
         os.environ.get("SkySpotter_CACHE_DIR", "~/.skyspotter_cache")
     )
+
+
+def _checkpoint_dir_candidates(project_root: str) -> list[str]:
+    """Project folders checked for the gallery ViT checkpoint (first with model.safetensors wins)."""
+    override = (
+        os.environ.get("SkySpotter_APP_MODEL_DIR", "").strip()
+        or os.environ.get("SkySpotter_AIRCRAFT_CHECKPOINT_DIR", "").strip()
+    )
+    candidates: list[str] = []
+    if override:
+        candidates.append(override)
+    candidates.extend(
+        [
+            os.path.join(project_root, "app_model"),
+            os.path.join(project_root, "aviation_model_processed"),  # legacy name
+            os.path.join(project_root, "aviation_model_v3"),
+        ]
+    )
+    return candidates
 
 
 def _load_index_source_image(file_path: str, max_size: int = 1024) -> Image.Image:
@@ -295,7 +370,7 @@ class MobileCLIPCoreMLBackend:
         except Exception as exc:
             raise RuntimeError(
                 "MobileCLIP auto-download requires 'huggingface_hub'. "
-                "Install dependencies with: pip install -r requirements.txt"
+                "Install dependencies with: pixi install (see pixi.toml)"
             ) from exc
 
         snapshot_download(
@@ -777,11 +852,7 @@ class MilitaryAircraftClassifier:
         # Optional local training checkpoints to export from (preferred when present).
         # This enables using models trained by scripts/train_processed_aircraft.py
         # without requiring a manual conversion step.
-        checkpoint_candidates = [
-            os.environ.get("SkySpotter_AIRCRAFT_CHECKPOINT_DIR", ""),
-            os.path.join(project_root, "aviation_model_processed"),
-            os.path.join(project_root, "aviation_model_v3"),
-        ]
+        checkpoint_candidates = _checkpoint_dir_candidates(project_root)
         for cp_dir in checkpoint_candidates:
             if not cp_dir:
                 continue
@@ -792,7 +863,7 @@ class MilitaryAircraftClassifier:
                     self._checkpoint_labels_path = lbl
                 break
 
-        # In local/dev mode, prioritize checkpoint-based export (aviation_model_processed)
+        # In local/dev mode, prioritize checkpoint-based export (app_model/)
         # over pre-existing ONNX blobs so tested training output is the source of truth.
         if self._local_checkpoint_dir and not hasattr(sys, "_MEIPASS"):
             self.model_dir = os.path.join(
@@ -811,11 +882,19 @@ class MilitaryAircraftClassifier:
         self._torch_processor = None
         self._torch_device = None
         self._rembg_session = None
+        self._onnx_export_disabled = False
         strict_rembg = os.environ.get("SkySpotter_STRICT_REMBG", "").strip().lower()
         self._strict_rembg = strict_rembg in {"1", "true", "yes", "on"}
         self._load_labels()
         # Ensure classifier labels come from the selected checkpoint when available.
         self._sync_labels_from_checkpoint()
+        if prefer_directml_classifier() and self._local_checkpoint_dir:
+            if not self._ensure_onnx_classifier_session():
+                logger.warning(
+                    "[MODEL] DirectML ONNX classifier not ready (export or session failed). "
+                    "ViT will fall back to PyTorch CPU unless you fix ONNX export. "
+                    "Try PYTHONUTF8=1 and see logs above."
+                )
 
     def _load_labels(self):
         # Try to find labels.txt in the same directory as the model
@@ -888,14 +967,16 @@ class MilitaryAircraftClassifier:
 
             self._torch_processor = ViTImageProcessor.from_pretrained(self._local_checkpoint_dir)
             self._torch_model = ViTForImageClassification.from_pretrained(self._local_checkpoint_dir)
-            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                self._torch_device = torch.device("mps")
-            elif torch.cuda.is_available():
-                self._torch_device = torch.device("cuda")
-            else:
-                self._torch_device = torch.device("cpu")
+            self._torch_device = _resolve_classifier_torch_device()
             self._torch_model.to(self._torch_device)
             self._torch_model.eval()
+            if str(self._torch_device) == "cpu":
+                try:
+                    threads = int(os.environ.get("SkySpotter_TORCH_THREADS", "0"))
+                    if threads > 0:
+                        torch.set_num_threads(threads)
+                except (TypeError, ValueError):
+                    pass
 
             # Align label list with checkpoint config when present.
             try:
@@ -909,12 +990,19 @@ class MilitaryAircraftClassifier:
             except Exception:
                 pass
 
-            logger.warning(
-                "[MODEL] Classifier backend='hf-checkpoint' checkpoint='%s' device='%s' strict_rembg=%s",
-                self._local_checkpoint_dir,
-                str(self._torch_device),
-                self._strict_rembg,
-            )
+            global _classifier_device_logged
+            if not _classifier_device_logged:
+                _classifier_device_logged = True
+                logger.warning(
+                    "[MODEL] Aircraft classifier (PyTorch): checkpoint='%s' device='%s' "
+                    "torch.cuda.is_available=%s dml_available=%s prefer_directml=%s strict_rembg=%s",
+                    self._local_checkpoint_dir,
+                    self._torch_device,
+                    torch.cuda.is_available(),
+                    dml_available(),
+                    prefer_directml_classifier(),
+                    self._strict_rembg,
+                )
             return True
         except Exception as e:
             logger.warning("[MODEL] HF checkpoint path unavailable, fallback to ONNX: %s", e)
@@ -926,8 +1014,14 @@ class MilitaryAircraftClassifier:
             from rembg import new_session, remove
 
             if self._rembg_session is None:
-                self._rembg_session = new_session("isnet-general-use")
-                logger.info("[AVIATION AI] rembg session initialized: isnet-general-use")
+                providers = onnxruntime_providers_prefer_dml()
+                self._rembg_session = new_session(
+                    "isnet-general-use", providers=providers
+                )
+                logger.info(
+                    "[AVIATION AI] rembg session initialized: isnet-general-use providers=%s",
+                    providers,
+                )
             return remove(image, session=self._rembg_session, alpha_matting=False)
         except Exception as e:
             if self._strict_rembg:
@@ -1001,6 +1095,148 @@ class MilitaryAircraftClassifier:
         label = self.LABELS[idx] if idx < len(self.LABELS) else ""
         return label, conf
 
+    def _export_checkpoint_to_onnx(self, progress_callback=None) -> bool:
+        if not self._local_checkpoint_dir:
+            return False
+        checkpoint_model = os.path.join(self._local_checkpoint_dir, "model.safetensors")
+        if not os.path.exists(checkpoint_model):
+            return False
+        needs_export = not os.path.exists(self.onnx_path)
+        if not needs_export:
+            try:
+                needs_export = os.path.getmtime(self.onnx_path) < os.path.getmtime(
+                    checkpoint_model
+                )
+            except OSError:
+                needs_export = False
+        if not needs_export:
+            return True
+        if self._onnx_export_disabled:
+            if os.path.exists(self.onnx_path) and os.path.getsize(self.onnx_path) > 0:
+                return True
+            return False
+        if progress_callback:
+            progress_callback("Exporting aircraft model for DirectML (one-time)...")
+        try:
+            import shutil
+            import warnings
+
+            import torch
+            from transformers import ViTForImageClassification
+            from transformers.utils import logging as hf_transformers_logging
+
+            export_kw = dict(
+                input_names=["pixel_values"],
+                output_names=["logits"],
+                dynamic_axes={
+                    "pixel_values": {0: "batch_size"},
+                    "logits": {0: "batch_size"},
+                },
+                opset_version=17,
+            )
+            prev_hf_verbosity = hf_transformers_logging.get_verbosity()
+            prev_env = {
+                k: os.environ.get(k)
+                for k in ("TRANSFORMERS_VERBOSITY", "HF_HUB_DISABLE_PROGRESS_BARS")
+            }
+            hf_transformers_logging.set_verbosity_error()
+            os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+            os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
+                    os.makedirs(self.model_dir, exist_ok=True)
+                    model = ViTForImageClassification.from_pretrained(
+                        self._local_checkpoint_dir
+                    )
+                    model.eval()
+                    dummy_input = torch.randn(1, 3, 384, 384)
+                    try:
+                        torch.onnx.export(
+                            model,
+                            dummy_input,
+                            self.onnx_path,
+                            dynamo=False,
+                            **export_kw,
+                        )
+                    except TypeError:
+                        torch.onnx.export(
+                            model, dummy_input, self.onnx_path, **export_kw
+                        )
+            finally:
+                hf_transformers_logging.set_verbosity(prev_hf_verbosity)
+                for key, val in prev_env.items():
+                    if val is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = val
+            labels_src = os.path.join(self._local_checkpoint_dir, "labels.txt")
+            labels_dst = os.path.join(self.model_dir, "labels.txt")
+            if os.path.exists(labels_src):
+                shutil.copy(labels_src, labels_dst)
+                self._load_labels()
+            self._sync_labels_from_checkpoint()
+            logger.info("[AVIATION AI] Exported ONNX classifier to %s", self.onnx_path)
+            return True
+        except Exception as e:
+            self._onnx_export_disabled = True
+            logger.warning("[AVIATION AI] ONNX export for DirectML failed: %s", e)
+            return False
+
+    def _ensure_onnx_classifier_session(self, progress_callback=None) -> bool:
+        if not prefer_directml_classifier():
+            return False
+        if not self._local_checkpoint_dir:
+            return False
+        self._sync_labels_from_checkpoint()
+        if not self._export_checkpoint_to_onnx(progress_callback):
+            return False
+        if self._session is not None:
+            return True
+        try:
+            providers = onnxruntime_providers_prefer_dml()
+            self._session = create_onnxruntime_session(self.onnx_path, providers)
+            active = self._session.get_providers()
+            logger.warning(
+                "[MODEL] Aircraft classifier (ONNX): path='%s' active_provider=%s",
+                self.onnx_path,
+                active[0] if active else "unknown",
+            )
+            try:
+                shape = list(self._session.get_inputs()[0].shape)
+                h_dim = shape[2] if len(shape) > 2 else None
+                if isinstance(h_dim, int) and h_dim > 0:
+                    self._input_size = int(h_dim)
+            except Exception:
+                self._input_size = 384
+            return True
+        except Exception as e:
+            logger.warning("[AVIATION AI] ONNX DirectML session init failed: %s", e)
+            self._session = None
+            return False
+
+    def _classify_onnx_pipeline(
+        self, file_path: str, max_source_size: int, progress_callback=None
+    ) -> str:
+        if not self._ensure_onnx_classifier_session(progress_callback):
+            return ""
+        src = _load_index_source_image(
+            file_path, max_size=max(256, int(max_source_size))
+        ).convert("RGB")
+        rgba = self._legacy_bg_remove(src)
+        cropped_rgb, mode = self._legacy_focus_blob_crop(file_path, rgba)
+        label, conf, _ = self._predict_im(cropped_rgb)
+        logger.info(
+            "[AVIATION AI] ONNX pipeline mode=%s label=%s conf=%.3f file=%s",
+            mode,
+            label,
+            conf,
+            os.path.basename(file_path),
+        )
+        if label and conf >= 0.40:
+            return label
+        return ""
+
     def _ensure_model(self, progress_callback=None):
         # Checkpoint-only mode: do not download/export/use ONNX fallback models.
         checkpoint_model = None
@@ -1037,9 +1273,7 @@ class MilitaryAircraftClassifier:
                 import shutil
                 import torch
                 from transformers import ViTForImageClassification
-                import logging
 
-                logger = logging.getLogger(__name__)
                 os.makedirs(self.model_dir, exist_ok=True)
 
                 logger.info(
@@ -1082,10 +1316,8 @@ class MilitaryAircraftClassifier:
         
         try:
             import requests
-            import logging
             from huggingface_hub import hf_hub_download
-            logger = logging.getLogger(__name__)
-            
+
             os.makedirs(self.model_dir, exist_ok=True)
             
             logger.info(f"[AVIATION AI] Model missing at {self.onnx_path}. Downloading from {model_url}...")
@@ -1115,8 +1347,6 @@ class MilitaryAircraftClassifier:
             return
             
         except Exception as e:
-            import logging
-            logger = logging.getLogger(__name__)
             logger.warning(f"[AVIATION AI] GitHub download failed ({e}), trying HuggingFace fallback...")
             try:
                 from huggingface_hub import hf_hub_download
@@ -1185,17 +1415,39 @@ class MilitaryAircraftClassifier:
         label = self.LABELS[idx] if idx < len(self.LABELS) else ""
         return label, conf, probs
 
-    def classify(self, file_path: str, progress_callback=None) -> str:
+    def classify(
+        self, file_path: str, progress_callback=None, *, max_source_size: Optional[int] = None
+    ) -> str:
         try:
             self._ensure_model(progress_callback)
-            # Preferred path: same legacy PoC logic that produced better quality.
+            if max_source_size is None:
+                try:
+                    max_source_size = int(
+                        os.environ.get("SkySpotter_CLASSIFY_MAX_SIZE", "2048")
+                    )
+                except (TypeError, ValueError):
+                    max_source_size = 2048
+            if prefer_directml_classifier():
+                label = self._classify_onnx_pipeline(
+                    file_path, int(max_source_size), progress_callback
+                )
+                if label:
+                    return label
+                if self._session is not None:
+                    return ""
+                logger.warning(
+                    "[AVIATION AI] DirectML ONNX unavailable; falling back to PyTorch."
+                )
+
             if self._ensure_torch_checkpoint_model():
-                src = _load_index_source_image(file_path, max_size=2048).convert("RGB")
+                src = _load_index_source_image(
+                    file_path, max_size=max(256, int(max_source_size))
+                ).convert("RGB")
                 rgba = self._legacy_bg_remove(src)
                 cropped_rgb, mode = self._legacy_focus_blob_crop(file_path, rgba)
                 label, conf = self._predict_with_torch(cropped_rgb)
                 logger.info(
-                    "[AVIATION AI] Legacy pipeline mode=%s label=%s conf=%.3f file=%s",
+                    "[AVIATION AI] PyTorch pipeline mode=%s label=%s conf=%.3f file=%s",
                     mode,
                     label,
                     conf,
@@ -1206,7 +1458,7 @@ class MilitaryAircraftClassifier:
                 return ""
 
             logger.warning(
-                "[MODEL] Checkpoint-only mode: classifier skipped because checkpoint backend is unavailable."
+                "[MODEL] Classifier skipped: no DirectML ONNX session and PyTorch checkpoint unavailable."
             )
             return ""
 
@@ -1309,8 +1561,6 @@ class MilitaryAircraftClassifier:
                     
                     # Merge logic: Prefer crop if it's more confident or if global is ambiguous
                     if (conf_crop > conf) or (conf < 0.45 and conf_crop > 0.35):
-                        import logging
-                        logger = logging.getLogger(__name__)
                         logger.info(f"[AVIATION AI] {os.path.basename(file_path)}: Attention-adjusted crop ({label_crop} @ {conf_crop:.2f} via {source}) preferred over global ({label} @ {conf:.2f})")
                         label, conf = label_crop, conf_crop
             except Exception as ce:
@@ -1318,9 +1568,6 @@ class MilitaryAircraftClassifier:
                 pass
 
             if label:
-                import logging
-                logger = logging.getLogger(__name__)
-                
                 # Confidence thresholding (Combine knowledge logic)
                 # If confidence is too low, we return empty so the caller can fallback to SigLIP Zero-Shot
                 if conf < 0.40:
@@ -1330,9 +1577,7 @@ class MilitaryAircraftClassifier:
                 logger.info(f"[AVIATION AI] {os.path.basename(file_path)} identified as {label} (Conf: {conf:.2f})")
                 return label
         except Exception as e:
-            import logging
             import traceback
-            logger = logging.getLogger(__name__)
             logger.error(f"[AVIATION AI] Error classifying {file_path}: {e}")
             logger.error(traceback.format_exc())
             pass
@@ -1346,6 +1591,7 @@ class AviationSigLIPONNXBackend(MobileCLIPONNXBackend):
     """
     MODEL_ID = "aviation-specialist-siglip-p16-512"
     HUB_REPO_ID = "Xenova/siglip-base-patch16-512"
+    SUPPORTS_HUB_DOWNLOAD = True
     
     # SigLIP specific ONNX paths in Xenova repo
     IMAGE_MODEL_FILE = "vision_model.onnx"
@@ -1733,6 +1979,8 @@ class SemanticImageIndex:
 
     @property
     def backend(self):
+        if not semantic_embeddings_enabled():
+            return None
         if self._mobileclip_backend is None:
             self._mobileclip_backend = resolve_mobileclip_backend()
         return self._mobileclip_backend
@@ -1740,10 +1988,14 @@ class SemanticImageIndex:
     @property
     def model_name(self):
         if self._model_name is None:
-            if hasattr(self.backend, "MODEL_ID"):
-                self._model_name = self.backend.MODEL_ID
+            if semantic_embeddings_enabled():
+                backend = self.backend
+                if backend is not None and hasattr(backend, "MODEL_ID"):
+                    self._model_name = backend.MODEL_ID
+                else:
+                    self._model_name = "unknown"
             else:
-                self._model_name = "unknown"
+                self._model_name = AVIATION_INDEX_MODEL_ID
         return self._model_name
 
     def _init_db_if_needed(self):
@@ -1867,12 +2119,14 @@ class SemanticImageIndex:
         except ImportError as exc:
             raise RuntimeError(
                 "Semantic search requires 'sentence-transformers'. "
-                "Install dependencies with: pip install -r requirements.txt"
+                "Install dependencies with: pixi install (see pixi.toml)"
             ) from exc
         self._model = SentenceTransformer(self.model_name)
         return self._model
 
     def semantic_backend_available(self) -> bool:
+        if not semantic_embeddings_enabled():
+            return False
         if self.model_name.startswith("mobileclip-") or self.model_name.startswith("aviation-"):
             backend = self._mobileclip_backend or resolve_mobileclip_backend()
             return backend.available()
@@ -1883,6 +2137,8 @@ class SemanticImageIndex:
             return False
 
     def semantic_backend_error(self) -> str:
+        if not semantic_embeddings_enabled():
+            return "Semantic embeddings disabled (SkySpotter aircraft + EXIF mode)"
         if self.model_name.startswith("mobileclip-") or self.model_name.startswith("aviation-"):
             backend = self._mobileclip_backend or resolve_mobileclip_backend()
             return backend.availability_error()
@@ -1893,6 +2149,8 @@ class SemanticImageIndex:
             return str(exc)
 
     def mobileclip_supports_hub_download(self) -> bool:
+        if not semantic_embeddings_enabled():
+            return False
         return bool(
             (self.model_name.startswith("mobileclip-") or self.model_name.startswith("aviation-"))
             and self.backend is not None
@@ -2718,44 +2976,61 @@ class SemanticImageIndex:
                 self._conn.commit()
                 batch_writes = 0
 
-        # Phase 2: semantic embeddings (slow). Update existing rows in-place.
-        # If semantic backend assets are unavailable, keep metadata-only indexing.
-        if not self.semantic_backend_available():
-            skipped += len(pending_for_semantic)
-            if pending_for_semantic:
-                logger.warning(
-                    "[SYSTEM] Semantic backend unavailable; skipping embedding pass (%d files).",
-                    len(pending_for_semantic),
-                )
+        # Phase 2: aircraft classification (+ optional SigLIP embeddings when enabled).
+        total_sem = len(pending_for_semantic)
+        use_embeddings = semantic_embeddings_enabled() and self.semantic_backend_available()
+        if not pending_for_semantic:
+            return {"indexed": indexed, "skipped": skipped, "failed": failed, "total": total}
+        if not use_embeddings and not self.model_name.startswith("aviation-"):
+            skipped += total_sem
             return {"indexed": indexed, "skipped": skipped, "failed": failed, "total": total}
 
-        total_sem = len(pending_for_semantic)
         for i, (canonical_fp, st) in enumerate(pending_for_semantic, start=1):
             if stop_check and stop_check():
                 break
             if progress_callback:
-                # Keep callback signature unchanged while reporting semantic pass progress.
                 if i <= 2 or i >= total_sem or (i % 12 == 0):
-                    progress_callback(i, total_sem, "Processing AI features...")
+                    msg = (
+                        "Processing AI features..."
+                        if use_embeddings
+                        else "Classifying aircraft..."
+                    )
+                    progress_callback(i, total_sem, msg)
             try:
-                vec = self._encode_image(canonical_fp)
-                
-                # AVIATION SPECIALIST ENRICHMENT:
-                # SkySpotter policy: use ONLY specialist classifier output from
-                # checkpoint/ONNX. Do not fallback to SigLIP zero-shot labels.
                 detected_aircraft = ""
                 if self.model_name.startswith("aviation-"):
                     try:
-                        # Use the Specialist Military Classifier for precise model identification
                         if not hasattr(self, "_aviation_classifier") or self._aviation_classifier is None:
                             self._aviation_classifier = MilitaryAircraftClassifier()
-                        
+                        try:
+                            index_max = int(
+                                os.environ.get("SkySpotter_INDEX_MAX_SIZE", "1280")
+                            )
+                        except (TypeError, ValueError):
+                            index_max = 1280
                         detected_aircraft = self._aviation_classifier.classify(
-                            canonical_fp, 
-                            progress_callback=lambda msg: progress_callback(i, total_sem, msg) if progress_callback else None
+                            canonical_fp,
+                            progress_callback=(
+                                lambda m, _i=i, _t=total_sem: progress_callback(_i, _t, m)
+                                if progress_callback
+                                else None
+                            ),
+                            max_source_size=index_max,
                         )
                     except Exception as e:
-                        logger.error(f"[AVIATION AI] Enrichment failed for {os.path.basename(canonical_fp)}: {e}")
+                        logger.error(
+                            "[AVIATION AI] Classification failed for %s: %s",
+                            os.path.basename(canonical_fp),
+                            e,
+                        )
+
+                if use_embeddings:
+                    vec = self._encode_image(canonical_fp)
+                    dim = int(vec.size)
+                    blob = self._to_blob(vec)
+                else:
+                    dim = 0
+                    blob = self._to_blob(np.zeros(0, dtype=np.float32))
 
                 self._conn.execute(
                     """
@@ -2764,8 +3039,8 @@ class SemanticImageIndex:
                     WHERE file_path = ? AND model_name = ? AND file_size = ? AND mtime_ns = ?
                     """,
                     (
-                        int(vec.size),
-                        self._to_blob(vec),
+                        dim,
+                        blob,
                         detected_aircraft,
                         float(time.time()),
                         canonical_fp,
@@ -2866,11 +3141,7 @@ class SemanticImageIndex:
                     try:
                         module_dir = os.path.dirname(os.path.abspath(__file__))
                         project_root = os.path.dirname(module_dir)
-                        checkpoint_candidates = [
-                            os.environ.get("SkySpotter_AIRCRAFT_CHECKPOINT_DIR", ""),
-                            os.path.join(project_root, "aviation_model_processed"),
-                            os.path.join(project_root, "aviation_model_v3"),
-                        ]
+                        checkpoint_candidates = _checkpoint_dir_candidates(project_root)
                         checkpoint = "none"
                         for cp in checkpoint_candidates:
                             if cp and os.path.exists(os.path.join(cp, "model.safetensors")):
@@ -2949,7 +3220,7 @@ class SemanticImageIndex:
             batch = canonical_paths[i : i + batch_size]
             qs = ",".join(["?"] * len(batch))
             rows = self._conn.execute(
-                f"SELECT file_path, width, height FROM semantic_index WHERE file_path IN ({qs})",
+                f"SELECT file_path, width, height, detected_aircraft FROM semantic_index WHERE file_path IN ({qs})",
                 batch,
             ).fetchall()
             for row in rows:
@@ -2963,7 +3234,44 @@ class SemanticImageIndex:
                     # semantic_index currently does not persist EXIF orientation.
                     # Keep shape compatible with gallery caller.
                     "orientation": 1,
+                    "detected_aircraft": str(self._row_value(row, "detected_aircraft", "") or "").strip(),
                 }
+        return out
+
+    def get_detected_aircraft_for_paths(self, file_paths: Sequence[str]) -> Dict[str, str]:
+        """Return {original_path: aircraft label} from the semantic index (empty if unknown)."""
+        if not file_paths:
+            return {}
+
+        canonical_to_original: Dict[str, str] = {}
+        canonical_paths: List[str] = []
+        for p in file_paths:
+            if not p:
+                continue
+            cp = self._canonical_path(p)
+            if cp in canonical_to_original:
+                continue
+            canonical_to_original[cp] = p
+            canonical_paths.append(cp)
+
+        out: Dict[str, str] = {}
+        if not canonical_paths:
+            return out
+
+        batch_size = 900
+        for i in range(0, len(canonical_paths), batch_size):
+            batch = canonical_paths[i : i + batch_size]
+            qs = ",".join(["?"] * len(batch))
+            rows = self._conn.execute(
+                f"SELECT file_path, detected_aircraft FROM semantic_index WHERE file_path IN ({qs})",
+                batch,
+            ).fetchall()
+            for row in rows:
+                fp = str(self._row_value(row, "file_path", "") or "")
+                if not fp:
+                    continue
+                original = canonical_to_original.get(fp, fp)
+                out[original] = str(self._row_value(row, "detected_aircraft", "") or "").strip()
         return out
 
     def _fetch_rows_for_paths(self, paths: Sequence[str]) -> List[sqlite3.Row]:
@@ -3228,6 +3536,19 @@ class SemanticImageIndex:
                     filtered = [r for r in filtered if self._contains_loose(str(r["lens_model"] or ""), needle)]
                 continue
 
+            if low.startswith("aircraft:"):
+                matched = True
+                needle = t.split(":", 1)[1].strip().lower()
+                if needle:
+                    filtered = [
+                        r
+                        for r in filtered
+                        if self._contains_loose(
+                            str(self._row_value(r, "detected_aircraft", "") or ""), needle
+                        )
+                    ]
+                continue
+
             if low.startswith("date:"):
                 matched = True
                 pref = t.split(":", 1)[1].strip()
@@ -3423,6 +3744,51 @@ class SemanticImageIndex:
             t for t in semantic_terms if (t or "").strip().lower() not in metadata_stopwords
         ]
         return filtered, " ".join(semantic_terms).strip()
+
+    def _search_hits_aircraft_label_only(
+        self,
+        rows: Sequence[sqlite3.Row],
+        label_query: str,
+        canonical_to_original: Dict[str, str],
+        signature_to_original: Dict[str, str],
+        top_k: int,
+    ) -> List[SearchHit]:
+        """Match remaining free-text tokens against indexed detected_aircraft labels only."""
+        needle = (label_query or "").strip().lower()
+        if not needle:
+            return []
+        hits: List[SearchHit] = []
+        for r in rows:
+            if not self._row_semantic_ready(r):
+                continue
+            label = str(self._row_value(r, "detected_aircraft", "") or "")
+            if not label or not self._contains_loose(label, needle):
+                continue
+            hits.append(
+                SearchHit(
+                    file_path=str(
+                        signature_to_original.get(str(r["file_signature"] or ""))
+                        or canonical_to_original.get(self._canonical_path(str(r["file_path"])))
+                        or str(r["file_path"])
+                    ),
+                    score=1.0,
+                    file_name=str(r["file_name"] or os.path.basename(str(r["file_path"]))),
+                    capture_time=str(r["capture_time"] or ""),
+                    camera_model=str(r["camera_model"] or ""),
+                    lens_model=str(r["lens_model"] or ""),
+                    iso=int(r["iso"] or 0),
+                    gps_lat=float(r["gps_lat"]) if r["gps_lat"] is not None else None,
+                    gps_lon=float(r["gps_lon"]) if r["gps_lon"] is not None else None,
+                    city=str(r["city"] or ""),
+                    admin1=str(r["admin1"] or ""),
+                    country=str(r["country"] or ""),
+                    country_code=str(r["country_code"] or ""),
+                    face_count=int(r["face_count"] or 0),
+                    detected_aircraft=label,
+                )
+            )
+        hits.sort(key=lambda h: h.capture_time, reverse=True)
+        return hits[: max(1, int(top_k))]
 
     def _normalize_loose_metadata_query(self, raw: str) -> str:
         """
@@ -3754,6 +4120,11 @@ class SemanticImageIndex:
             ]
             hits.sort(key=lambda h: h.capture_time, reverse=True)
             return hits[: max(1, int(top_k))]
+
+        if not semantic_embeddings_enabled():
+            return self._search_hits_aircraft_label_only(
+                rows, semantic_query, canonical_to_original, signature_to_original, top_k
+            )
 
         query_vec = self._encode_text(semantic_query)
 

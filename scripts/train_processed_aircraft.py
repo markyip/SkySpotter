@@ -4,7 +4,16 @@ import sys
 import json
 import numpy as np
 import evaluate
+from pathlib import Path
 from PIL import Image
+from tqdm import tqdm
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from classifier_preprocess import build_processed_dataset  # noqa: E402
 from datasets import Dataset, Features, ClassLabel, Image as DatasetImage
 from transformers import (
     ViTForImageClassification, 
@@ -27,9 +36,12 @@ from torchvision.transforms import (
 
 # --- CONFIGURATION ---
 DATA_PATH = os.environ.get("SkySpotter_TRAIN_DATA_PATH", r"./training_data/classified_images")
+PROCESSED_PATH = os.environ.get(
+    "SkySpotter_TRAIN_PROCESSED_PATH", r"./training_data/processed_images"
+)
 # We use the high-resolution 384px ViT as our foundation
 MODEL_ID = "google/vit-base-patch16-384"
-OUTPUT_DIR = "./aviation_model_processed"
+OUTPUT_DIR = os.environ.get("SkySpotter_TRAIN_OUTPUT_DIR", r"./customized_model")
 
 # --- GLOBAL TRANSFORMS (Required for Windows Multiprocessing) ---
 # Hardcode 384px for high-resolution refinement
@@ -66,14 +78,46 @@ def preprocess_val(examples):
         del examples["image"]
     return examples
 
+def _load_training_image(path: Path) -> Image.Image:
+    return Image.open(path)
+
+
 def train():
     if not os.path.exists(DATA_PATH):
         print(f"ERROR: DATA_PATH not found at {DATA_PATH}")
         return
 
-    print(f"--- Scanning Dataset: {DATA_PATH} ---")
-    
-    class_names = sorted([d for d in os.listdir(DATA_PATH) if os.path.isdir(os.path.join(DATA_PATH, d))])
+    source_root = Path(DATA_PATH)
+    processed_root = Path(PROCESSED_PATH)
+    print(f"--- Preprocessing training images (background removal + crop) ---")
+    print(f"  Source:   {source_root}")
+    print(f"  Processed: {processed_root}")
+
+    def _progress(src_path: Path, status: str):
+        tqdm.write(f"  {src_path.name}: {status}")
+
+    saved, skipped = build_processed_dataset(
+        source_root,
+        processed_root,
+        load_image=_load_training_image,
+        progress_callback=_progress,
+    )
+    print(f"Preprocessing complete: {saved} saved, {skipped} skipped.")
+
+    train_data_path = str(processed_root)
+    if saved == 0 and not any(processed_root.rglob("*.png")):
+        print("ERROR: No processed training images. Check source folders and rembg/pixi environment.")
+        return
+
+    print(f"--- Scanning Dataset: {train_data_path} ---")
+
+    class_names = sorted(
+        [
+            d
+            for d in os.listdir(train_data_path)
+            if os.path.isdir(os.path.join(train_data_path, d))
+        ]
+    )
     
     if not class_names:
         print("ERROR: No subdirectories found in DATA_PATH!")
@@ -82,10 +126,10 @@ def train():
     image_paths = []
     labels = []
     for label_idx, class_name in enumerate(class_names):
-        class_dir = os.path.join(DATA_PATH, class_name)
+        class_dir = os.path.join(train_data_path, class_name)
         count = 0
         for f in os.listdir(class_dir):
-            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.arw')): # Include .arw if needed, but datasets usually uses images. PIL might not read .arw natively without rawpy. Assuming .jpg/.png for processed
+            if f.lower().endswith((".png", ".jpg", ".jpeg")):
                 image_paths.append(os.path.join(class_dir, f))
                 labels.append(label_idx)
                 count += 1
@@ -186,8 +230,11 @@ def train():
     with open(os.path.join(OUTPUT_DIR, "labels.txt"), "w") as f:
         f.write("\n".join(class_names))
         
-    print(f"\nSUCCESS! Enhanced Model saved to {OUTPUT_DIR}")
-    print(f"You can now run 'python scripts/plot_training_history.py' to see the performance curves.")
+    print(f"\nSUCCESS! Model saved to {OUTPUT_DIR}")
+    print("Next steps:")
+    print("  1. pixi run batch-test-classifier   # test on testing_data/test_images/")
+    print("  2. When satisfied, copy checkpoint files to app_model/ for gallery use.")
+    print("You can run 'python scripts/plot_training_history.py --model-dir customized_model' for training curves.")
 
 if __name__ == "__main__":
     train()

@@ -9,7 +9,12 @@ platforms = ["win-64"]
 [tasks]
 start = "python src/main.py"
 start-windowless = "pythonw src/main.py"
-poc-legacy-rembg = "python scripts/poc_aircraft_detection_legacy.py --input-dir \"D:\\Development\\F-35\" --output-dir \"D:\\Development\\SkySpotter\\poc_f35_output_legacy_pixi\""
+batch-test-classifier = "python scripts/batch_test_classifier.py"
+verify-model = "python scripts/batch_test_classifier.py"
+test-aircraft-model = "python scripts/batch_test_classifier.py"
+
+[activation.env]
+PYTHONNOUSERSITE = "1"
 
 [dependencies]
 python = ">=3.10,<3.13"
@@ -18,7 +23,7 @@ pip = "*"
 [pypi-dependencies]
 PyQt6 = ">=6.6.0"
 rawpy = ">=0.25.0"
-numpy = ">=2.0.0,<2.4"
+numpy = ">=2.0.0,<=2.3"
 Pillow = ">=10.0.0"
 send2trash = ">=1.8.0"
 natsort = ">=8.4.0"
@@ -37,6 +42,7 @@ opencv-python-headless = "*"
 huggingface_hub = "*"
 requests = "*"
 rembg = "*"
+onnxscript = "*"
 numba = "<0.62"
 torch = "*"
 transformers = "*"

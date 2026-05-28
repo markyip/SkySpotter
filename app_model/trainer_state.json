@@ -1,7 +1,7 @@
 {
   "best_global_step": 6672,
   "best_metric": 0.9420197515132208,
-  "best_model_checkpoint": "./aviation_model_processed\\checkpoint-6672",
+  "best_model_checkpoint": "./app_model\\checkpoint-6672",
   "epoch": 15.0,
   "eval_steps": 500,
   "global_step": 8340,

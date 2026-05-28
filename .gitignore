@@ -50,6 +50,8 @@ debug_*.log
 
 # Test files
 test_images/
+!testing_data/test_images/
+!testing_data/test_images/**
 sample_images/
 test_*.py
 *_test.py
@@ -125,7 +127,15 @@ scratch/
 aviation_model_v2/
 old_semantic.py
 
-# Local PoC outputs / generated artifacts
+# Local classifier test outputs / generated artifacts
+testing_data/test_output/*
+!testing_data/test_output/.gitkeep
+training_data/processed_images/*
+!training_data/processed_images/.gitkeep
+!training_data/processed_images/README.md
+customized_model/*
+!customized_model/.gitkeep
+!customized_model/README.md
 poc_f35_output_legacy/
 poc_f35_output_legacy_pixi/
 poc_f35_output_legacy_pixi5/

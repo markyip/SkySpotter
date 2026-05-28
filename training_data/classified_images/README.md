@@ -1,20 +1,22 @@
-# Classified Image Dataset Template
+# Classified image dataset
 
-Put your training images here using one subfolder per class label.
+Put training images here using **one subfolder per class label** (any subject: birds, animals, aircraft, etc.).
 
-Example:
+Examples:
 
-- `training_data/classified_images/F35/`
-- `training_data/classified_images/F16/`
-- `training_data/classified_images/AH64/`
+- `training_data/classified_images/robin/`
+- `training_data/classified_images/sparrow/`
+- `training_data/classified_images/F35/` (military aircraft)
 
 Notes:
 
-- Folder names become the output class labels.
-- Use image files such as `.jpg`, `.jpeg`, `.png` (and `.arw` if needed).
-- Keep labels stable between runs to avoid changing class index mapping unexpectedly.
+- Folder names become class labels in the trained model.
+- Use `.jpg`, `.jpeg`, or `.png` in source folders (training will auto-remove backgrounds and write processed PNGs under `training_data/processed_images/`).
+- Keep label folder names stable between runs.
 
-Start training:
+Start training (pixi installs dependencies including `rembg`):
 
-- Windows: `train_model.bat`
-- macOS/Linux: `./train_model.sh`
+- **Windows:** `scripts\launchers\train_model.bat`
+- **macOS:** `./scripts/launchers/train_model.sh`
+
+Output checkpoint defaults to `customized_model/`. Copy to `app_model/` when you want the gallery to use it.

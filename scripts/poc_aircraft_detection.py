@@ -1,3 +1,9 @@
+"""Optional PoC: exercise the in-app MilitaryAircraftClassifier (gallery path).
+
+For verifying a checkpoint you just trained, use batch_test_classifier.py or
+scripts/launchers/verify_model.* instead (tests customized_model/ on testing_data/).
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -10,6 +16,8 @@ import numpy as np
 from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_INPUT_DIR = PROJECT_ROOT / "testing_data" / "test_images"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "testing_data" / "poc_gallery_output"
 SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
@@ -183,16 +191,22 @@ def run(input_dir: Path, output_dir: Path, max_images: int = 0) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="PoC aircraft detection runner (standalone from gallery workflow).")
+    parser = argparse.ArgumentParser(
+        description=(
+            "PoC: run gallery MilitaryAircraftClassifier on a folder "
+            "(app_model / in-app DirectML path). "
+            "To verify customized_model/ after training, use scripts/launchers/verify_model.bat or verify_model.sh."
+        )
+    )
     parser.add_argument(
         "--input-dir",
-        default=r"D:\Development\F-35",
-        help="Folder of images to process",
+        default=str(DEFAULT_INPUT_DIR),
+        help=f"Folder of images to process (default: {DEFAULT_INPUT_DIR})",
     )
     parser.add_argument(
         "--output-dir",
-        default=r"D:\Development\SkySpotter\poc_f35_output",
-        help="Folder for pipeline images and CSV",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help=f"Folder for pipeline images and CSV (default: {DEFAULT_OUTPUT_DIR})",
     )
     parser.add_argument(
         "--max-images",

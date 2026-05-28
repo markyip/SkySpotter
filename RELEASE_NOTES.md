@@ -12,7 +12,7 @@
 - README now documents the recommended pixi workflow (`pixi install`, `pixi run start`).
 - README classifier section updated to prioritize `aviation_model_processed/` checkpoint flow.
 - README now documents checkpoint-only aircraft inference behavior (no ONNX fallback).
-- Added explicit `poc-legacy-rembg` task usage and notes about fail-fast `rembg` behavior.
+- Added `pixi run batch-test-classifier` (`scripts/batch_test_classifier.py`); training auto-runs background removal; default checkpoint folder `customized_model/`.
 
 ## 🚀 Version 2.0.1
 **Release Date: May 23, 2026**
