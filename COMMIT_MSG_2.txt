@@ -1,3 +1,0 @@
-chore: enforce checkpoint-only training workflow
-
-Remove legacy ONNX/UI leftovers, add dataset and training launch scripts, and update docs to match the current pixi + checkpoint-only implementation.
