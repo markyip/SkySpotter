@@ -7447,10 +7447,21 @@ class RAWImageViewer(QMainWindow):
         if getattr(self, "view_mode", "single") != "gallery":
             btn.hide()
             return
+        btn.setToolTip("Auto-sort by aircraft type")
+        indexing = bool(getattr(self, "_semantic_indexing_in_progress", False))
+        sort_busy = bool(getattr(self, "_aircraft_auto_sort_in_progress", False))
         if self._folder_has_sortable_aircraft_labels():
             btn.show()
-            self._set_magic_wand_enabled(
-                not getattr(self, "_aircraft_auto_sort_in_progress", False)
+            self._set_magic_wand_enabled(not sort_busy and not indexing)
+            if indexing:
+                btn.setToolTip(
+                    "Auto-sort by aircraft type (wait for indexing to finish)"
+                )
+        elif indexing:
+            btn.show()
+            self._set_magic_wand_enabled(False)
+            btn.setToolTip(
+                "Auto-sort by aircraft type (wait for indexing to finish)"
             )
         else:
             btn.hide()
@@ -7541,6 +7552,7 @@ class RAWImageViewer(QMainWindow):
                 try:
                     moved = 0
                     skipped = 0
+                    already_placed = 0
                     errors = []
                     total = len(self_inner.paths)
                     for i, path in enumerate(self_inner.paths):
@@ -7558,35 +7570,32 @@ class RAWImageViewer(QMainWindow):
                             skipped += 1
                             continue
                         safe = RAWImageViewer._sanitize_aircraft_folder_name(label)
-                        if not safe:
-                            skipped += 1
+                        dest_path, plan_reason = (
+                            RAWImageViewer._plan_aircraft_auto_sort_move(
+                                self_inner.root_folder, path, safe
+                            )
+                        )
+                        if plan_reason != "move" or not dest_path:
+                            if plan_reason == "already_placed":
+                                already_placed += 1
+                            else:
+                                skipped += 1
                             continue
-                        dest_dir = os.path.join(self_inner.root_folder, safe)
-                        parent_norm = os.path.normpath(os.path.dirname(path))
-                        if parent_norm == os.path.normpath(dest_dir):
-                            skipped += 1
-                            continue
+                        dest_dir = os.path.dirname(dest_path)
                         try:
                             os.makedirs(dest_dir, exist_ok=True)
                         except OSError as exc:
                             errors.append(f"{base}: {exc}")
                             continue
-                        dest_path = os.path.join(dest_dir, base)
-                        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(
-                            os.path.abspath(dest_path)
-                        ):
-                            skipped += 1
+                        if not os.path.isdir(dest_dir):
+                            errors.append(
+                                f"{base}: destination is not a folder ({safe})"
+                            )
                             continue
-                        if os.path.exists(dest_path):
-                            stem, ext = os.path.splitext(dest_path)
-                            n = 1
-                            while os.path.exists(dest_path):
-                                dest_path = f"{stem}_{n}{ext}"
-                                n += 1
                         try:
                             shutil.move(path, dest_path)
                             moved += 1
-                        except OSError as exc:
+                        except (OSError, shutil.Error) as exc:
                             errors.append(f"{base}: {exc}")
 
                     self_inner.signals.done.emit(
@@ -7595,6 +7604,7 @@ class RAWImageViewer(QMainWindow):
                             "folder": self_inner.root_folder,
                             "moved": moved,
                             "skipped": skipped,
+                            "already_placed": already_placed,
                             "errors": errors,
                         }
                     )
@@ -7616,11 +7626,20 @@ class RAWImageViewer(QMainWindow):
             folder = result.get("folder")
             moved = int(result.get("moved", 0))
             skipped = int(result.get("skipped", 0))
+            already_placed = int(result.get("already_placed", 0))
             errors = result.get("errors") or []
-            msg = f"Auto-sort complete: moved {moved}, skipped {skipped}"
-            if errors:
-                msg += f", {len(errors)} error(s)"
-            self.status_bar.showMessage(msg, 6000)
+            if already_placed and not moved and not errors:
+                msg = (
+                    f"Auto-sort: all labeled images were already in aircraft "
+                    f"subfolder(s) ({already_placed} skipped)"
+                )
+            else:
+                msg = f"Auto-sort complete: moved {moved}, skipped {skipped}"
+                if already_placed:
+                    msg += f", {already_placed} already in aircraft folder(s)"
+                if errors:
+                    msg += f", {len(errors)} error(s)"
+            self.status_bar.showMessage(msg, 8000)
             if folder and os.path.isdir(folder):
                 view = getattr(self, "view_mode", "gallery")
                 start_view = view if view in ("gallery", "single") else "gallery"
@@ -7911,15 +7930,13 @@ class RAWImageViewer(QMainWindow):
             if not semantic_query:
                 hits = metadata_hits
             elif not semantic_embeddings_enabled():
-                if metadata_hits:
-                    hits = metadata_hits
-                else:
-                    hits = index.search_text(
-                        query,
-                        base_files,
-                        top_k=min(500, len(base_files)),
-                        min_score=0.0,
-                    )
+                # Free-text aircraft terms (e.g. "F-35") need indexed labels via search_text.
+                hits = index.search_text(
+                    query,
+                    base_files,
+                    top_k=min(500, len(base_files)),
+                    min_score=0.0,
+                )
             elif not index.semantic_backend_available():
                 hits = []
                 self.status_bar.showMessage(
@@ -13975,6 +13992,65 @@ class RAWImageViewer(QMainWindow):
         if len(name) > 120:
             name = name[:120].rstrip(" .")
         return name or ""
+
+    @staticmethod
+    def _unique_aircraft_sort_dest_path(dest_dir: str, filename: str) -> str:
+        """Return an unused file path under dest_dir (adds _N before extension if needed)."""
+        dest_path = os.path.join(dest_dir, filename)
+        if not os.path.exists(dest_path):
+            return dest_path
+        if os.path.isdir(dest_path):
+            stem, ext = os.path.splitext(filename)
+            n = 1
+            while True:
+                candidate = os.path.join(dest_dir, f"{stem}_{n}{ext}")
+                if not os.path.exists(candidate):
+                    return candidate
+                n += 1
+        stem, ext = os.path.splitext(dest_path)
+        n = 1
+        while os.path.exists(dest_path):
+            dest_path = f"{stem}_{n}{ext}"
+            n += 1
+        return dest_path
+
+    @staticmethod
+    def _plan_aircraft_auto_sort_move(
+        root_folder: str, source_path: str, aircraft_folder_name: str
+    ) -> tuple[str | None, str]:
+        """Plan a Magic Wand move. Returns (dest_path, reason) or (None, skip_reason)."""
+        if not aircraft_folder_name:
+            return None, "invalid_folder"
+        if not source_path:
+            return None, "missing_source"
+        try:
+            if not os.path.isfile(source_path):
+                return None, "missing_source"
+        except OSError:
+            return None, "missing_source"
+
+        src_abs = os.path.normcase(os.path.abspath(source_path))
+        dest_dir = os.path.abspath(os.path.join(root_folder, aircraft_folder_name))
+        dest_dir_norm = os.path.normcase(dest_dir)
+        parent_norm = os.path.normcase(os.path.dirname(src_abs))
+
+        if parent_norm == dest_dir_norm:
+            return None, "already_placed"
+
+        try:
+            common = os.path.normcase(
+                os.path.commonpath([src_abs, dest_dir_norm])
+            )
+        except ValueError:
+            common = ""
+        if common == dest_dir_norm and parent_norm != dest_dir_norm:
+            return None, "already_placed"
+
+        base = os.path.basename(source_path)
+        dest_path = RAWImageViewer._unique_aircraft_sort_dest_path(dest_dir, base)
+        if os.path.normcase(os.path.abspath(dest_path)) == src_abs:
+            return None, "already_placed"
+        return dest_path, "move"
 
     def get_supported_extensions(self):
         """Get list of supported image file extensions"""

@@ -208,7 +208,6 @@ The first run may pause on **“Exporting aircraft model for DirectML (one-time)
 | `SkySpotter_CLASSIFIER_DEVICE=cuda` | PyTorch ViT on NVIDIA (requires CUDA `torch`) |
 | `SkySpotter_CLASSIFIER_DEVICE=cpu` | PyTorch ViT on CPU only |
 | `SkySpotter_INDEX_MAX_SIZE=1280` | Smaller decode size during folder indexing (faster) |
-| `SkySpotter_CLASSIFIER_MIN_CROP_SIZE=400` | Skip ViT only if **both** crop width and height are below this; either side ≥ 400 runs classification |
 | `SkySpotter_ORT_PROVIDERS` | Optional provider order, e.g. `DmlExecutionProvider,CPUExecutionProvider` |
 
 Set `PYTHONUTF8=1` if ONNX export fails on Windows with a console encoding error (cp950).

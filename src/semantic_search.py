@@ -802,14 +802,6 @@ class MobileCLIPONNXBackend:
         return arr
 
 
-def _classifier_min_crop_size() -> int:
-    """Classify when either crop side reaches this many px; skip only if both are smaller."""
-    try:
-        return max(1, int(os.environ.get("SkySpotter_CLASSIFIER_MIN_CROP_SIZE", "400")))
-    except (TypeError, ValueError):
-        return 400
-
-
 class MilitaryAircraftClassifier:
     """Specialist ViT classifier for precise military aircraft identification."""
     HUB_REPO_ID = "dima806/military_aircraft_image_detection"
@@ -1047,20 +1039,6 @@ class MilitaryAircraftClassifier:
             except Exception:
                 return image.convert("RGBA")
 
-    def _crop_below_classify_minimum(self, cropped_rgb: Image.Image, file_path: str) -> bool:
-        min_px = _classifier_min_crop_size()
-        w, h = cropped_rgb.size
-        if w >= min_px or h >= min_px:
-            return False
-        logger.info(
-            "[AVIATION AI] Skip classify (crop %dx%d, both sides < %dpx): %s",
-            w,
-            h,
-            min_px,
-            os.path.basename(file_path),
-        )
-        return True
-
     def _legacy_focus_blob_crop(self, file_path: str, image_rgba: Image.Image) -> tuple[Image.Image, str]:
         """Match legacy PoC blob-selection logic (focus-overlap first, else largest blob)."""
         try:
@@ -1247,8 +1225,6 @@ class MilitaryAircraftClassifier:
         ).convert("RGB")
         rgba = self._legacy_bg_remove(src)
         cropped_rgb, mode = self._legacy_focus_blob_crop(file_path, rgba)
-        if self._crop_below_classify_minimum(cropped_rgb, file_path):
-            return ""
         label, conf, _ = self._predict_im(cropped_rgb)
         logger.info(
             "[AVIATION AI] ONNX pipeline mode=%s label=%s conf=%.3f file=%s",
@@ -1469,8 +1445,6 @@ class MilitaryAircraftClassifier:
                 ).convert("RGB")
                 rgba = self._legacy_bg_remove(src)
                 cropped_rgb, mode = self._legacy_focus_blob_crop(file_path, rgba)
-                if self._crop_below_classify_minimum(cropped_rgb, file_path):
-                    return ""
                 label, conf = self._predict_with_torch(cropped_rgb)
                 logger.info(
                     "[AVIATION AI] PyTorch pipeline mode=%s label=%s conf=%.3f file=%s",
@@ -3246,21 +3220,23 @@ class SemanticImageIndex:
             batch = canonical_paths[i : i + batch_size]
             qs = ",".join(["?"] * len(batch))
             rows = self._conn.execute(
-                f"SELECT file_path, width, height, detected_aircraft FROM semantic_index WHERE file_path IN ({qs})",
-                batch,
+                f"SELECT file_path, width, height, detected_aircraft FROM semantic_index "
+                f"WHERE model_name = ? AND file_path IN ({qs})",
+                [self.model_name, *batch],
             ).fetchall()
             for row in rows:
-                fp = str(self._row_value(row, "file_path", "") or "")
+                # Default sqlite3 rows are tuples; do not use _row_value (expects Row/dict).
+                fp = str(row[0] or "")
                 if not fp:
                     continue
                 original = canonical_to_original.get(fp, fp)
                 out[original] = {
-                    "width": int(self._row_value(row, "width", 0) or 0),
-                    "height": int(self._row_value(row, "height", 0) or 0),
+                    "width": int(row[1] or 0),
+                    "height": int(row[2] or 0),
                     # semantic_index currently does not persist EXIF orientation.
                     # Keep shape compatible with gallery caller.
                     "orientation": 1,
-                    "detected_aircraft": str(self._row_value(row, "detected_aircraft", "") or "").strip(),
+                    "detected_aircraft": str(row[3] or "").strip(),
                 }
         return out
 
@@ -3289,15 +3265,16 @@ class SemanticImageIndex:
             batch = canonical_paths[i : i + batch_size]
             qs = ",".join(["?"] * len(batch))
             rows = self._conn.execute(
-                f"SELECT file_path, detected_aircraft FROM semantic_index WHERE file_path IN ({qs})",
-                batch,
+                f"SELECT file_path, detected_aircraft FROM semantic_index "
+                f"WHERE model_name = ? AND file_path IN ({qs})",
+                [self.model_name, *batch],
             ).fetchall()
             for row in rows:
-                fp = str(self._row_value(row, "file_path", "") or "")
+                fp = str(row[0] or "")
                 if not fp:
                     continue
                 original = canonical_to_original.get(fp, fp)
-                out[original] = str(self._row_value(row, "detected_aircraft", "") or "").strip()
+                out[original] = str(row[1] or "").strip()
         return out
 
     def _fetch_rows_for_paths(self, paths: Sequence[str]) -> List[sqlite3.Row]:
@@ -4208,9 +4185,21 @@ class SemanticImageIndex:
         rows = self._metadata_rows_for_search(candidate_paths, needs_face=needs_face)
 
         filtered, semantic_query = self._apply_filters(rows, raw_query)
+        canonical_to_original: Dict[str, str] = {}
+        for p in candidate_paths:
+            if not p:
+                continue
+            cp = self._canonical_path(p)
+            canonical_to_original[cp] = p
+
         hits = [
             SearchHit(
-                file_path=str(self._row_value(r, "file_path")),
+                file_path=str(
+                    canonical_to_original.get(
+                        self._canonical_path(str(self._row_value(r, "file_path")))
+                    )
+                    or self._row_value(r, "file_path")
+                ),
                 score=1.0,
                 file_name=str(self._row_value(r, "file_name") or os.path.basename(str(self._row_value(r, "file_path")))),
                 capture_time=str(self._row_value(r, "capture_time")),
@@ -4238,6 +4227,13 @@ class SemanticImageIndex:
         if not candidate_paths:
             return []
 
+        canonical_to_original: Dict[str, str] = {}
+        for p in candidate_paths:
+            if not p:
+                continue
+            cp = self._canonical_path(p)
+            canonical_to_original[cp] = p
+
         # Bulk fetch all rows that exist in the index
         rows: List[Dict[str, object]] = []
         db_rows = self._fetch_rows_for_paths(candidate_paths)
@@ -4245,8 +4241,9 @@ class SemanticImageIndex:
 
         # Rows present in DB (fast path).
         for row in db_rows:
-            original = str(row["file_path"])
-            found_paths.add(self._canonical_path(original))
+            canonical = self._canonical_path(str(row["file_path"]))
+            found_paths.add(canonical)
+            display_path = canonical_to_original.get(canonical, canonical)
             
             face_count = row["face_count"] if "face_count" in row.keys() else 0
             
@@ -4273,7 +4270,7 @@ class SemanticImageIndex:
                             # Update DB so we don't have to geocode this file again
                             self._conn.execute(
                                 "UPDATE semantic_index SET city=?, admin1=?, country=?, country_code=? WHERE file_path=?",
-                                (city, admin1, country, cc, original)
+                                (city, admin1, country, cc, canonical),
                             )
                             self._conn.commit()
                     except Exception:
@@ -4281,8 +4278,8 @@ class SemanticImageIndex:
 
             rows.append(
                 {
-                    "file_path": original,
-                    "file_name": str(self._row_value(row, "file_name") or os.path.basename(original)),
+                    "file_path": display_path,
+                    "file_name": str(self._row_value(row, "file_name") or os.path.basename(display_path)),
                     "capture_time": str(self._row_value(row, "capture_time")),
                     "camera_model": str(self._row_value(row, "camera_model")),
                     "lens_model": str(self._row_value(row, "lens_model")),
@@ -4296,6 +4293,10 @@ class SemanticImageIndex:
                     "country": country,
                     "country_code": str(self._row_value(row, "country_code")),
                     "face_count": int(face_count or 0),
+                    "detected_aircraft": str(
+                        self._row_value(row, "detected_aircraft", "") or ""
+                    ).strip(),
+                    "semantic_ready": int(self._row_value(row, "semantic_ready", 0) or 0),
                 }
             )
         # Fallback for files not yet indexed: extract EXIF so metadata search can still
@@ -4309,7 +4310,7 @@ class SemanticImageIndex:
             meta = self._extract_exif_brief(canonical, include_face=False)
             rows.append(
                 {
-                    "file_path": canonical,
+                    "file_path": canonical_to_original.get(canonical, p),
                     "file_name": os.path.basename(canonical),
                     "capture_time": str(meta.get("capture_time") or ""),
                     "camera_model": str(meta.get("camera_model") or ""),
@@ -4324,6 +4325,8 @@ class SemanticImageIndex:
                     "country": str(meta.get("country") or ""),
                     "country_code": str(meta.get("country_code") or ""),
                     "face_count": int(meta.get("face_count") or 0),
+                    "detected_aircraft": "",
+                    "semantic_ready": 0,
                 }
             )
         return rows
