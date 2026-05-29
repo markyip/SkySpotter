@@ -1,6 +1,13 @@
 # SkySpotter v1.0.0
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+<p align="center">
+  <img src="icons/appicon.ico" alt="SkySpotter Icon" width="256">
+</p>
+
+![Version](https://img.shields.io/badge/version-2.1.0-blue)
+![Downloads](https://img.shields.io/github/downloads/markyip/SkySpotter/total) 
+![License](https://img.shields.io/badge/license-MIT-green)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-orange?logo=buy-me-a-coffee)](https://www.buymeacoffee.com/markyip)
 
 ## ✈️ Meet SkySpotter
 
