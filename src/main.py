@@ -15260,11 +15260,65 @@ class RAWImageViewer(QMainWindow):
         skip = (discard_folder,) if discard_folder else ("Discard",)
         yield from self._iter_folder_images_shallow(folder_path, extensions, skip)
 
+    def _resolve_folder_start_path(self, folder_path: str, start_file: str) -> str | None:
+        """Resolve start_file to an absolute path under folder_path, if supported."""
+        if not folder_path or not start_file:
+            return None
+        folder_abs = os.path.abspath(folder_path)
+        extensions = set(self.get_supported_extensions())
+        candidates = []
+        if os.path.isabs(start_file):
+            candidates.append(start_file)
+        candidates.append(os.path.join(folder_abs, os.path.basename(start_file)))
+        candidates.append(os.path.join(folder_abs, start_file))
+        seen = set()
+        for cand in candidates:
+            ap = os.path.abspath(cand)
+            key = _norm_path(ap)
+            if key in seen:
+                continue
+            seen.add(key)
+            if not os.path.isfile(ap):
+                continue
+            if os.path.splitext(ap)[1].lower() not in extensions:
+                continue
+            if _norm_path(os.path.dirname(ap)) != _norm_path(folder_abs):
+                continue
+            return ap
+        return None
+
+    def _try_fast_open_start_image(self, folder_path: str, start_file: str) -> bool:
+        """Show the requested image immediately; folder scan continues in background."""
+        start_path = self._resolve_folder_start_path(folder_path, start_file)
+        if not start_path:
+            return False
+        import logging
+        logger = logging.getLogger(__name__)
+        self._folder_fast_open_path = start_path
+        self.current_folder = os.path.abspath(folder_path)
+        self.image_files = [start_path]
+        self._semantic_search_corpus_files = [start_path]
+        self._filmstrip_warmed_paths = set()
+        self.current_file_index = 0
+        self.current_file_path = start_path
+        self.view_mode = "single"
+        if hasattr(self, "gallery_widget") and self.gallery_widget:
+            self.gallery_widget.hide()
+        if hasattr(self, "loading_overlay"):
+            self.loading_overlay.hide_loading()
+        self._show_single_view()
+        logger.info(
+            "[FOLDER] Fast-opened %s while folder scan runs in background",
+            os.path.basename(start_path),
+        )
+        return True
+
     def _on_folder_load_error(self, token, title, message):
         if token != getattr(self, "_folder_load_generation", None):
             return
         self._active_folder_load_worker = None
         self._active_folder_load_signals = None
+        self._folder_fast_open_path = None
         self._hide_all_loading_indicators()
         self.show_error(title, message)
 
@@ -15293,52 +15347,60 @@ class RAWImageViewer(QMainWindow):
                 self.update_status_bar()
                 return
 
+            fast_path = getattr(self, "_folder_fast_open_path", None)
+            keep_visible_image = bool(
+                fast_path
+                and self.current_file_path
+                and _norm_path(self.current_file_path) == _norm_path(fast_path)
+            )
+
             self.current_folder = folder_path
             self.image_files = image_files
             self._semantic_search_corpus_files = list(image_files)
             self._filmstrip_warmed_paths = set()
             self._gallery_bulk_metadata = bulk_metadata
-            # Folder switched: invalidate render/task state from previous folder so
-            # stale async callbacks cannot keep the old content visible.
-            try:
-                if getattr(self, "image_manager", None) is not None:
-                    self.image_manager.cancel_all_tasks()
-            except Exception:
-                pass
-            self._displayed_content_path = None
-            self._manager_display_track_path = None
-            self._manager_displayed_max_dim = 0
-            self._last_loaded_path = None
-            self._last_manager_exif_path = None
-            self._last_manager_exif_ts = 0.0
-            # Clear previously displayed single-view content so the new folder does not
-            # temporarily show stale dimensions/pixels from the old folder.
-            self.current_image = None
-            self.current_pixmap = None
-            self._displayed_content_path = None
-            self._manager_displayed_max_dim = 0
-            self._is_half_size_displayed = False
-            self._full_resolution_loading = False
-            self._preserve_nav_zoom_active = False
-            self._pending_zoom_restore = False
-            self._restore_zoom_center = None
-            self._restore_zoom_level = None
-            if hasattr(self, '_maintain_zoom_on_navigation'):
+            if not keep_visible_image:
+                # Folder switched: invalidate render/task state from previous folder so
+                # stale async callbacks cannot keep the old content visible.
                 try:
-                    delattr(self, "_maintain_zoom_on_navigation")
-                except AttributeError:
+                    if getattr(self, "image_manager", None) is not None:
+                        self.image_manager.cancel_all_tasks()
+                except Exception:
                     pass
-            
-            # Immediately clear the image view to prevent stale pixels
-            self.image_label.setPixmap(QPixmap())
-            self.image_label.setText("Loading folder...")
-            self.image_label.adjustSize()
-            self.scroll_area.updateGeometry()
-            try:
-                if hasattr(self, "image_label") and self.image_label is not None:
-                    self.image_label.clear()
-            except Exception:
-                pass
+                self._displayed_content_path = None
+                self._manager_display_track_path = None
+                self._manager_displayed_max_dim = 0
+                self._last_loaded_path = None
+                self._last_manager_exif_path = None
+                self._last_manager_exif_ts = 0.0
+                # Clear previously displayed single-view content so the new folder does not
+                # temporarily show stale dimensions/pixels from the old folder.
+                self.current_image = None
+                self.current_pixmap = None
+                self._displayed_content_path = None
+                self._manager_displayed_max_dim = 0
+                self._is_half_size_displayed = False
+                self._full_resolution_loading = False
+                self._preserve_nav_zoom_active = False
+                self._pending_zoom_restore = False
+                self._restore_zoom_center = None
+                self._restore_zoom_level = None
+                if hasattr(self, '_maintain_zoom_on_navigation'):
+                    try:
+                        delattr(self, "_maintain_zoom_on_navigation")
+                    except AttributeError:
+                        pass
+
+                # Immediately clear the image view to prevent stale pixels
+                self.image_label.setPixmap(QPixmap())
+                self.image_label.setText("Loading folder...")
+                self.image_label.adjustSize()
+                self.scroll_area.updateGeometry()
+                try:
+                    if hasattr(self, "image_label") and self.image_label is not None:
+                        self.image_label.clear()
+                except Exception:
+                    pass
 
             try:
                 if start_file:
@@ -15380,6 +15442,13 @@ class RAWImageViewer(QMainWindow):
                 # race when switching folders quickly.
                 QTimer.singleShot(0, self._update_gallery_view)
                 QTimer.singleShot(120, self._update_gallery_view)
+            elif keep_visible_image:
+                QTimer.singleShot(0, self._sync_filmstrip_to_folder)
+                self.update_status_bar()
+                if hasattr(self, 'gallery_justified') and self.gallery_justified:
+                    self.gallery_justified._background_loading_active = False
+                    if hasattr(self.gallery_justified, '_load_timer') and self.gallery_justified._load_timer:
+                        self.gallery_justified._load_timer.stop()
             else:
                 self._show_single_view()
                 QTimer.singleShot(0, self._sync_filmstrip_to_folder)
@@ -15389,6 +15458,7 @@ class RAWImageViewer(QMainWindow):
                     if hasattr(self.gallery_justified, '_load_timer') and self.gallery_justified._load_timer:
                         self.gallery_justified._load_timer.stop()
 
+            self._folder_fast_open_path = None
             total_time = scan_time + sort_time + (time.time() - apply_start)
             logger.info(
                 "[FOLDER] Background folder load applied in %.3fs (scan %.3fs, sort %.3fs)",
@@ -15432,6 +15502,11 @@ class RAWImageViewer(QMainWindow):
                 # Legacy behavior: opening a specific file from gallery focuses single view.
                 self.view_mode = "single"
 
+            self._folder_fast_open_path = None
+            fast_open_active = False
+            if start_file and getattr(self, "view_mode", "single") == "single":
+                fast_open_active = self._try_fast_open_start_image(folder_path, start_file)
+
             if hasattr(self, 'view_mode'):
                 if self.view_mode == 'gallery':
                     if not hasattr(self, 'gallery_widget') or not self.gallery_widget:
@@ -15441,7 +15516,7 @@ class RAWImageViewer(QMainWindow):
                         self.gallery_justified.show_loading_message("Scanning folder...")
                     if hasattr(self, 'gallery_widget') and self.gallery_widget:
                         self.gallery_widget.show()
-                else:
+                elif not fast_open_active:
                     if hasattr(self, 'loading_overlay'):
                         self.loading_overlay.show_loading("Scanning folder...")
                     if hasattr(self, 'image_label'):
@@ -15503,7 +15578,7 @@ class RAWImageViewer(QMainWindow):
                                 meta = bulk_metadata.get(fp)
                                 mtime = file_stats.get(fp, (0, 0))[1]
                                 timestamp = capture_timestamp_for_sort(
-                                    fp, meta, mtime, probe_file=True
+                                    fp, meta, mtime, probe_file=False
                                 )
                                 base_name = os.path.basename(fp).lower()
                                 stem = os.path.splitext(base_name)[0]

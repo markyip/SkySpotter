@@ -12,6 +12,7 @@ __pycache__/
 # IDE files
 .vscode/
 .idea/
+.cursor/
 .agent/
 .gemini/
 *.swp
@@ -43,15 +44,17 @@ desktop.ini
 *.TIF
 *.TIFF
 
+# App/UI assets (allow icons despite image rules above)
+!icons/
+!icons/**
+
 # Log files
 *.log
 rawviewer_debug_*.log
 debug_*.log
 
-# Test files
+# Test files (repo root only)
 test_images/
-!testing_data/test_images/
-!testing_data/test_images/**
 sample_images/
 test_*.py
 *_test.py
@@ -127,12 +130,22 @@ scratch/
 aviation_model_v2/
 old_semantic.py
 
-# Local classifier test outputs / generated artifacts
-testing_data/test_output/*
-!testing_data/test_output/.gitkeep
+# Training & test data (README + .gitkeep only — no images, checkpoints, or run outputs)
+training_data/classified_images/**
+!training_data/classified_images/.gitkeep
+!training_data/classified_images/README.md
+
 training_data/processed_images/*
 !training_data/processed_images/.gitkeep
 !training_data/processed_images/README.md
+
+testing_data/test_images/*
+!testing_data/test_images/.gitkeep
+!testing_data/test_images/README.md
+
+testing_data/test_output/*
+!testing_data/test_output/.gitkeep
+
 customized_model/*
 !customized_model/.gitkeep
 !customized_model/README.md

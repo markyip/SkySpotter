@@ -1,71 +1,24 @@
-# RAWviewer Release Notes
+# SkySpotter Release Notes
 
-## 🚧 Unreleased (SkySpotter main)
+## Unreleased (main)
 
-🧹 Project housekeeping
-- Removed unused CoreML helper scripts: `scripts/download_mobileclip_coreml.py` and `scripts/export_mobileclip2_coreml.py`.
-- Removed legacy aircraft ONNX artifacts: `src/models/super_specialist.onnx` and `src/models/super_specialist_quantized.onnx`.
-- Cleaned generated PoC output folders from repository working tree.
-- Updated `.gitignore` to exclude local PoC outputs and local cache/index artifacts.
+Work in progress on the **SkySpotter** aviation specialist viewer—not yet tagged as a release.
 
-📘 Documentation updates
-- README now documents the recommended pixi workflow (`pixi install`, `pixi run start`).
-- README classifier section updated to prioritize `aviation_model_processed/` checkpoint flow.
-- README now documents checkpoint-only aircraft inference behavior (no ONNX fallback).
-- Added `pixi run batch-test-classifier` (`scripts/batch_test_classifier.py`); training auto-runs background removal; default checkpoint folder `customized_model/`.
+### Aircraft gallery & indexing
 
-## 🚀 Version 2.0.1
-**Release Date: May 23, 2026**
+- All AI (ViT labels, indexing, Magic Wand) runs **locally**—photos are not sent to the cloud for detection.
+- ViT aircraft classifier with gallery labels, Magic Wand auto-sort, and `aircraft:` / model-name gallery search (EXIF + detected labels).
+- Fixes for aircraft filter queries, Magic Wand moves when a type folder already exists, and reading indexed labels from the database.
+- Minimum crop size for classification uses a fraction of the source image (default 20% per axis) instead of a fixed pixel floor.
+- Faster open when launching on a single file: show that image first while the rest of the folder scans in the background.
 
-🛠️ Fixes & improvements
-- **Google Pixel DNG Support**: Fixed critical crashes in the `QImageReader` and `EXIFExtractor` fallbacks that prevented Google Pixel DNG files from rendering on macOS.
-- **Gallery Aspect Ratio Fix**: Fixed a bug where thumbnail crops were improperly bypassed, ensuring that all gallery tiles now correctly display cropped square previews without distorted aspect ratios or zoomed-in glitches.
+### Models & installer
 
----
+- Default checkpoint lives under `models/gallery-classifier/skyspotter-military-aircraft-vit/` (Git LFS); legacy `app_model/` path still supported.
+- Windows installer: SkySpotter branding, `pixi.lock` + `pixi install --locked`, gallery classifier install step (`scripts/download_app_model.py`).
+- Installer entry uses `src/bootstrap.py` (replaces missing legacy installer script).
 
-## 🚀 Version 2.0.0
-**Release Date: May 7, 2026**
+### Documentation
 
-🎯 What's New
-- **Local Semantic Search**: Cross-platform natural-language gallery search. Harness the power of MobileCLIP (Core ML on macOS, ONNX on Windows) to rank images by meaning (e.g., "sunny landscape" or "vintage portrait").
-- **Structured Metadata Filters**: Powerful new query syntax to narrow by `camera:`, `lens:`, `iso:`, `ext:`, and more.
-- **Slideshow Mode**: Automatic hands-free playback of your photos with adjustable intervals.
-- **macOS Native Share**: Integration with the native macOS share sheet for instant sending via Mail, AirDrop, or Messages.
-- **High-Fidelity Rendering**: New LANCZOS resampling and 2x JPEG oversampling for razor-sharp display on 4K and Retina screens.
-- **Native macOS & Windows Shell Integration**: Improved Windows shell verbs and deep Finder/Explorer compatibility.
-- **Non-Destructive Rotation**: Instantly rotate any image (including RAW) by 90° steps visually without modifying the original file.
-- **Massive Location Intelligence**: Added ~150+ world cities to the GPS contradiction filter and improved multi-word place detection (e.g., "Hong Kong").
-- **Precision Focus Overlays**: Added focus point visualization using MakerNote data for Canon, Nikon, and Sony.
-
-🛠️ Fixes & improvements
-- **High-Quality RAW Fallback**: Automatically triggers high-quality "fast RAW decode" for files with poor-quality embedded previews.
-- **Performance Hardening**: Refactored `UnifiedImageProcessor` to open RAW files exactly once, drastically reducing Disk I/O.
-
-### ⌨️ Keyboard & Gesture Map
-- **Space / Double-click**: Toggle between "Fit to Window" and 100% zoom.
-- **Pinch-to-Zoom**: Smoothly zoom in/out via trackpad or Ctrl+Scroll Wheel.
-- **Left / Right Arrow**: Navigate between images (preserves zoom level).
-- **Down Arrow**: Move current image to "Discard" folder.
-- **Delete**: Remove the current image.
-- **H / F**: Toggle Histogram / Focus Subject outlines.
-
----
-
-## 🚀 Version 1.6.0
-**Release Date: April 28, 2026**
-
-🎯 What's New
-- **macOS Native Integration**: Set RAWviewer as your default viewer. Full support for `FileOpen` events from Finder.
-- **Seamless Pinch-to-Zoom**: Fluid trackpad gestures for Mac and Windows (or Ctrl+Scroll Wheel).
-- **Advanced Gallery Behavior**: Improved large-folder scrolling, cacheless-by-default mode, and polished UI controls.
-
-🛠️ Fixes & improvements
-- **Smart Cursor Anchoring**: Zooming naturally anchors to your cursor position, matching modern macOS application behavior.
-- **Smart Zoom Gesture**: Double-tap with two fingers to instantly toggle between "Fit to Window" and 100% zoom.
-- **Live Status Feedback**: Real-time zoom percentage and total image counts displayed in the status bar.
-- **EXIF-Aware Gallery**: Background extraction of capture-time and orientation with smart refresh logic for visible tiles.
-- **Histogram UX Guard**: Fixed visibility resets and ensured the histogram remains disabled when no image is loaded.
-
----
-
-**Thank you for using RAWviewer!** 📸
+- README rewritten for aviation workflows (focus overlay, aircraft search, formats, Pixi-only builds).
+- Removed RAWviewer-era release history from this file; future versions will be listed here as SkySpotter ships.
