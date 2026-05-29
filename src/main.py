@@ -7554,6 +7554,7 @@ class RAWImageViewer(QMainWindow):
                     skipped = 0
                     already_placed = 0
                     errors = []
+                    path_remap: dict[str, str] = {}
                     total = len(self_inner.paths)
                     for i, path in enumerate(self_inner.paths):
                         base = os.path.basename(path)
@@ -7593,7 +7594,19 @@ class RAWImageViewer(QMainWindow):
                             )
                             continue
                         try:
+                            preserve_times = None
+                            try:
+                                st = os.stat(path)
+                                preserve_times = (st.st_atime, st.st_mtime)
+                            except OSError:
+                                pass
                             shutil.move(path, dest_path)
+                            if preserve_times:
+                                try:
+                                    os.utime(dest_path, preserve_times)
+                                except OSError:
+                                    pass
+                            path_remap[path] = dest_path
                             moved += 1
                         except (OSError, shutil.Error) as exc:
                             errors.append(f"{base}: {exc}")
@@ -7606,6 +7619,7 @@ class RAWImageViewer(QMainWindow):
                             "skipped": skipped,
                             "already_placed": already_placed,
                             "errors": errors,
+                            "path_remap": path_remap,
                         }
                     )
                 except Exception as exc:
@@ -7640,6 +7654,29 @@ class RAWImageViewer(QMainWindow):
                 if errors:
                     msg += f", {len(errors)} error(s)"
             self.status_bar.showMessage(msg, 8000)
+            path_remap = result.get("path_remap") or {}
+            if path_remap:
+                try:
+                    index = self._get_semantic_index()
+                    n = index.repath_indexed_files(path_remap)
+                    if n:
+                        import logging
+
+                        logging.getLogger(__name__).info(
+                            "[MAGIC WAND] Updated %d semantic_index path(s) after move",
+                            n,
+                        )
+                except Exception as exc:
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "[MAGIC WAND] Could not update index paths after move: %s", exc
+                    )
+                cache = getattr(self, "_gallery_bulk_metadata", None)
+                if isinstance(cache, dict):
+                    for old_p, new_p in path_remap.items():
+                        if old_p in cache:
+                            cache[new_p] = cache.pop(old_p)
             if folder and os.path.isdir(folder):
                 view = getattr(self, "view_mode", "gallery")
                 start_view = view if view in ("gallery", "single") else "gallery"

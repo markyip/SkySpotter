@@ -53,7 +53,7 @@ This is a **pre-filtering tool**, letting you go through hundreds of RAW files e
 
 1. Download the latest release from the [Releases Page](https://github.com/markyip/SkySpotter/releases/latest)
 2. Download `SkySpotter.exe` directly (no zip extraction needed)
-3. Double-click `SkySpotter.exe` to initiate the installation process. It will automatically download the necessary dependencies and AI models to a destination of your choice.
+3. Double-click `SkySpotter.exe` to initiate the installation process. It will automatically download dependencies, MobileCLIP ONNX weights, and the **gallery classifier** (`models/gallery-classifier/skyspotter-military-aircraft-vit/`). The installer bundles weights when you build after `git lfs pull`; otherwise it uses the GitHub release zip from `manifest.json` or `SkySpotter_APP_MODEL_URL`.
 4. Launch SkySpotter from the Desktop shortcut created during installation! (You can safely delete the original `SkySpotter.exe` installer afterwards).
 
 #### macOS
@@ -176,7 +176,7 @@ How to verify in logs:
 
 ### Aircraft classification speed & GPU paths
 
-Folder indexing runs **one image at a time**: **rembg** (subject isolation), then the **ViT** checkpoint in `app_model/`.
+Folder indexing runs **one image at a time**: **rembg** (subject isolation), then the **ViT** checkpoint in `models/gallery-classifier/skyspotter-military-aircraft-vit/` (legacy: `app_model/`).
 
 #### Windows — DirectML (default)
 
@@ -208,6 +208,8 @@ The first run may pause on **“Exporting aircraft model for DirectML (one-time)
 | `SkySpotter_CLASSIFIER_DEVICE=cuda` | PyTorch ViT on NVIDIA (requires CUDA `torch`) |
 | `SkySpotter_CLASSIFIER_DEVICE=cpu` | PyTorch ViT on CPU only |
 | `SkySpotter_INDEX_MAX_SIZE=1280` | Smaller decode size during folder indexing (faster) |
+| `SkySpotter_CLASSIFIER_MIN_CROP_FRACTION=0.20` | Per-axis minimum crop size as a fraction of the indexed source image (default **20%** — e.g. 2000×2000 → 400×400). Skip ViT only if **both** crop width and height are below their thresholds |
+| `SkySpotter_CLASSIFIER_MIN_CROP_FLOOR=300` | Optional absolute floor (px) applied to both axes after the fraction (legacy alias: `SkySpotter_CLASSIFIER_MIN_CROP_SIZE`) |
 | `SkySpotter_ORT_PROVIDERS` | Optional provider order, e.g. `DmlExecutionProvider,CPUExecutionProvider` |
 
 Set `PYTHONUTF8=1` if ONNX export fails on Windows with a console encoding error (cp950).
@@ -252,7 +254,7 @@ pixi run python build.py
 
 Project dependencies are managed via **`pixi.toml`** (`pixi install`). Build scripts in `scripts/launchers/` install pip packages into a local virtual environment when not using Pixi alone.
 
-**Packaging note:** `build.py` removes `src/logs/` before PyInstaller runs so development log files are not copied into the installer payload (`--add-data "src;src"`).
+**Packaging note:** `build.py` removes `src/logs/` before PyInstaller runs so development log files are not copied into the installer payload (`--add-data "src;src"`). The Windows installer copies **`pixi.toml` and `pixi.lock`** and runs `pixi install --locked` so end-user installs use the same pinned Python 3.12 wheels as development (avoiding stale PyPI packages that only support Python &lt;3.10).
 
 ## 🐛 Troubleshooting
 
@@ -323,7 +325,7 @@ If you are on macOS 12 or older, OR if you simply want to permanently bypass all
 
 ## 🧠 Customizing the Classifier
 
-Train a **custom ViT classifier** on your own labeled folders—birds, animals, vehicles, military aircraft, or any other subjects. SkySpotter ships a default model in `app_model/` for gallery inference; **your trained checkpoint does not replace it until you copy files there yourself.**
+Train a **custom ViT classifier** on your own labeled folders—birds, animals, vehicles, military aircraft, or any other subjects. SkySpotter ships a default model under `models/gallery-classifier/skyspotter-military-aircraft-vit/`; **your trained checkpoint does not replace it until you copy the four weight files there (or set `SkySpotter_GALLERY_CLASSIFIER_DIR`).**
 
 ### Workflow overview
 
@@ -332,7 +334,7 @@ Train a **custom ViT classifier** on your own labeled folders—birds, animals, 
 | 1. Label training photos | `training_data/classified_images/<class>/` | One subfolder per class |
 | 2. Train | `scripts/launchers/train_model.*` → `customized_model/` | Fine-tune ViT; rembg runs automatically |
 | 3. Test | `testing_data/test_images/` → `scripts/launchers/verify_model.*` | Confirm the checkpoint before gallery use |
-| 4. Promote | Copy into **`app_model/`** | **Active model** the app loads for labels and Magic Wand |
+| 4. Promote | Copy into **`models/gallery-classifier/<id>/`** (or `app_model/`) | **Active model** for labels and Magic Wand |
 | — | `training_data/processed_images/` | Cached training PNGs (generated at step 2; do not edit) |
 
 ### 1. Prepare labeled images
@@ -411,11 +413,11 @@ If labels are wrong, add more training images for those classes and re-run **ste
 
 **3d. Optional: test the gallery path**
 
-`scripts/poc_aircraft_detection.py` exercises the **in-app** classifier (`app_model` / DirectML). Use this only **after** you copy your checkpoint to step 4—not for the first check on `customized_model/`.
+`scripts/poc_aircraft_detection.py` exercises the **in-app** classifier (gallery model / DirectML). Use this only **after** you copy your checkpoint to step 4—not for the first check on `customized_model/`.
 
 ### 4. Promote to the gallery when ready
 
-When verification looks good, **copy** these four files from `customized_model/` into `app_model/`:
+When verification looks good, **copy** these four files from `customized_model/` into `models/gallery-classifier/skyspotter-military-aircraft-vit/` (or legacy `app_model/`):
 
 - `config.json`
 - `model.safetensors`
@@ -426,9 +428,16 @@ Restart SkySpotter (or reload the folder) so indexing picks up your model. Open 
 
 ### 5. Runtime behavior
 
-Gallery classification uses the checkpoint in **`app_model/`** only (see `app_model/README.md`). If that folder is missing or invalid, labels are not applied.
+Gallery classification loads the first valid checkpoint among `models/gallery-classifier/skyspotter-military-aircraft-vit/`, legacy `app_model/`, or paths from `SkySpotter_GALLERY_CLASSIFIER_DIR` / `SkySpotter_APP_MODEL_DIR`. See `models/gallery-classifier/README.md`.
 
-To use a different folder without renaming: set `SkySpotter_APP_MODEL_DIR` to its path before launching.
+**Clone from GitHub (developers):**
+
+```bash
+git clone https://github.com/markyip/SkySpotter.git
+cd SkySpotter
+git lfs install
+git lfs pull
+```
 
 ## 📁 Supported Image Formats
 

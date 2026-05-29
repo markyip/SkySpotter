@@ -1,0 +1,21 @@
+{
+  "id": "skyspotter-military-aircraft-vit",
+  "version": "1.0.0",
+  "display_name": "SkySpotter Military Aircraft ViT",
+  "description": "Default gallery classifier: military and civil aircraft labels, Magic Wand, and indexing.",
+  "files": [
+    "config.json",
+    "model.safetensors",
+    "preprocessor_config.json",
+    "labels.txt"
+  ],
+  "github": {
+    "repo": "markyip/SkySpotter",
+    "path": "models/gallery-classifier/skyspotter-military-aircraft-vit",
+    "tag": "gallery-classifier-v1.0.0"
+  },
+  "release": {
+    "url": "https://github.com/markyip/SkySpotter/releases/download/gallery-classifier-v1.0.0/skyspotter-military-aircraft-vit-v1.0.0.zip",
+    "sha256": ""
+  }
+}

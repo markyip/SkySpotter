@@ -520,6 +520,7 @@ def main():
         ])
         
         add_data_args.append('--add-data "pixi.toml;."')
+        add_data_args.append('--add-data "pixi.lock;."')
         add_data_args.append('--add-data "src;src"')
     
     if platform.system() == 'Darwin':
@@ -565,7 +566,28 @@ def main():
                 shutil.copy2(uninst_src, dist_dir / "uninstall.bat")
                 print(f"  Copied uninstall.bat to {dist_dir}")
             
-            # 2. Build Installer EXE
+            # 2. Bundle gallery classifier for the installer
+            classifier_src = (
+                REPO_ROOT / "models" / "gallery-classifier" / "skyspotter-military-aircraft-vit"
+            )
+            classifier_dst = dist_dir / "models" / "gallery-classifier" / "skyspotter-military-aircraft-vit"
+            checkpoint = classifier_src / "model.safetensors"
+            if checkpoint.is_file():
+                if classifier_dst.exists():
+                    shutil.rmtree(classifier_dst.parent.parent)
+                classifier_dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(classifier_src, classifier_dst)
+                manifest_src = REPO_ROOT / "models" / "gallery-classifier" / "manifest.json"
+                if manifest_src.is_file():
+                    shutil.copy2(manifest_src, classifier_dst.parent / "manifest.json")
+                print(f"  Copied gallery classifier to {classifier_dst}")
+            else:
+                print(
+                    "  [WARNING] gallery classifier weights missing — run: git lfs pull\n"
+                    "  Installer will try SkySpotter_APP_MODEL_URL or GitHub release zip."
+                )
+
+            # 3. Build Installer EXE
             build_installer()
 
         if platform.system() == 'Darwin':
@@ -590,23 +612,43 @@ def build_installer():
         print("[SKIP] Installer build only supported on Windows.")
         return
 
-    installer_script = REPO_ROOT / "installer.py"
-    if not installer_script.exists():
-        print(f"[ERROR] Installer script not found: {installer_script}")
+    bootstrap_script = REPO_ROOT / "src" / "bootstrap.py"
+    if not bootstrap_script.exists():
+        print(f"[ERROR] Installer entry not found: {bootstrap_script}")
         return
 
     icon_path = REPO_ROOT / "icons" / "appicon.ico"
-    
+
+    installer_add_data = [
+        f"src{os.pathsep}src",
+        f"scripts{os.pathsep}scripts",
+        f"icons{os.pathsep}icons",
+        f"pixi.toml{os.pathsep}.",
+        f"pixi.lock{os.pathsep}.",
+        f"uninstall.bat{os.pathsep}.",
+    ]
+    classifier_dir = REPO_ROOT / "models" / "gallery-classifier"
+    if (classifier_dir / "skyspotter-military-aircraft-vit" / "model.safetensors").is_file():
+        installer_add_data.append(f"models{os.pathsep}models")
+        print("[INFO] Bundling models/gallery-classifier/ into SkySpotter_Setup.exe")
+    else:
+        print(
+            "[WARNING] Gallery classifier not bundled — run git lfs pull or set "
+            "SkySpotter_APP_MODEL_URL before building the installer"
+        )
+
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--onefile",
         "--windowed",
         "--name", "SkySpotter_Setup",
-        "--icon", str(icon_path) if icon_path.exists() else "",
-        "--add-data", f"dist/SkySpotter;SkySpotter",
         "--clean",
-        "installer.py"
+        str(bootstrap_script),
     ]
+    if icon_path.exists():
+        cmd.extend(["--icon", str(icon_path)])
+    for spec in installer_add_data:
+        cmd.extend(["--add-data", spec])
     
     # Remove empty strings from cmd (like if icon_path didn't exist)
     cmd = [c for c in cmd if c]

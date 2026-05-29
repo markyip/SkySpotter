@@ -136,6 +136,17 @@ training_data/processed_images/*
 customized_model/*
 !customized_model/.gitkeep
 !customized_model/README.md
+
+# Local classifier PoC / batch test outputs (not for git)
+testing_data/poc_app_model_test_set/
+testing_data/test_output_app_model_test_set/
+
+# Training artifacts (keep weights under models/gallery-classifier/ only)
+app_model/*.safetensors
+app_model/*.json
+app_model/*.bin
+app_model/labels.txt
+!app_model/README.md
 poc_f35_output_legacy/
 poc_f35_output_legacy_pixi/
 poc_f35_output_legacy_pixi5/

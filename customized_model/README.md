@@ -14,6 +14,6 @@ After training, SkySpotter writes the checkpoint here by default:
    ```bash
    pixi run batch-test-classifier
    ```
-3. When results look good, **copy** (do not move until you are sure) these files into `app_model/` to use the model in the gallery.
+3. When results look good, **copy** (do not move until you are sure) these files into `models/gallery-classifier/skyspotter-military-aircraft-vit/` (or legacy `app_model/`) to use the model in the gallery.
 
-The bundled `app_model/` folder ships with the app’s default military-aircraft model. Your customized checkpoint does not replace it until you copy files there yourself.
+The default weights live in `models/gallery-classifier/skyspotter-military-aircraft-vit/` on GitHub (Git LFS). Your customized checkpoint does not replace them until you copy files there yourself.

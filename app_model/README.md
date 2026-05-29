@@ -1,10 +1,9 @@
-# App model (gallery classifier)
+# Legacy path: `app_model/`
 
-This folder holds the **ViT checkpoint SkySpotter uses in the app** for aircraft labels, gallery indexing, and Magic Wand.
+Gallery classifier weights now live in the repository at:
 
-- Ships with the default military-aircraft model.
-- After training your own classes, copy your checkpoint here from `customized_model/` (see README → Customizing the Classifier).
+**`models/gallery-classifier/skyspotter-military-aircraft-vit/`**
 
-Required files: `config.json`, `model.safetensors`, `preprocessor_config.json`, `labels.txt`.
+SkySpotter still checks this folder for backward compatibility. After training, copy your four checkpoint files here **or** into the `models/gallery-classifier/<your-id>/` layout and set `SkySpotter_GALLERY_CLASSIFIER_DIR`.
 
-Override location: `SkySpotter_APP_MODEL_DIR` (legacy: `SkySpotter_AIRCRAFT_CHECKPOINT_DIR`).
+See [models/gallery-classifier/README.md](../models/gallery-classifier/README.md) for Git LFS pull instructions.

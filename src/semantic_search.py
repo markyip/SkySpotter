@@ -108,21 +108,9 @@ def _skyspotter_cache_root() -> str:
 
 def _checkpoint_dir_candidates(project_root: str) -> list[str]:
     """Project folders checked for the gallery ViT checkpoint (first with model.safetensors wins)."""
-    override = (
-        os.environ.get("SkySpotter_APP_MODEL_DIR", "").strip()
-        or os.environ.get("SkySpotter_AIRCRAFT_CHECKPOINT_DIR", "").strip()
-    )
-    candidates: list[str] = []
-    if override:
-        candidates.append(override)
-    candidates.extend(
-        [
-            os.path.join(project_root, "app_model"),
-            os.path.join(project_root, "aviation_model_processed"),  # legacy name
-            os.path.join(project_root, "aviation_model_v3"),
-        ]
-    )
-    return candidates
+    from gallery_model_paths import checkpoint_dir_candidates
+
+    return checkpoint_dir_candidates(project_root)
 
 
 def _load_index_source_image(file_path: str, max_size: int = 1024) -> Image.Image:
@@ -802,6 +790,43 @@ class MobileCLIPONNXBackend:
         return arr
 
 
+def _classifier_min_crop_fraction() -> float:
+    """Fraction of source width/height used as per-axis minimum crop size (default 20%)."""
+    try:
+        raw = os.environ.get("SkySpotter_CLASSIFIER_MIN_CROP_FRACTION", "0.20")
+        value = float(raw)
+        return min(1.0, max(0.01, value))
+    except (TypeError, ValueError):
+        return 0.20
+
+
+def _classifier_min_crop_thresholds(
+    source_width: int, source_height: int
+) -> tuple[int, int]:
+    """
+    Per-axis minimum crop sizes derived from the indexed source image dimensions.
+
+    Example: 2000×2000 at 20% → skip only if crop is below 400×400 (both axes).
+    Classify when either crop side meets its axis threshold.
+    """
+    w = max(1, int(source_width or 1))
+    h = max(1, int(source_height or 1))
+    pct = _classifier_min_crop_fraction()
+    min_w = max(1, int(round(w * pct)))
+    min_h = max(1, int(round(h * pct)))
+    floor_raw = os.environ.get("SkySpotter_CLASSIFIER_MIN_CROP_FLOOR", "").strip()
+    if not floor_raw:
+        floor_raw = os.environ.get("SkySpotter_CLASSIFIER_MIN_CROP_SIZE", "").strip()
+    if floor_raw:
+        try:
+            floor_px = max(1, int(floor_raw))
+            min_w = max(min_w, floor_px)
+            min_h = max(min_h, floor_px)
+        except (TypeError, ValueError):
+            pass
+    return min_w, min_h
+
+
 class MilitaryAircraftClassifier:
     """Specialist ViT classifier for precise military aircraft identification."""
     HUB_REPO_ID = "dima806/military_aircraft_image_detection"
@@ -1039,6 +1064,30 @@ class MilitaryAircraftClassifier:
             except Exception:
                 return image.convert("RGBA")
 
+    def _crop_below_classify_minimum(
+        self,
+        cropped_rgb: Image.Image,
+        source_size: tuple[int, int],
+        file_path: str,
+    ) -> bool:
+        src_w, src_h = source_size
+        min_w, min_h = _classifier_min_crop_thresholds(src_w, src_h)
+        w, h = cropped_rgb.size
+        if w >= min_w or h >= min_h:
+            return False
+        logger.info(
+            "[AVIATION AI] Skip classify (crop %dx%d < %dx%d min from source %dx%d, %.0f%%): %s",
+            w,
+            h,
+            min_w,
+            min_h,
+            src_w,
+            src_h,
+            _classifier_min_crop_fraction() * 100.0,
+            os.path.basename(file_path),
+        )
+        return True
+
     def _legacy_focus_blob_crop(self, file_path: str, image_rgba: Image.Image) -> tuple[Image.Image, str]:
         """Match legacy PoC blob-selection logic (focus-overlap first, else largest blob)."""
         try:
@@ -1225,6 +1274,8 @@ class MilitaryAircraftClassifier:
         ).convert("RGB")
         rgba = self._legacy_bg_remove(src)
         cropped_rgb, mode = self._legacy_focus_blob_crop(file_path, rgba)
+        if self._crop_below_classify_minimum(cropped_rgb, src.size, file_path):
+            return ""
         label, conf, _ = self._predict_im(cropped_rgb)
         logger.info(
             "[AVIATION AI] ONNX pipeline mode=%s label=%s conf=%.3f file=%s",
@@ -1445,6 +1496,8 @@ class MilitaryAircraftClassifier:
                 ).convert("RGB")
                 rgba = self._legacy_bg_remove(src)
                 cropped_rgb, mode = self._legacy_focus_blob_crop(file_path, rgba)
+                if self._crop_below_classify_minimum(cropped_rgb, src.size, file_path):
+                    return ""
                 label, conf = self._predict_with_torch(cropped_rgb)
                 logger.info(
                     "[AVIATION AI] PyTorch pipeline mode=%s label=%s conf=%.3f file=%s",
@@ -3276,6 +3329,37 @@ class SemanticImageIndex:
                 original = canonical_to_original.get(fp, fp)
                 out[original] = str(row[1] or "").strip()
         return out
+
+    def repath_indexed_files(self, old_to_new: Dict[str, str]) -> int:
+        """Update semantic_index rows after Magic Wand moves files on disk."""
+        if not old_to_new:
+            return 0
+        updated = 0
+        for old_p, new_p in old_to_new.items():
+            if not old_p or not new_p:
+                continue
+            old_c = self._canonical_path(old_p)
+            new_c = self._canonical_path(new_p)
+            if old_c == new_c:
+                continue
+            cur = self._conn.execute(
+                """
+                UPDATE semantic_index
+                SET file_path = ?, file_name = ?, updated_at = ?
+                WHERE file_path = ? AND model_name = ?
+                """,
+                (
+                    new_c,
+                    os.path.basename(new_c),
+                    float(time.time()),
+                    old_c,
+                    self.model_name,
+                ),
+            )
+            updated += int(cur.rowcount or 0)
+        if updated:
+            self._conn.commit()
+        return updated
 
     def _fetch_rows_for_paths(self, paths: Sequence[str]) -> List[sqlite3.Row]:
         """Bulk fetch rows for a list of paths using optimized batch queries."""

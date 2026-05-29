@@ -233,7 +233,7 @@ def train():
     print(f"\nSUCCESS! Model saved to {OUTPUT_DIR}")
     print("Next steps:")
     print("  1. pixi run batch-test-classifier   # test on testing_data/test_images/")
-    print("  2. When satisfied, copy checkpoint files to app_model/ for gallery use.")
+    print("  2. When satisfied, copy checkpoint files to models/gallery-classifier/<your-id>/ for gallery use.")
     print("You can run 'python scripts/plot_training_history.py --model-dir customized_model' for training curves.")
 
 if __name__ == "__main__":

@@ -14,6 +14,12 @@ else:
     BUNDLE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     EXE_DIR = BUNDLE_DIR
 
+APP_NAME = "SkySpotter"
+APP_EXE_NAME = "SkySpotter.exe"
+DEFAULT_INSTALL_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA", "C:"), APP_NAME
+)
+
 # Check if we should just run the app
 if "--run" in sys.argv:
     # We are in the install directory. Find the pixi environment.
@@ -58,6 +64,13 @@ class InstallWorker(QObject):
             # Copy application files
             self.log_signal.emit("Copying core files...")
             shutil.copy2(os.path.join(BUNDLE_DIR, "pixi.toml"), target_dir)
+            lock_src = os.path.join(BUNDLE_DIR, "pixi.lock")
+            if os.path.exists(lock_src):
+                shutil.copy2(lock_src, target_dir)
+            else:
+                self.log_signal.emit(
+                    "WARNING: pixi.lock missing from installer — dependency versions are not pinned."
+                )
             
             src_dir = os.path.join(target_dir, "src")
             if os.path.exists(src_dir): shutil.rmtree(src_dir)
@@ -77,7 +90,7 @@ class InstallWorker(QObject):
                 shutil.copy2(uninst_src, target_dir)
 
             # Copy the executable itself
-            target_exe = os.path.join(target_dir, "RAWviewer.exe")
+            target_exe = os.path.join(target_dir, APP_EXE_NAME)
             if getattr(sys, 'frozen', False):
                 shutil.copy2(sys.executable, target_exe)
 
@@ -102,8 +115,11 @@ class InstallWorker(QObject):
 
             # Install environment using Pixi
             self.log_signal.emit("Downloading AI Models & Python Dependencies. This may take a few minutes...")
+            install_cmd = [pixi_exe, "install", "-v"]
+            if os.path.isfile(os.path.join(target_dir, "pixi.lock")):
+                install_cmd.append("--locked")
             process = subprocess.Popen(
-                [pixi_exe, "install", "-v"], cwd=target_dir,
+                install_cmd, cwd=target_dir,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding='utf-8', errors='replace',
                 creationflags=subprocess.CREATE_NO_WINDOW
@@ -148,6 +164,43 @@ class InstallWorker(QObject):
                 self.finished.emit(False)
                 return
 
+            self.progress_signal.emit(82)
+
+            self.log_signal.emit("Installing gallery classifier (models/gallery-classifier)...")
+            process_aircraft = subprocess.Popen(
+                [
+                    pixi_exe,
+                    "run",
+                    "python",
+                    "scripts/download_app_model.py",
+                    "--install-dir",
+                    target_dir,
+                    "--bundle-dir",
+                    BUNDLE_DIR,
+                ],
+                cwd=target_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            for line in process_aircraft.stdout:
+                if self.cancelled:
+                    process_aircraft.terminate()
+                    self.log_signal.emit("Installation cancelled.")
+                    return
+                msg = line.strip()
+                if msg:
+                    self.log_signal.emit(msg)
+            process_aircraft.wait()
+
+            if process_aircraft.returncode != 0:
+                self.log_signal.emit("Failed to install gallery classifier model.")
+                self.finished.emit(False)
+                return
+
             self.progress_signal.emit(90)
 
             # Create fast launcher
@@ -168,14 +221,14 @@ oWS.Run "{pixi_exe} run start-windowless", 0, False
                 
                 vbs_script = f"""
 Set oWS = WScript.CreateObject("WScript.Shell")
-sLinkFile = "{os.path.join(desktop, 'RAWviewer.lnk')}"
+sLinkFile = "{os.path.join(desktop, 'SkySpotter.lnk')}"
 Set oLink = oWS.CreateShortcut(sLinkFile)
 oLink.TargetPath = "{launcher_vbs_path}"
 oLink.WorkingDirectory = "{target_dir}"
 oLink.IconLocation = "{target_exe}"
 oLink.Save
 
-sLinkFile2 = "{os.path.join(programs, 'RAWviewer.lnk')}"
+sLinkFile2 = "{os.path.join(programs, 'SkySpotter.lnk')}"
 Set oLink2 = oWS.CreateShortcut(sLinkFile2)
 oLink2.TargetPath = "{launcher_vbs_path}"
 oLink2.WorkingDirectory = "{target_dir}"
@@ -198,13 +251,13 @@ oLink2.Save
             try:
                 import ctypes
                 import time
-                key_path = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\RAWviewer"
+                key_path = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{APP_NAME}"
                 icon_path = target_exe
                 install_date = time.strftime("%Y%m%d")
                 uninst_path = os.path.join(target_dir, "uninstall.bat")
                 silent_cmd = f'powershell.exe -WindowStyle Hidden -Command "& \'{uninst_path}\' __CLEANUP__ \'{target_dir}\'"'
                 with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
-                    winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, "RAWviewer")
+                    winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, APP_NAME)
                     winreg.SetValueEx(key, "DisplayIcon", 0, winreg.REG_SZ, icon_path)
                     winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, "2.0.1")
                     winreg.SetValueEx(key, "UninstallString", 0, winreg.REG_SZ, silent_cmd)
@@ -231,7 +284,7 @@ oLink2.Save
 class InstallerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("RAWviewer Setup")
+        self.setWindowTitle(f"{APP_NAME} Setup")
         self.setFixedSize(650, 500)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -252,7 +305,7 @@ class InstallerGUI(QMainWindow):
         title_layout = QHBoxLayout(title_bar)
         title_layout.setContentsMargins(20, 0, 10, 0)
         
-        win_title = QLabel("RAWVIEWER SETUP")
+        win_title = QLabel(f"{APP_NAME.upper()} SETUP")
         win_title.setStyleSheet("font-size: 11px; font-weight: 800; letter-spacing: 1px; color: #888;")
         title_layout.addWidget(win_title)
         title_layout.addStretch()
@@ -380,7 +433,10 @@ class InstallerGUI(QMainWindow):
         title.setObjectName("title")
         layout.addWidget(title)
         
-        desc = QLabel("RAWviewer is a professional photo culling tool powered by AI.\nThis setup will download the required AI models and optimized environments.")
+        desc = QLabel(
+            f"{APP_NAME} is a professional aviation photo viewer powered by AI.\n"
+            "This setup will download the required AI models and optimized environments."
+        )
         desc.setObjectName("desc")
         layout.addWidget(desc)
         
@@ -390,8 +446,7 @@ class InstallerGUI(QMainWindow):
         
         row = QHBoxLayout()
         self.path_edit = QLineEdit()
-        default_path = os.path.join(os.environ.get('LOCALAPPDATA', 'C:'), "RAWviewer")
-        self.path_edit.setText(default_path)
+        self.path_edit.setText(DEFAULT_INSTALL_DIR)
         
         btn_browse = QPushButton("Browse...")
         btn_browse.setFixedSize(80, 36)
@@ -432,7 +487,7 @@ class InstallerGUI(QMainWindow):
         title.setStyleSheet("font-size: 40px; color: #4ade80;")
         layout.addWidget(title, alignment=Qt.AlignmentFlag.AlignCenter)
         
-        desc = QLabel("RAWviewer is now installed and ready to launch.")
+        desc = QLabel(f"{APP_NAME} is now installed and ready to launch.")
         desc.setObjectName("desc")
         layout.addWidget(desc, alignment=Qt.AlignmentFlag.AlignCenter)
 
