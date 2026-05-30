@@ -293,6 +293,32 @@ class JustifiedGallery(QWidget):
         except Exception:
             logger.exception("[GALLERY] set_images() failed")
 
+    def get_scroll_anchor_path(self) -> Optional[str]:
+        """Return the file path at the top of the current viewport (for scroll restore)."""
+        items = self._gallery_layout_items
+        if not items:
+            return None
+        p = self._scroll_area
+        if p is None:
+            p = self.parent()
+            while p and not isinstance(p, QScrollArea):
+                p = p.parent()
+        if not isinstance(p, QScrollArea):
+            return None
+        anchor_y = p.verticalScrollBar().value() + 12
+        low, high = 0, len(items) - 1
+        idx = 0
+        while low <= high:
+            mid = (low + high) // 2
+            if items[mid]["rect"].bottom() < anchor_y:
+                low = mid + 1
+            else:
+                idx = mid
+                high = mid - 1
+        if idx < 0 or idx >= len(items):
+            return None
+        return items[idx].get("file_path")
+
     def scroll_to_file(self, file_path: Optional[str]):
         """Scroll so file_path is near the top after the gallery layout is available."""
         if not file_path:

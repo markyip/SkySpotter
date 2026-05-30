@@ -6679,7 +6679,7 @@ class RAWImageViewer(QMainWindow):
 
         self.gallery_search_input = QLineEdit()
         self.gallery_search_input.setPlaceholderText(
-            "Filter gallery (camera:, iso, aircraft:F-35, …)"
+            "Filter gallery (camera:, aircraft:F-35, sharp, blurry, …)"
         )
         self.gallery_search_input.setClearButtonEnabled(True)
         self.gallery_search_input.setMinimumWidth(140)
@@ -7414,8 +7414,22 @@ class RAWImageViewer(QMainWindow):
                 "[GALLERY] Gallery aircraft tooltip refresh failed: %s", e
             )
 
+    _MAGIC_WAND_SKIP_LABELS = frozenset(
+        {"unknown", "unidentified", "n/a", "none", ""}
+    )
+    _MAGIC_WAND_UNCLASSIFIED_FOLDER = "Unclassified"
+
+    @classmethod
+    def _magic_wand_folder_for_label(cls, label: str) -> str:
+        """Map detected aircraft label to a destination subfolder (Unclassified when missing)."""
+        text = (label or "").strip()
+        if not text or text.lower() in cls._MAGIC_WAND_SKIP_LABELS:
+            return cls._MAGIC_WAND_UNCLASSIFIED_FOLDER
+        safe = cls._sanitize_aircraft_folder_name(text)
+        return safe or cls._MAGIC_WAND_UNCLASSIFIED_FOLDER
+
     def _folder_has_sortable_aircraft_labels(self) -> bool:
-        """True when at least one image has a non-empty aircraft label from indexing."""
+        """True when indexing has run and Magic Wand can sort labeled or unlabeled files."""
         if getattr(self, "view_mode", "single") != "gallery":
             return False
         folder = getattr(self, "current_folder", None)
@@ -7433,10 +7447,16 @@ class RAWImageViewer(QMainWindow):
             labels = index.get_detected_aircraft_for_paths(corpus)
         except Exception:
             return False
-        skip = {"unknown", "unidentified", "n/a", "none", ""}
+        if not labels:
+            return False
+        skip = self._MAGIC_WAND_SKIP_LABELS
         for path in corpus:
             label = (labels.get(path) or "").strip().lower()
             if label and label not in skip:
+                return True
+        # Indexed but no aircraft label (too small, low confidence, etc.) → Unclassified sort.
+        for path in corpus:
+            if path in labels:
                 return True
         return False
 
@@ -7492,18 +7512,18 @@ class RAWImageViewer(QMainWindow):
         except Exception as e:
             self.show_error("Auto-sort", f"Could not read aircraft labels:\n{e}")
             return
-        skip_labels = {"unknown", "unidentified", "n/a", "none", ""}
+        skip_labels = self._MAGIC_WAND_SKIP_LABELS
         labeled = [
             p
             for p in corpus
             if (labels.get(p) or "").strip().lower() not in skip_labels
         ]
-        if not labeled:
+        unlabeled = [p for p in corpus if p not in labeled]
+        if not labels:
             self.show_error(
                 "Auto-sort",
-                "No AI aircraft labels found yet.\n\n"
-                "Wait until gallery indexing finishes (aircraft classification runs "
-                "during indexing), then try again.",
+                "No indexed images yet.\n\n"
+                "Wait until gallery indexing finishes, then try again.",
             )
             return
         dialog = CustomConfirmDialog(
@@ -7512,10 +7532,12 @@ class RAWImageViewer(QMainWindow):
             message="Move images into subfolders based on detected aircraft type?",
             informative_text=(
                 f"Folder: {os.path.basename(folder)}\n"
-                f"Images with labels: {len(labeled)} of {len(corpus)}\n\n"
+                f"With aircraft label: {len(labeled)} of {len(corpus)}\n"
+                f"To Unclassified: {len(unlabeled)}\n\n"
                 f"Files will be moved to:\n"
-                f"  {folder}/<aircraft label>/filename\n\n"
-                "Images without a label stay where they are. "
+                f"  {folder}/<aircraft label>/filename\n"
+                f"  {folder}/{self._MAGIC_WAND_UNCLASSIFIED_FOLDER}/filename  "
+                f"(no label, too small, or low confidence)\n\n"
                 "The gallery will show images in the folder and one level of "
                 "subfolders after sorting (not deeper nested paths)."
             ),
@@ -7526,10 +7548,96 @@ class RAWImageViewer(QMainWindow):
             return
         self._start_aircraft_auto_sort(folder, corpus, labels)
 
+    def _capture_gallery_scroll_restore(self) -> dict | None:
+        """Remember gallery scroll anchor and active search before a same-folder reload."""
+        if getattr(self, "view_mode", None) != "gallery":
+            return None
+        state: dict = {}
+        gj = getattr(self, "gallery_justified", None)
+        anchor = None
+        if gj is not None and hasattr(gj, "get_scroll_anchor_path"):
+            try:
+                anchor = gj.get_scroll_anchor_path()
+            except Exception:
+                anchor = None
+        if not anchor:
+            anchor = getattr(self, "current_file_path", None)
+        if anchor:
+            state["anchor_path"] = anchor
+        query = ""
+        inp = getattr(self, "gallery_search_input", None)
+        if inp is not None:
+            query = (inp.text() or "").strip()
+        if not query:
+            query = (getattr(self, "_last_semantic_query", "") or "").strip()
+        if query:
+            state["search_query"] = query
+        return state or None
+
+    def _apply_gallery_restore_after_folder_load(self) -> None:
+        """Re-apply saved gallery search filter and scroll position after Magic Wand reload."""
+        restore = getattr(self, "_gallery_restore_after_folder_load", None)
+        if not restore:
+            return
+        try:
+            query = (restore.get("search_query") or "").strip()
+            if query:
+                self._last_semantic_query = ""
+                inp = getattr(self, "gallery_search_input", None)
+                if inp is not None:
+                    inp.blockSignals(True)
+                    inp.setText(query)
+                    inp.blockSignals(False)
+                self._run_semantic_search_query(query)
+            anchor = self._resolve_gallery_restore_anchor()
+            if anchor and anchor in (getattr(self, "image_files", None) or []):
+                self.current_file_index = self.image_files.index(anchor)
+                self.current_file_path = anchor
+                gj = getattr(self, "gallery_justified", None)
+                if gj is not None and hasattr(gj, "scroll_to_file"):
+                    gj.scroll_to_file(anchor)
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "[MAGIC WAND] Failed to restore gallery search/scroll after reload"
+            )
+        finally:
+            self._gallery_restore_after_folder_load = None
+
+    def _remap_gallery_scroll_restore(self, path_remap: dict) -> None:
+        """Update saved gallery anchor paths after files were moved on disk."""
+        restore = getattr(self, "_gallery_restore_after_folder_load", None)
+        if not restore or not path_remap:
+            return
+        anchor = restore.get("anchor_path")
+        if anchor:
+            restore["anchor_path"] = path_remap.get(anchor, anchor)
+
+    def _resolve_gallery_restore_anchor(self) -> str | None:
+        """Return a path in image_files matching the saved gallery scroll anchor, if any."""
+        restore = getattr(self, "_gallery_restore_after_folder_load", None)
+        if not restore:
+            return None
+        anchor = restore.get("anchor_path")
+        if not anchor or not getattr(self, "image_files", None):
+            return None
+        if anchor in self.image_files:
+            return anchor
+        anchor_norm = _norm_path(anchor)
+        anchor_base = os.path.normcase(os.path.basename(anchor))
+        for fp in self.image_files:
+            if _norm_path(fp) == anchor_norm:
+                return fp
+            if os.path.normcase(os.path.basename(fp)) == anchor_base:
+                return fp
+        return None
+
     def _start_aircraft_auto_sort(self, folder, file_paths, labels_map) -> None:
         token = time.time_ns()
         self._aircraft_auto_sort_active_token = token
         self._aircraft_auto_sort_in_progress = True
+        self._gallery_restore_after_folder_load = self._capture_gallery_scroll_restore()
         self._update_magic_wand_visibility()
         signals = AircraftAutoSortSignals()
         self._aircraft_auto_sort_signals = signals
@@ -7551,6 +7659,7 @@ class RAWImageViewer(QMainWindow):
 
                 try:
                     moved = 0
+                    moved_unclassified = 0
                     skipped = 0
                     already_placed = 0
                     errors = []
@@ -7562,15 +7671,7 @@ class RAWImageViewer(QMainWindow):
                             f"Sorting {i + 1}/{total}: {base}"
                         )
                         label = (self_inner.labels.get(path) or "").strip()
-                        if not label or label.lower() in {
-                            "unknown",
-                            "unidentified",
-                            "n/a",
-                            "none",
-                        }:
-                            skipped += 1
-                            continue
-                        safe = RAWImageViewer._sanitize_aircraft_folder_name(label)
+                        safe = RAWImageViewer._magic_wand_folder_for_label(label)
                         dest_path, plan_reason = (
                             RAWImageViewer._plan_aircraft_auto_sort_move(
                                 self_inner.root_folder, path, safe
@@ -7608,6 +7709,8 @@ class RAWImageViewer(QMainWindow):
                                     pass
                             path_remap[path] = dest_path
                             moved += 1
+                            if safe == RAWImageViewer._MAGIC_WAND_UNCLASSIFIED_FOLDER:
+                                moved_unclassified += 1
                         except (OSError, shutil.Error) as exc:
                             errors.append(f"{base}: {exc}")
 
@@ -7616,6 +7719,7 @@ class RAWImageViewer(QMainWindow):
                             "token": self_inner.token,
                             "folder": self_inner.root_folder,
                             "moved": moved,
+                            "moved_unclassified": moved_unclassified,
                             "skipped": skipped,
                             "already_placed": already_placed,
                             "errors": errors,
@@ -7639,6 +7743,7 @@ class RAWImageViewer(QMainWindow):
         try:
             folder = result.get("folder")
             moved = int(result.get("moved", 0))
+            moved_unclassified = int(result.get("moved_unclassified", 0))
             skipped = int(result.get("skipped", 0))
             already_placed = int(result.get("already_placed", 0))
             errors = result.get("errors") or []
@@ -7649,6 +7754,8 @@ class RAWImageViewer(QMainWindow):
                 )
             else:
                 msg = f"Auto-sort complete: moved {moved}, skipped {skipped}"
+                if moved_unclassified:
+                    msg += f" ({moved_unclassified} to Unclassified)"
                 if already_placed:
                     msg += f", {already_placed} already in aircraft folder(s)"
                 if errors:
@@ -7677,6 +7784,7 @@ class RAWImageViewer(QMainWindow):
                     for old_p, new_p in path_remap.items():
                         if old_p in cache:
                             cache[new_p] = cache.pop(old_p)
+                self._remap_gallery_scroll_restore(path_remap)
             if folder and os.path.isdir(folder):
                 view = getattr(self, "view_mode", "gallery")
                 start_view = view if view in ("gallery", "single") else "gallery"
@@ -7700,6 +7808,7 @@ class RAWImageViewer(QMainWindow):
             self._aircraft_auto_sort_in_progress = False
             self._aircraft_auto_sort_active_token = None
             self._aircraft_auto_sort_signals = None
+            self._gallery_restore_after_folder_load = None
             self._update_magic_wand_visibility()
 
     def _on_semantic_index_error(self, token, error):
@@ -8683,9 +8792,23 @@ class RAWImageViewer(QMainWindow):
                 self.gallery_justified.set_images(
                     self.image_files, bulk_metadata if bulk_metadata else None
                 )
-                current_file = getattr(self, "current_file_path", None)
-                if current_file and hasattr(self.gallery_justified, "scroll_to_file"):
-                    self.gallery_justified.scroll_to_file(current_file)
+                restore_pending = getattr(self, "_gallery_restore_after_folder_load", None)
+                defer_restore = bool(
+                    restore_pending
+                    and (restore_pending.get("search_query") or "").strip()
+                )
+                if not defer_restore:
+                    current_file = getattr(self, "current_file_path", None)
+                    restore_anchor = self._resolve_gallery_restore_anchor()
+                    if restore_anchor:
+                        current_file = restore_anchor
+                        if restore_anchor in self.image_files:
+                            self.current_file_index = self.image_files.index(restore_anchor)
+                            self.current_file_path = restore_anchor
+                    if current_file and hasattr(self.gallery_justified, "scroll_to_file"):
+                        self.gallery_justified.scroll_to_file(current_file)
+                    if restore_anchor:
+                        self._gallery_restore_after_folder_load = None
                 # Avoid forced rebuild loops; set_images() already schedules build/layout.
                 # Only nudge visible-load passes after initial layout is expected ready.
                 self._warm_gallery_from_filmstrip_cache()
@@ -15423,7 +15546,11 @@ class RAWImageViewer(QMainWindow):
                         )
                     idx = self.image_files.index(start_file_path) if start_file_path in self.image_files else 0
                 else:
-                    idx = 0
+                    restore_anchor = self._resolve_gallery_restore_anchor()
+                    if restore_anchor:
+                        idx = self.image_files.index(restore_anchor)
+                    else:
+                        idx = 0
                 self.current_file_index = idx
                 self.current_file_path = self.image_files[idx]
             except Exception:
@@ -15442,6 +15569,8 @@ class RAWImageViewer(QMainWindow):
                 # race when switching folders quickly.
                 QTimer.singleShot(0, self._update_gallery_view)
                 QTimer.singleShot(120, self._update_gallery_view)
+                if getattr(self, "_gallery_restore_after_folder_load", None):
+                    QTimer.singleShot(150, self._apply_gallery_restore_after_folder_load)
             elif keep_visible_image:
                 QTimer.singleShot(0, self._sync_filmstrip_to_folder)
                 self.update_status_bar()
@@ -15479,8 +15608,10 @@ class RAWImageViewer(QMainWindow):
         """Load images from a folder without blocking the UI during scan/sort."""
         import logging
         logger = logging.getLogger(__name__)
-        # Folder scope changed: clear search bar, indexing UI, and filter snapshot.
-        self._reset_semantic_search_for_new_folder()
+        # Folder scope changed: clear search bar unless Magic Wand will restore it.
+        restore_state = getattr(self, "_gallery_restore_after_folder_load", None)
+        if not (restore_state and (restore_state.get("search_query") or "").strip()):
+            self._reset_semantic_search_for_new_folder()
 
         try:
             if not folder_path:

@@ -1264,29 +1264,92 @@ class MilitaryAircraftClassifier:
             self._session = None
             return False
 
+    def prepare_subject_pipeline(
+        self, file_path: str, max_source_size: int, progress_callback=None
+    ) -> tuple[Optional[Image.Image], Optional[Image.Image], Optional[Image.Image]]:
+        """
+        Load source RGB, rembg RGBA, and classifier crop in one pass (avoids duplicate rembg).
+
+        Returns (src_rgb, rgba, cropped_rgb). ``cropped_rgb`` is None if crop is too small.
+        """
+        try:
+            src = _load_index_source_image(
+                file_path, max_size=max(256, int(max_source_size))
+            ).convert("RGB")
+            rgba = self._legacy_bg_remove(src)
+            cropped_rgb, _mode = self._legacy_focus_blob_crop(file_path, rgba)
+            if self._crop_below_classify_minimum(cropped_rgb, src.size, file_path):
+                return src, rgba, None
+            return src, rgba, cropped_rgb
+        except Exception as e:
+            logger.debug(
+                "[AVIATION AI] Subject pipeline failed for %s: %s",
+                os.path.basename(file_path),
+                e,
+            )
+            return None, None, None
+
+    def prepare_subject_crop(
+        self, file_path: str, max_source_size: int, progress_callback=None
+    ) -> Optional[Image.Image]:
+        """
+        Background-removed, focus/largest-blob crop for ViT classification only.
+        Returns None when rembg fails (strict mode), mask is empty, or crop is too small.
+        """
+        _src, _rgba, cropped = self.prepare_subject_pipeline(
+            file_path, max_source_size, progress_callback
+        )
+        return cropped
+
+    def classify_from_subject_crop(
+        self,
+        cropped_rgb: Image.Image,
+        file_path: str,
+        progress_callback=None,
+    ) -> str:
+        """Run ViT classifier on an already prepared subject crop."""
+        if cropped_rgb is None:
+            return ""
+        self._ensure_model(progress_callback)
+        if prefer_directml_classifier():
+            if self._ensure_onnx_classifier_session(progress_callback):
+                label, conf, _ = self._predict_im(cropped_rgb)
+                logger.info(
+                    "[AVIATION AI] ONNX crop classify label=%s conf=%.3f file=%s",
+                    label,
+                    conf,
+                    os.path.basename(file_path),
+                )
+                if label and conf >= 0.40:
+                    return label
+                return ""
+            if self._session is not None:
+                return ""
+        if self._ensure_torch_checkpoint_model():
+            label, conf = self._predict_with_torch(cropped_rgb)
+            logger.info(
+                "[AVIATION AI] PyTorch crop classify label=%s conf=%.3f file=%s",
+                label,
+                conf,
+                os.path.basename(file_path),
+            )
+            if label and conf >= 0.40:
+                return label
+        return ""
+
     def _classify_onnx_pipeline(
         self, file_path: str, max_source_size: int, progress_callback=None
     ) -> str:
         if not self._ensure_onnx_classifier_session(progress_callback):
             return ""
-        src = _load_index_source_image(
-            file_path, max_size=max(256, int(max_source_size))
-        ).convert("RGB")
-        rgba = self._legacy_bg_remove(src)
-        cropped_rgb, mode = self._legacy_focus_blob_crop(file_path, rgba)
-        if self._crop_below_classify_minimum(cropped_rgb, src.size, file_path):
-            return ""
-        label, conf, _ = self._predict_im(cropped_rgb)
-        logger.info(
-            "[AVIATION AI] ONNX pipeline mode=%s label=%s conf=%.3f file=%s",
-            mode,
-            label,
-            conf,
-            os.path.basename(file_path),
+        cropped_rgb = self.prepare_subject_crop(
+            file_path, int(max_source_size), progress_callback
         )
-        if label and conf >= 0.40:
-            return label
-        return ""
+        if cropped_rgb is None:
+            return ""
+        return self.classify_from_subject_crop(
+            cropped_rgb, file_path, progress_callback
+        )
 
     def _ensure_model(self, progress_callback=None):
         # Checkpoint-only mode: do not download/export/use ONNX fallback models.
@@ -1478,9 +1541,10 @@ class MilitaryAircraftClassifier:
                     )
                 except (TypeError, ValueError):
                     max_source_size = 2048
+            max_sz = int(max_source_size)
             if prefer_directml_classifier():
                 label = self._classify_onnx_pipeline(
-                    file_path, int(max_source_size), progress_callback
+                    file_path, max_sz, progress_callback
                 )
                 if label:
                     return label
@@ -1490,30 +1554,14 @@ class MilitaryAircraftClassifier:
                     "[AVIATION AI] DirectML ONNX unavailable; falling back to PyTorch."
                 )
 
-            if self._ensure_torch_checkpoint_model():
-                src = _load_index_source_image(
-                    file_path, max_size=max(256, int(max_source_size))
-                ).convert("RGB")
-                rgba = self._legacy_bg_remove(src)
-                cropped_rgb, mode = self._legacy_focus_blob_crop(file_path, rgba)
-                if self._crop_below_classify_minimum(cropped_rgb, src.size, file_path):
-                    return ""
-                label, conf = self._predict_with_torch(cropped_rgb)
-                logger.info(
-                    "[AVIATION AI] PyTorch pipeline mode=%s label=%s conf=%.3f file=%s",
-                    mode,
-                    label,
-                    conf,
-                    os.path.basename(file_path),
-                )
-                if label and conf >= 0.40:
-                    return label
-                return ""
-
-            logger.warning(
-                "[MODEL] Classifier skipped: no DirectML ONNX session and PyTorch checkpoint unavailable."
+            cropped_rgb = self.prepare_subject_crop(
+                file_path, max_sz, progress_callback
             )
-            return ""
+            if cropped_rgb is None:
+                return ""
+            return self.classify_from_subject_crop(
+                cropped_rgb, file_path, progress_callback
+            )
 
             import onnxruntime as ort
             if self._session is None:
@@ -2154,6 +2202,8 @@ class SemanticImageIndex:
             self._conn.execute("ALTER TABLE semantic_index ADD COLUMN face_count INTEGER")
         if "detected_aircraft" not in cols:
             self._conn.execute("ALTER TABLE semantic_index ADD COLUMN detected_aircraft TEXT")
+        if "blur_score" not in cols:
+            self._conn.execute("ALTER TABLE semantic_index ADD COLUMN blur_score REAL")
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_semantic_signature_model ON semantic_index(file_signature, model_name)"
         )
@@ -3050,6 +3100,7 @@ class SemanticImageIndex:
                     )
                     progress_callback(i, total_sem, msg)
             try:
+                blur_score_val = None
                 detected_aircraft = ""
                 if self.model_name.startswith("aviation-"):
                     try:
@@ -3061,15 +3112,37 @@ class SemanticImageIndex:
                             )
                         except (TypeError, ValueError):
                             index_max = 1280
-                        detected_aircraft = self._aviation_classifier.classify(
-                            canonical_fp,
-                            progress_callback=(
-                                lambda m, _i=i, _t=total_sem: progress_callback(_i, _t, m)
-                                if progress_callback
-                                else None
-                            ),
-                            max_source_size=index_max,
+                        try:
+                            from blur_score import blur_index_max_size, compute_blur_score_for_index
+
+                            blur_rgb = _load_index_source_image(
+                                canonical_fp, max_size=blur_index_max_size()
+                            )
+                            blur_score_val, _blur_region = compute_blur_score_for_index(
+                                canonical_fp, blur_rgb
+                            )
+                        except Exception as blur_exc:
+                            logger.debug(
+                                "[BLUR] Laplacian score failed for %s: %s",
+                                os.path.basename(canonical_fp),
+                                blur_exc,
+                            )
+                        prog = (
+                            lambda m, _i=i, _t=total_sem: progress_callback(_i, _t, m)
+                            if progress_callback
+                            else None
                         )
+                        _src, _rgba, subject_crop = (
+                            self._aviation_classifier.prepare_subject_pipeline(
+                                canonical_fp, index_max, progress_callback=prog
+                            )
+                        )
+                        if subject_crop is not None:
+                            detected_aircraft = (
+                                self._aviation_classifier.classify_from_subject_crop(
+                                    subject_crop, canonical_fp, progress_callback=prog
+                                )
+                            )
                     except Exception as e:
                         logger.error(
                             "[AVIATION AI] Classification failed for %s: %s",
@@ -3088,13 +3161,15 @@ class SemanticImageIndex:
                 self._conn.execute(
                     """
                     UPDATE semantic_index
-                    SET dim = ?, embedding = ?, semantic_ready = 1, detected_aircraft = ?, updated_at = ?
+                    SET dim = ?, embedding = ?, semantic_ready = 1,
+                        detected_aircraft = ?, blur_score = ?, updated_at = ?
                     WHERE file_path = ? AND model_name = ? AND file_size = ? AND mtime_ns = ?
                     """,
                     (
                         dim,
                         blob,
                         detected_aircraft,
+                        blur_score_val,
                         float(time.time()),
                         canonical_fp,
                         self.model_name,
@@ -3547,6 +3622,16 @@ class SemanticImageIndex:
             
         return False
 
+    @staticmethod
+    def _row_blur_score(row) -> float | None:
+        raw = SemanticImageIndex._row_value(row, "blur_score", None)
+        if raw is None or raw == "":
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
     def _apply_filters(
         self, rows: Sequence[sqlite3.Row], query_text: str
     ) -> tuple[List[sqlite3.Row], str]:
@@ -3554,6 +3639,9 @@ class SemanticImageIndex:
         Parse a mixed query and filter rows.
 
         Supported filter tokens:
+        - sharp / blurry / blur:sharp / blur:blurry (indexed blur_score; bottom 20% of
+          current gallery/filter set = blurry; env SkySpotter_BLUR_BLURRY_FRACTION)
+        - blur>=N / blur>N / blur<=N / blur<N / blur=N (numeric Laplacian variance)
         - camera:<text>
         - lens:<text>
         - city:<text>
@@ -3634,6 +3722,57 @@ class SemanticImageIndex:
                             str(self._row_value(r, "detected_aircraft", "") or ""), needle
                         )
                     ]
+                continue
+
+            if low in ("sharp", "blur:sharp", "focus:sharp", "infocus", "in-focus"):
+                matched = True
+                from blur_score import filter_rows_by_blur_rank
+
+                filtered = filter_rows_by_blur_rank(
+                    filtered, self._row_blur_score, want="sharp"
+                )
+                continue
+
+            if low in (
+                "blurry",
+                "blur:blurry",
+                "blur",
+                "outoffocus",
+                "out-of-focus",
+                "oof",
+                "defocused",
+            ):
+                matched = True
+                from blur_score import filter_rows_by_blur_rank
+
+                filtered = filter_rows_by_blur_rank(
+                    filtered, self._row_blur_score, want="blurry"
+                )
+                continue
+
+            blur_cmp = re.match(r"^blur\s*(>=|>|<=|<|=)\s*(\d+(?:\.\d+)?)$", low)
+            if blur_cmp:
+                matched = True
+                op, val_str = blur_cmp.group(1), blur_cmp.group(2)
+                val = float(val_str)
+
+                def _blur_ok(score: float) -> bool:
+                    if op == "<":
+                        return score < val
+                    if op == "<=":
+                        return score <= val
+                    if op == ">":
+                        return score > val
+                    if op == ">=":
+                        return score >= val
+                    return abs(score - val) < 1e-6
+
+                filtered = [
+                    r
+                    for r in filtered
+                    if self._row_blur_score(r) is not None
+                    and _blur_ok(self._row_blur_score(r))
+                ]
                 continue
 
             if low.startswith("date:"):

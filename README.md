@@ -45,7 +45,7 @@ See **where the camera focused** before you zoom in for sharpness:
 **Core selling points** for organizing an airshow folder. Everything below runs **offline on your machine**—no account, no cloud inference, no sending images to a server.
 
 - **Automated aircraft classification**: Custom **Vision Transformer (ViT)** recognizes about **70** military and civil aircraft types (e.g. F-35, AH-64, A400M, Eurofighter Typhoon). Class list: [`labels.txt`](models/gallery-classifier/skyspotter-military-aircraft-vit/labels.txt)
-- **One-click auto-sort**: **Magic Wand** in the gallery toolbar moves images into subfolders by detected aircraft type. After sorting, the gallery still shows those files (see folder scope in search section below)
+- **One-click auto-sort**: **Magic Wand** moves images into subfolders by detected aircraft type; images without a label go to **`Unclassified/`**. After sorting, the gallery still shows those files (see folder scope in search section below)
 - **Gallery filters — search by aircraft type**: `aircraft:F-35`, `aircraft:typhoon`, or type a model name after indexing; combine with EXIF (`camera:sony iso<800 aircraft:viper`, `format:raw`, `year>=2024`, and more)
 
 Full search syntax: **[Gallery search](#-gallery-search-gallery-view)**.
@@ -173,7 +173,8 @@ Separate tokens with spaces. Filters use `key:value` or comparison forms.
 | Kind | Example |
 | --- | --- |
 | Aircraft label | `aircraft:F-35` or `Typhoon` (indexed `detected_aircraft`) |
-| Filter combo | `camera:sony iso<800 aircraft:viper` |
+| Sharp / blurry | `sharp` · `blurry` (Laplacian score; **bottom 20%** of current folder = blurry; `SkySpotter_BLUR_BLURRY_FRACTION`) |
+| Filter combo | `camera:sony iso<800 aircraft:viper blurry` |
 | Camera / lens | `camera:canon` · `lens:70-200` |
 | ISO / year | `iso<=800` · `year>=2024` |
 | Place | `city:tokyo` · `country:jp` · `admin:california` |
@@ -329,7 +330,7 @@ If you are on macOS 12 or older, OR if you simply want to permanently bypass all
   2. Click the **+** button and add `SkySpotter.app`.
   3. Toggle it to **ON**.
 - **Gallery search only filters EXIF and aircraft labels:** This is expected. Phrases like “sunset” or “crowd” are not semantic image search—they only match if those words appear in metadata or an indexed aircraft label.
-- **Magic Wand hidden:** Wait until aircraft indexing finishes (labels written to the index). The wand appears only when at least one image has a detected aircraft label.
+- **Magic Wand hidden:** Wait until gallery indexing finishes. The wand appears once images are indexed (labeled types get their own folder; others can go to `Unclassified/`).
 - **“Exporting aircraft model” on first folder open:** Normal one-time setup on a new PC (often under a minute). Later opens of the same folder are much faster.
 
 ## 🧠 Customizing the Classifier
@@ -470,6 +471,8 @@ Gallery search uses a local index (EXIF + aircraft labels written while the fold
 ## 📄 License
 
 This project is licensed under the MIT License — see [LICENSE](LICENSE).
+
+**Third-party software and models** (ViT checkpoints, rembg / IS-Net, PyQt6, optional CLIP weights, etc.) are **not** covered by SkySpotter’s MIT license alone. See **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)** for copyrights, attribution, and redistribution requirements. Blur **sharp** / **blurry** filters use a Laplacian heuristic only (no extra model license).
 
 ## 🤝 Contributing
 
