@@ -3,16 +3,17 @@
 <p align="center">
   <img src="icons/appicon.ico" alt="SkySpotter Icon" width="256"><br>
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
+  <a href="https://github.com/markyip/SkySpotter"><img src="https://img.shields.io/github/downloads/markyip/SkySpotter/total" alt="Downloads"></a>
   <a href="https://www.buymeacoffee.com/markyip"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-orange?logo=buy-me-a-coffee" alt="Buy Me a Coffee"></a>
 </p>
 
 ## ✈️ Meet SkySpotter
 
-You’re an aviation photographer who just returned from an airshow, a base visit, or a day at the Mach Loop. You’ve come home with a full memory card and thousands of shots of fast jets, helicopters, and flybys—and now you’re facing the real challenge: **sorting through them all**.
+You're an aviation photographer who just returned from an airshow, a base visit, or a day at the Mach Loop. You've come home with a full memory card and thousands of shots of fast jets, helicopters, and flybys—and now you're facing the real challenge: **sorting through them all**.
 
 SkySpotter is a smart image viewer for Windows and Mac that helps you quickly sort, clean up, and organize massive folders of airplane photos before you start editing.
 
-Best of all, it’s built entirely around your privacy. All of the AI features—like recognizing aircraft types and auto-sorting them into folders—run 100% locally on your computer. Your photos are never uploaded to the cloud, meaning your files stay completely safe and under your control.
+Best of all, it's built entirely around your privacy. All of the AI features—like recognizing aircraft types and auto-sorting them into folders—run 100% locally on your computer. Your photos are never uploaded to the cloud, meaning your files stay completely safe and under your control.
 
 With SkySpotter, you can:
 
@@ -83,9 +84,16 @@ This is a **pre-filtering tool**, letting you go through hundreds of RAW files e
 - **Cross-platform support**: Windows and macOS
 - **macOS file association**: Finder integration; set as default viewer; double-click to open
 - **Intuitive navigation**: Keyboard shortcuts, mouse controls, and scroll wheel support
+- **Zoom functionality**: Fit-to-window and 100% zoom modes with smooth panning, including native Mac trackpad pinch-to-zoom
+- **DNG zoom reliability**: Single-view DNG now prioritizes full-resolution decoding to keep Space / double-click 100% zoom behavior consistent
 - **File management**: Move images to discard folder or delete permanently
 - **EXIF data display**: Camera settings, focal length, ISO, aperture, and capture information
+- **Session persistence**: Remembers your last opened folder, image, and view mode
 - **Single-image histogram**: Press **`H`** to show or hide the strip while viewing one image
+- **Modern installer**: Lightweight executable that automatically provisions a self-contained Python environment and downloads AI models on first launch
+- **Professional startup**: Synchronized native and Qt splash screens for a flicker-free launch experience
+- **Modern UI**: Material Design 3 aesthetics with Font Awesome icons (via qtawesome) and non-intrusive loading indicators
+- **Platform-specific chrome**: **Share** (macOS system share sheet) on macOS; **Open with another app** (native Windows picker) on Windows — send or edit the current file in Lightroom, Photoshop, etc.
 - **Non-destructive visual rotate**: Rotate in the viewer by 90° steps without modifying originals (including RAW); gallery tiles refresh immediately
 
 ---
@@ -102,6 +110,8 @@ This is a **pre-filtering tool**, letting you go through hundreds of RAW files e
 4. Launch SkySpotter from the Desktop shortcut created during installation! (You can safely delete the original `SkySpotter.exe` installer afterwards).
 
 #### macOS
+
+> **Minimum supported macOS (official prebuilt release): macOS 13 Ventura or newer.**
 
 1. Download the latest release from the [Releases Page](https://github.com/markyip/SkySpotter/releases/latest)
 2. Download and extract the latest macOS `.zip` release.
@@ -152,7 +162,7 @@ Use the on-screen gallery button or **click a thumbnail** to open a photo full-s
 
 ## 🔎 Gallery search (Gallery view)
 
-Open the bottom search panel to filter the grid. SkySpotter gallery search is **EXIF/metadata** plus **detected aircraft labels** (written during folder indexing). There is no free-text “describe this photo” semantic search and no face-based search in this app.
+Open the bottom search panel to filter the grid. SkySpotter gallery search is **EXIF/metadata** plus **detected aircraft labels** (written during folder indexing). There is no free-text "describe this photo" semantic search and no face-based search in this app.
 
 **What you can search:**
 
@@ -165,6 +175,20 @@ Open the bottom search panel to filter the grid. SkySpotter gallery search is **
 - **Clear** the field or use **×** to show the full folder again
 
 Indexing must finish before aircraft-name filters match; Magic Wand also needs detected labels on your images.
+
+### Semantic + face indexing behavior (current default)
+
+- Semantic indexing and face detection are both enabled by default.
+- To keep the app responsive on very large RAW folders, indexing runs in two passes:
+  1. metadata + semantic embeddings (search-ready first)
+  2. face-count backfill in background
+- Background face pass starts automatically after semantic indexing is ready and resumes from persisted DB state.
+- Thumbnail warm-up before face scan is conservative by default to avoid long "warming" stalls on multi-thousand-image folders.
+- Advanced environment switches:
+  - `RAWVIEWER_INDEX_DEFER_FACE_SCAN=1` (default): run face scan after semantic pass
+  - `RAWVIEWER_FACE_SCAN_WARM_THUMBS=0` (default): disable full warm-up prepass
+  - `RAWVIEWER_FACE_SCAN_WARM_MAX_FILES=256` (default): cap warm-up batch size
+  - `RAWVIEWER_FACE_SCAN_WARM_MAX_SECONDS=25` (default): cap warm-up wall time
 
 ### Gallery search syntax examples
 
@@ -271,6 +295,8 @@ Gallery `format:raw` / `format:jpeg` filters use the same extension sets as the 
 
 ## 🏗️ Building from Source
 
+Launch and build scripts live under [`scripts/launchers/`](scripts/launchers/README.md). Upstream RAWviewer uses `scripts/Launch/`; SkySpotter keeps the `scripts/launchers/` layout instead.
+
 ### Prerequisites
 
 - Install **[Pixi](https://pixi.sh/latest/)** — required for development and building from source
@@ -294,6 +320,16 @@ pixi run start
 
 Train, verify, and build scripts are in the same folder — see `scripts/launchers/README.md`.
 
+**Virtual environments:** `pixi install` → `pixi run start` uses `.pixi/`. Build/debug batch scripts may create a local `rawviewer_env/` (created automatically). `.venv/` is optional for IDE use only.
+
+**Optional dev toggles:**
+
+| Variable | Effect |
+|----------|--------|
+| `RAWVIEWER_GPU_VIEW=1` | Use the experimental GPU-accelerated single-image viewport (smoother zoom/pan; default remains the classic scroll area) |
+| `RAWVIEWER_GPU_VIEW_NO_GL=1` | Force raster viewport when GPU view is enabled (debug / fallback) |
+| `RAWVIEWER_PERSISTENT_CACHE=1` | Enable disk/SQLite cache persistence (off by default) |
+
 ### Windows
 
 ```batch
@@ -314,7 +350,7 @@ Or: `pixi install` then `pixi run python build.py`
 
 Everything is installed with **`pixi install`** (see `pixi.toml`). Use **`pixi run start`**, **`pixi run verify-model`**, and **`pixi run python build.py`** so commands run inside that environment.
 
-**Packaging note:** `build.py` strips dev logs before PyInstaller runs. The Windows installer copies **`pixi.toml` and `pixi.lock`** and runs **`pixi install --locked`** on the user’s machine so installs match the pinned environment.
+**Packaging note:** `build.py` strips dev logs before PyInstaller runs. The Windows installer copies **`pixi.toml` and `pixi.lock`** and runs **`pixi install --locked`** on the user's machine so installs match the pinned environment.
 
 ---
 
@@ -340,12 +376,19 @@ Optional: set `RAWVIEWER_FILE_LOG=1` when developing to enable extra file loggin
 - **"Windows protected your PC"**: Click "More info" → "Run anyway"
 - **Antivirus warnings**: Add SkySpotter to your antivirus exclusions
 - **Performance issues**: Try running as administrator
+- **"Open with another app" does nothing**: Ensure a file is loaded in single-image view; restart the app after upgrading. The picker uses the native `OpenAs_RunDLLW` API (Unicode paths supported).
 - **AttributeError with stdout**: This is normal for windowed builds - the application runs without a console window
+- **Installer stuck on "Downloading MobileCLIP ONNX Models" / `No module named 'requests'`**:
+  - Fixed in recent builds (`requests` in `pixi.toml`). Re-run the installer from a fresh build, or in the install folder run `_internal\pixi\pixi.exe install` then retry.
+  - Public Hugging Face models download **without** an account or token.
 - **Crash code `-1073741819` / `0xC0000005` (access violation)**:
   - This is a native crash (viewer, RAW decoder, or graphics driver layer), not always a Python exception.
   - Check **`%LOCALAPPDATA%\SkySpotter\logs\`** for `fatal_dump_*.log` and `crash_report_*.txt` (see **Crash logs** above). If you run from a git checkout, also check `<project>\src\logs\`.
 
 ### macOS
+
+- **Minimum supported macOS (official prebuilt app): 13.0 (Ventura)**
+  - macOS 12 and older may fail to launch the prebuilt binary; use a local Pixi build instead.
 
 - **"App is damaged and should be moved to the Trash" / "Apple could not verify SkySpotter is free of malware"**:
   - **Why it happens**: Apple heavily restricts apps downloaded outside the App Store that aren't signed with a paid developer certificate. On newer macOS versions (especially Apple Silicon M1/M2/M3), macOS breaks the app's ad-hoc signature and aggressively blocks opening it.
@@ -354,7 +397,7 @@ Optional: set `RAWVIEWER_FILE_LOG=1` when developing to enable extra file loggin
     xattr -cr /Applications/SkySpotter.app
     ```
     _(Note: If you placed the app somewhere other than the Applications folder, update the path accordingly)._
-- **"Symbol not found: (mkfifoat)" or App crashes instantly on macOS 12 (Monterey) or older**:
+- **"Symbol not found: (_mkfifoat)" or App crashes instantly on macOS 12 (Monterey) or older**:
   - **Why it happens**: The pre-built release is compiled using a newer macOS 13+ SDK. Older macOS versions do not have the required system files to run it.
   - **The Fix**: You must build the app locally (see the "Ultimate Fix" below).
 
@@ -384,9 +427,9 @@ If you are on macOS 12 or older, OR if you simply want to permanently bypass all
   1. Go to **System Settings** > **Privacy & Security** > **Full Disk Access**.
   2. Click the **+** button and add `SkySpotter.app`.
   3. Toggle it to **ON**.
-- **Gallery search only filters EXIF and aircraft labels:** This is expected. Phrases like “sunset” or “crowd” are not semantic image search—they only match if those words appear in metadata or an indexed aircraft label.
+- **Gallery search only filters EXIF and aircraft labels:** This is expected. Phrases like "sunset" or "crowd" are not semantic image search—they only match if those words appear in metadata or an indexed aircraft label.
 - **Magic Wand hidden:** Wait until gallery indexing finishes. The wand appears once images are indexed (labeled types get their own folder; others can go to `Unclassified/`).
-- **“Exporting aircraft model” on first folder open:** Normal one-time setup on a new PC (often under a minute). Later opens of the same folder are much faster.
+- **"Exporting aircraft model" on first folder open:** Normal one-time setup on a new PC (often under a minute). Later opens of the same folder are much faster.
 
 ## 🧠 Customizing the Classifier
 
@@ -527,7 +570,7 @@ Gallery search uses a local index (EXIF + aircraft labels written while the fold
 
 This project is licensed under the MIT License — see [LICENSE](LICENSE).
 
-**Third-party software and models** (ViT checkpoints, rembg / IS-Net, PyQt6, optional CLIP weights, etc.) are **not** covered by SkySpotter’s MIT license alone. See **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)** for copyrights, attribution, and redistribution requirements.
+**Third-party software and models** (ViT checkpoints, rembg / IS-Net, PyQt6, optional CLIP weights, etc.) are **not** covered by SkySpotter's MIT license alone. See **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)** for copyrights, attribution, and redistribution requirements.
 
 ## 🤝 Contributing
 
@@ -554,7 +597,7 @@ If you encounter issues:
 If SkySpotter has helped your workflow, a few things make a big difference:
 
 - **Share it** with photographer friends who shoot airshows or military aviation—more people trying the project helps it improve.
-- **Chip in** if you’d like to help fund my **RIAT tickets for next year**.
+- **Chip in** if you'd like to help fund my **RIAT tickets for next year**.
 - **Not an aviation photographer?** Try **[RAWviewer](https://github.com/markyip/RAWviewer)** for the same fast, local workflow with **semantic search** instead of aircraft recognition.
 
 Enjoy organizing your airshow shots! 📸

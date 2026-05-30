@@ -78,6 +78,12 @@ rawviewer_env/
 venv/
 .venv_mobileclip2_export/
 
+# Pixi local environment (commit pixi.lock; ignore installed env)
+.pixi/
+
+# Local agent / IDE scratch (not part of the app)
+.agent/
+
 # Local MobileCLIP2 / OpenCLIP Core ML export trees (not part of the app bundle)
 .build/
 .hf_cache_mobileclip/
@@ -125,6 +131,10 @@ tests/
 
 # Development scratch
 scratch/
+
+# .NET build output (Windows share helper)
+src/windows_share_helper/bin/
+src/windows_share_helper/obj/
 
 # Aviation Specialist AI
 aviation_model_v2/

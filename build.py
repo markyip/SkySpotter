@@ -213,6 +213,8 @@ def install_dependencies():
         dependencies.append('onnxruntime-directml')
         dependencies.append('mediapipe')
         dependencies.append('opencv-contrib-python')
+        dependencies.append('huggingface-hub')
+        dependencies.append('requests')
     elif system_name == "Darwin":
         dependencies.append('onnxruntime-silicon')
         dependencies.append('huggingface-hub')
@@ -432,7 +434,6 @@ def main():
             shutil.rmtree(logs_dir)
         except Exception as e:
             print(f"[WARNING] Could not clean src/logs: {e}")
-
     # Platform-agnostic icon
     is_aviation = os.environ.get("SkySpotter_AVIATION_BUILD", "").strip().lower() in ("1", "true", "yes")
     

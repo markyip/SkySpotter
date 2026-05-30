@@ -74,7 +74,12 @@ class InstallWorker(QObject):
             
             src_dir = os.path.join(target_dir, "src")
             if os.path.exists(src_dir): shutil.rmtree(src_dir)
-            shutil.copytree(os.path.join(BUNDLE_DIR, "src"), src_dir, dirs_exist_ok=True)
+            shutil.copytree(
+                os.path.join(BUNDLE_DIR, "src"),
+                src_dir,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns("logs", "*.log"),
+            )
             
             assets_dir = os.path.join(target_dir, "icons")
             if os.path.exists(assets_dir): shutil.rmtree(assets_dir)
@@ -259,7 +264,7 @@ oLink2.Save
                 with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
                     winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, APP_NAME)
                     winreg.SetValueEx(key, "DisplayIcon", 0, winreg.REG_SZ, icon_path)
-                    winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, "2.0.1")
+                    winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, "2.2.1")
                     winreg.SetValueEx(key, "UninstallString", 0, winreg.REG_SZ, silent_cmd)
                     winreg.SetValueEx(key, "QuietUninstallString", 0, winreg.REG_SZ, silent_cmd)
                     winreg.SetValueEx(key, "InstallLocation", 0, winreg.REG_SZ, target_dir)

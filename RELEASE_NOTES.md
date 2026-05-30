@@ -4,10 +4,25 @@
 
 Work in progress on the **SkySpotter** aviation specialist viewer—not yet tagged as a release.
 
+### Merged from RAWviewer v2.2.1 (upstream)
+
+**Release Date: May 30, 2026**
+
+- **Windows — Open with another app**: Bottom-bar button opens the native “Open with” picker (Lightroom, Photoshop, etc.).
+- **Experimental GPU single-image view**: Opt in with `RAWVIEWER_GPU_VIEW=1` for smoother zoom/pan (classic scroll area remains the default).
+- **Search → gallery navigation**: Search results open the correct image; film strip and arrow keys stay within filtered results.
+- **Film strip**: Fixed phantom selection, recursion on hover, and sync to search-filtered lists.
+- **Search panel UI**: Collapsing the search field no longer shifts nearby status-bar icons.
+- **Gallery thumbnails**: Click handler uses the widget’s current path in filtered grids.
+- **Fast single-file open**, phased semantic/face indexing, DNG zoom stability, and Pixi-first build scripts (ported into SkySpotter `scripts/launchers/` layout).
+
+Earlier RAWviewer releases (2.2.0, 2.1.0, 2.0.1) contributed indexing, installer, and zoom fixes included in this merge.
+
 ### Aircraft gallery & indexing
 
 - All AI (ViT labels, indexing, Magic Wand) runs **locally**—photos are not sent to the cloud for detection.
 - ViT aircraft classifier with gallery labels, Magic Wand auto-sort, and `aircraft:` / model-name gallery search (EXIF + detected labels).
+- Gallery classifier version tracking: custom models protected from auto-update; official updates prompt with progress; aircraft labels re-index when weights change.
 - Fixes for aircraft filter queries, Magic Wand moves when a type folder already exists, and reading indexed labels from the database.
 - Minimum crop size for classification uses a fraction of the source image (default 20% per axis) instead of a fixed pixel floor.
 - Faster open when launching on a single file: show that image first while the rest of the folder scans in the background.
@@ -29,7 +44,7 @@ Work in progress on the **SkySpotter** aviation specialist viewer—not yet tagg
 ### Documentation
 
 - README rewritten for aviation workflows (focus overlay, aircraft search, formats, Pixi-only builds).
-- Removed RAWviewer-era release history from this file; future versions will be listed here as SkySpotter ships.
+- SkySpotter release history will be listed here as versions ship.
 
 ### Third-party models & attribution
 

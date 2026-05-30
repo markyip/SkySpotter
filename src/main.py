@@ -145,6 +145,15 @@ except Exception:
 
 # In PyInstaller --windowed builds there is no console, so stdout/stderr can be None.
 # Redirect them to a file early so all existing safe_print() debug output is preserved.
+def _runtime_log_dir() -> str:
+    """
+    Central runtime log directory.
+    Use LocalAppData for both installed and dev runs to avoid packaging stale src/logs.
+    """
+    app_data = os.environ.get("LOCALAPPDATA", "C:\\")
+    return os.path.join(app_data, "SkySpotter", "logs")
+
+
 def _redirect_stdio_to_file_if_needed():
     try:
         # Opt-in only: do not create log folders/files in normal releases.
@@ -157,23 +166,10 @@ def _redirect_stdio_to_file_if_needed():
         if sys.stdout is not None and sys.stderr is not None:
             return
 
-        # Prefer writing next to the project-style logs folder when present.
-        # Fallback to a local "logs" folder in current working directory.
-        base_dir = os.getcwd()
-        candidate_dirs = [
-            os.path.join(base_dir, "src", "logs"),
-            os.path.join(base_dir, "logs"),
-        ]
-        log_dir = None
-        for d in candidate_dirs:
-            try:
-                os.makedirs(d, exist_ok=True)
-                log_dir = d
-                break
-            except OSError:
-                continue
-
-        if not log_dir:
+        log_dir = _runtime_log_dir()
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except OSError:
             return
 
         from datetime import datetime
@@ -234,6 +230,7 @@ def _enable_fatal_crash_dump_if_needed():
             os.path.join(base_dir, "src", "logs"),
             os.path.join(base_dir, "logs"),
             _skyspotter_log_dir(),
+            _runtime_log_dir(),
         ]
         dump_dir = None
         for d in candidates:
@@ -467,7 +464,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QFileDialog,
                              QMessageBox, QScrollArea, QSizePolicy, QPushButton, QFrame,
                              QGridLayout, QScrollBar, QDialog, QSplashScreen, QInputDialog,
-                             QLineEdit, QStackedLayout, QProgressDialog)
+                             QLineEdit, QStackedLayout, QProgressDialog, QGraphicsOpacityEffect)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint, QEvent, QSettings, QSize, QRect, QObject, QRunnable, QThreadPool, QTimer, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import (QPixmap, QImage, QAction, QKeySequence, QShortcut, QGuiApplication,
                          QDragEnterEvent, QDropEvent, QCursor, QIcon,
@@ -656,7 +653,7 @@ def setup_logging():
         # Optional file logging (opt-in) to avoid creating a logs folder in normal releases.
         enable_file_log = os.environ.get("RAWVIEWER_FILE_LOG", "").strip() in ("1", "true", "True", "YES", "yes")
         if enable_file_log:
-            log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+            log_dir = _runtime_log_dir()
             os.makedirs(log_dir, exist_ok=True)
 
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -685,7 +682,7 @@ def setup_logging():
         try:
             # Only attempt fallback file logging if explicitly enabled.
             if os.environ.get("RAWVIEWER_FILE_LOG", "").strip() in ("1", "true", "True", "YES", "yes"):
-                fallback_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs', 'error.log')
+                fallback_log = os.path.join(_runtime_log_dir(), 'error.log')
                 os.makedirs(os.path.dirname(fallback_log), exist_ok=True)
                 with open(fallback_log, 'a', encoding='utf-8') as f:
                     f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {error_msg}\n")
@@ -2083,6 +2080,10 @@ class FolderLoadSignals(QObject):
     """Signal carrier for background folder scan/sort work."""
     ready = pyqtSignal(object, object, object, object, str, object, object, float, float)
     error = pyqtSignal(object, str, str)
+
+class QuickFolderIndexSignals(QObject):
+    """Fast scandir + mtime sort for single-file open (navigation before EXIF sort finishes)."""
+    ready = pyqtSignal(object, object, object, int, float)  # token, files, file_stats, start_idx, scan_s
 
 class SemanticIndexSignals(QObject):
     """Signal carrier for background semantic index build."""
@@ -4326,7 +4327,7 @@ class CustomConfirmDialog(QDialog):
         button_layout = QHBoxLayout()
         button_layout.setContentsMargins(0, 8, 0, 0)
         button_layout.setSpacing(12)
-        button_layout.addStretch()
+        button_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
         # Cancel button (MD3 style - outlined)
         cancel_btn = QPushButton("Cancel")
@@ -4402,9 +4403,6 @@ class CustomConfirmDialog(QDialog):
         confirm_btn.setDefault(True)
         confirm_btn.setFocus()
         button_layout.addWidget(confirm_btn)
-        
-        # Add stretch after buttons to center them
-        button_layout.addStretch()
         
         content_layout.addLayout(button_layout)
         main_layout.addWidget(content_widget)
@@ -4652,15 +4650,19 @@ class SingleImageViewOverlay(QWidget):
     _FILMSTRIP_HEIGHT = 88
     _BOTTOM_HOTZONE = 72
 
-    def __init__(self, scroll_area, histogram_widget, viewer=None, parent=None):
+    def __init__(self, scroll_area, histogram_widget, viewer=None, parent=None,
+                 gpu_view=None):
         super().__init__(parent)
         self._viewer = viewer
         self._scroll = scroll_area
+        self._gpu_view = gpu_view
         self._hist = histogram_widget
         self._hist_user_placed = False
         self._filmstrip_pointer_active = False
         self._filmstrip_reveal = False
         scroll_area.setParent(self)
+        if gpu_view is not None:
+            gpu_view.setParent(self)
         histogram_widget.setParent(self)
         self.setObjectName("single_view_container")
         self.setStyleSheet("#single_view_container { background-color: #1E1E1E; }")
@@ -4679,16 +4681,19 @@ class SingleImageViewOverlay(QWidget):
         return getattr(self, "_filmstrip", None)
 
     def set_filmstrip_pointer_active(self, active: bool) -> None:
-        self._filmstrip_pointer_active = bool(active)
         if active:
+            if self._filmstrip_pointer_active:
+                return
+            self._filmstrip_pointer_active = True
             self._hide_filmstrip_timer.stop()
             self._reveal_filmstrip()
             if self._viewer is not None:
                 self._viewer._filmstrip_pointer_active = True
-        else:
-            if self._viewer is not None:
-                self._viewer._filmstrip_pointer_active = False
-            self._schedule_hide_filmstrip()
+            return
+        self._filmstrip_pointer_active = False
+        if self._viewer is not None:
+            self._viewer._filmstrip_pointer_active = False
+        self._schedule_hide_filmstrip()
 
     def _schedule_hide_filmstrip(self) -> None:
         self._hide_filmstrip_timer.start(0)
@@ -4746,6 +4751,10 @@ class SingleImageViewOverlay(QWidget):
         # Scroll area stays full size; film strip overlays the bottom (no image reflow).
         self._scroll.setGeometry(0, 0, self.width(), self.height())
         self._scroll.lower()
+        if self._gpu_view is not None:
+            # GPU view fills the container, stacked above the (now idle) scroll area.
+            self._gpu_view.setGeometry(0, 0, self.width(), self.height())
+            self._gpu_view.raise_()
         self._layout_filmstrip()
         self._layout_histogram()
 
@@ -4869,6 +4878,123 @@ def _windows_shell_verb_suggests_share(verb_name: object) -> bool:
     return False
 
 
+def _open_windows_open_with_dialog(path: str, owner_hwnd: int = 0) -> bool:
+    """Show the native Windows 'Open with' dialog for a file."""
+    import subprocess
+    import ctypes
+    from ctypes import Structure, byref, c_long, wintypes
+
+    abs_path = os.path.abspath(path)
+    if not os.path.isfile(abs_path):
+        return False
+
+    hwnd = int(owner_hwnd or 0)
+    OAIF_EXEC = 0x0004  # Required on Win10+ or Windows shows "go to Settings" instead.
+
+    # Classic Open With picker (Unicode). Prefer this over SHOpenWithDialog on Win11.
+    try:
+        shell32 = ctypes.windll.shell32
+        shell32.OpenAs_RunDLLW.argtypes = [
+            wintypes.HWND,
+            wintypes.HINSTANCE,
+            wintypes.LPCWSTR,
+            ctypes.c_int,
+        ]
+        shell32.OpenAs_RunDLLW.restype = None
+        shell32.OpenAs_RunDLLW(hwnd, None, abs_path, 1)
+        return True
+    except Exception:
+        pass
+
+    # SHOpenWithDialog — must pass OAIF_EXEC or user only sees the Settings redirect.
+    try:
+        class _OPENASINFO(Structure):
+            _fields_ = [
+                ("pcszFile", wintypes.LPCWSTR),
+                ("pcszClass", wintypes.LPCWSTR),
+                ("oaifInFlags", wintypes.DWORD),
+            ]
+
+        shell32 = ctypes.windll.shell32
+        shell32.SHOpenWithDialog.argtypes = [wintypes.HWND, ctypes.POINTER(_OPENASINFO)]
+        shell32.SHOpenWithDialog.restype = c_long
+        info = _OPENASINFO(abs_path, None, OAIF_EXEC)
+        hr = int(shell32.SHOpenWithDialog(hwnd, byref(info)))
+        if hr >= 0:
+            return True
+    except Exception:
+        pass
+
+    # rundll32 fallback — must use OpenAs_RunDLLW, not the ANSI OpenAs_RunDLL.
+    try:
+        subprocess.Popen(["rundll32.exe", "shell32.dll,OpenAs_RunDLLW", abs_path])
+        return True
+    except Exception:
+        pass
+
+    try:
+        flags = 0
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            flags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+        r = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Sta",
+                "-Command",
+                "Start-Process",
+                "-FilePath",
+                abs_path,
+                "-Verb",
+                "OpenAs",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=flags,
+        )
+        if r.returncode == 0:
+            return True
+    except Exception:
+        pass
+
+    try:
+        import win32com.client  # type: ignore
+
+        folder = win32com.client.Dispatch("Shell.Application").Namespace(
+            os.path.dirname(abs_path)
+        )
+        item = folder.ParseName(os.path.basename(abs_path))
+        if item is None:
+            return False
+        open_with_tokens = (
+            "openas",
+            "open with",
+            "openwith",
+            "開啟方式",
+            "選擇開啟方式",
+            "打开方式",
+            "选择打开方式",
+        )
+        for verb_key in open_with_tokens:
+            try:
+                item.InvokeVerb(verb_key)
+                return True
+            except Exception:
+                continue
+        for verb in item.Verbs():
+            try:
+                name = str(getattr(verb, "Name", "") or "").replace("&", "").strip().lower()
+                if any(token in name for token in open_with_tokens):
+                    verb.DoIt()
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
 def _share_windows_clipboard_cf_hdrop(path: str) -> bool:
     """Place file(s) on clipboard as CF_HDROP (native Windows file clipboard)."""
     import struct
@@ -4928,6 +5054,84 @@ def _share_windows_clipboard_file_via_powershell(path: str) -> bool:
             creationflags=flags,
         )
         return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _resolve_windows_share_helper_exe():
+    """Locate built WindowsShareHelper.exe (dev tree or bundled install)."""
+    rel = os.path.join(
+        "windows_share_helper",
+        "bin",
+        "Release",
+        "net8.0-windows10.0.19041.0",
+        "WindowsShareHelper.exe",
+    )
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [os.path.join(here, rel)]
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        candidates.append(os.path.join(exe_dir, "WindowsShareHelper.exe"))
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(os.path.join(meipass, "WindowsShareHelper.exe"))
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _share_windows_via_helper(path: str, owner_hwnd: int) -> bool:
+    """Launch the .NET helper that wraps IDataTransferManagerInterop."""
+    import subprocess
+    import time
+
+    helper = _resolve_windows_share_helper_exe()
+    if not helper:
+        return False
+    abs_path = os.path.abspath(path)
+    if not os.path.isfile(abs_path):
+        return False
+    flags = 0
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        flags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+    try:
+        proc = subprocess.Popen(
+            [helper, str(int(owner_hwnd or 0)), abs_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+        )
+        # Fail fast if the helper exits immediately, but never block the Qt UI
+        # thread for hundreds of ms — that prevented the share flyout on first click.
+        app = None
+        try:
+            from PyQt6.QtWidgets import QApplication
+
+            app = QApplication.instance()
+        except Exception:
+            app = None
+        deadline = time.time() + 0.15
+        while time.time() < deadline:
+            rc = proc.poll()
+            if rc is not None:
+                return rc == 0
+            if app is not None:
+                app.processEvents()
+            time.sleep(0.01)
+        return True
+    except Exception:
+        return False
+
+
+def _share_windows_via_winrt(path: str, owner_hwnd: int) -> bool:
+    """In-process WinRT share sheet (DataTransferManager + interop)."""
+    if not owner_hwnd:
+        return False
+    try:
+        from windows_share import share_file_windows
+
+        return bool(share_file_windows(path, owner_hwnd))
     except Exception:
         return False
 
@@ -5087,6 +5291,19 @@ class RAWImageViewer(QMainWindow):
         self.current_image = None
         self.current_pixmap = None
 
+        # Content cross-fade (thumbnail -> preview -> full upgrades, and navigation between files).
+        # One-shot flag set by display_pixmap(); consumed by _set_single_view_pixmap().
+        # Zoom/pan/resize paint through _set_single_view_pixmap directly without setting this
+        # flag, so they never trigger a fade.
+        self._crossfade_enabled = not _env_true("RAWVIEWER_DISABLE_CROSSFADE", default=False)
+        self._crossfade_duration_ms = 160
+        self._crossfade_next_paint = False
+        self._crossfade_overlay = None
+        self._crossfade_anim = None
+
+        # Route B GPU view: track last displayed path to decide fit-vs-preserve on new pixmaps.
+        self._gpu_last_path = None
+
         # Enhanced zoom and pan state tracking
         # Note: Only using simple toggle between fit-to-window and 100% zoom
         self.current_zoom_level = 1.0  # Current zoom level (1.0 = 100%)
@@ -5150,14 +5367,13 @@ class RAWImageViewer(QMainWindow):
         self._visual_rotation_degrees = {}
         self._semantic_index = None
         self._semantic_search_backup_files = None
+        self._semantic_search_result_paths = None
         # Full unfiltered file list for semantic index/search corpus in current folder.
         self._semantic_search_corpus_files = []
         self._semantic_index_active_token = None
         self._semantic_indexing_in_progress = False
         self._pending_aircraft_auto_sort = False
         self._aircraft_auto_sort_in_progress = False
-        self._aircraft_auto_sort_active_token = None
-        self._aircraft_auto_sort_signals = None
         self._aircraft_auto_sort_active_token = None
         self._aircraft_auto_sort_signals = None
         self._face_index_active_token = None
@@ -5259,11 +5475,28 @@ class RAWImageViewer(QMainWindow):
 
     def _set_single_view_pixmap(self, base: QPixmap) -> None:
         """Set image_label pixmap with optional dashed focus / subject outline."""
+        # Consume the one-shot cross-fade request. Only display_pixmap() (i.e. new content
+        # arriving: thumbnail/preview/full upgrade or navigation) sets this flag. Zoom/pan/resize
+        # repaints reach here without it, so they never fade.
+        do_fade = bool(getattr(self, "_crossfade_next_paint", False))
+        self._crossfade_next_paint = False
+
         if base is None or base.isNull():
+            self._cancel_content_crossfade()
             self.image_label.setPixmap(QPixmap())
             self.image_label.setText("Failed to load image")
             self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             return
+
+        # Snapshot the currently displayed content so we can fade it out on top of the new image.
+        old_pm = None
+        if do_fade and getattr(self, "_crossfade_enabled", True):
+            current = self.image_label.pixmap()
+            if current is not None and not current.isNull():
+                old_pm = QPixmap(current)  # detach from the label's live pixmap
+        else:
+            # Any non-fade paint (zoom/pan) must drop a still-running fade to avoid stale overlay.
+            self._cancel_content_crossfade()
 
         blended = base
         ow = self.current_pixmap.width() if self.current_pixmap else 0
@@ -5287,6 +5520,77 @@ class RAWImageViewer(QMainWindow):
             p.end()
         self.image_label.setPixmap(blended)
         self.image_label.resize(blended.size())
+
+        if old_pm is not None:
+            self._run_content_crossfade(old_pm)
+
+    def _cancel_content_crossfade(self) -> None:
+        """Stop and remove any in-flight cross-fade overlay/animation."""
+        anim = getattr(self, "_crossfade_anim", None)
+        if anim is not None:
+            try:
+                anim.stop()
+            except Exception:
+                pass
+            self._crossfade_anim = None
+        overlay = getattr(self, "_crossfade_overlay", None)
+        if overlay is not None:
+            try:
+                overlay.deleteLater()
+            except Exception:
+                pass
+            self._crossfade_overlay = None
+
+    def _run_content_crossfade(self, old_pixmap: QPixmap) -> None:
+        """Fade the previously displayed content out on top of the freshly set image.
+
+        The new (sharp) pixmap is already shown on image_label; we overlay the old pixmap
+        and animate its opacity 1 -> 0 so the upgrade/navigation feels smooth rather than
+        snapping. Cheap and isolated from the zoom/pan state machine.
+        """
+        if not getattr(self, "_crossfade_enabled", True):
+            return
+        if old_pixmap is None or old_pixmap.isNull():
+            return
+        try:
+            self._cancel_content_crossfade()
+
+            overlay = QLabel(self.image_label)
+            overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            overlay.setGeometry(self.image_label.rect())
+            overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            overlay.setScaledContents(False)
+            overlay.setPixmap(old_pixmap)
+            overlay.show()
+            overlay.raise_()
+
+            effect = QGraphicsOpacityEffect(overlay)
+            overlay.setGraphicsEffect(effect)
+            effect.setOpacity(1.0)
+
+            anim = QPropertyAnimation(effect, b"opacity", self)
+            anim.setDuration(int(getattr(self, "_crossfade_duration_ms", 160)))
+            anim.setStartValue(1.0)
+            anim.setEndValue(0.0)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+            def _cleanup(_overlay=overlay, _anim=anim):
+                try:
+                    _overlay.deleteLater()
+                except Exception:
+                    pass
+                if getattr(self, "_crossfade_overlay", None) is _overlay:
+                    self._crossfade_overlay = None
+                if getattr(self, "_crossfade_anim", None) is _anim:
+                    self._crossfade_anim = None
+
+            anim.finished.connect(_cleanup)
+            self._crossfade_overlay = overlay
+            self._crossfade_anim = anim
+            anim.start()
+        except Exception:
+            # Visual nicety only; never let it break image display.
+            self._cancel_content_crossfade()
 
     def _draw_focus_subject_outline_on_base_painter(
         self, painter: QPainter, base_pm: QPixmap, rect_image_space: QRect
@@ -5486,7 +5790,12 @@ class RAWImageViewer(QMainWindow):
         return True
 
     def _refresh_focus_subject_rect_from_exif(self) -> None:
-        """Populate _focus_subject_rect_image from pyexiv2, then exifread Subject*, then Canon AF."""
+        """Populate _focus_subject_rect_image from pyexiv2, then exifread Subject*, then Canon AF.
+
+        The EXIF hint is derived in the image's *upright* (EXIF-oriented) space, so it is
+        computed against the un-rotated base pixmap dimensions and then rotated by the
+        user's non-destructive visual rotation so the box tracks the displayed image.
+        """
         self._focus_subject_rect_image = None
         self._focus_rect_source = None
         path = getattr(self, "current_file_path", None)
@@ -5495,16 +5804,33 @@ class RAWImageViewer(QMainWindow):
             return
 
         try:
-            from exif_subject_area import pixmap_ltwh_focus_hint
+            from exif_subject_area import pixmap_ltwh_focus_hint, _rotate_rect
 
             orientation = 1
             cached_exif = self.image_cache.get_exif(path)
             if cached_exif:
                 orientation = cached_exif.get("orientation", 1)
 
-            hint = pixmap_ltwh_focus_hint(path, pm.width(), pm.height(), orientation)
+            # Visual rotation the user applied (clockwise degrees, non-destructive).
+            degrees = self._get_visual_rotation_degrees()
+
+            # Hint must be computed against the base (un-visually-rotated) pixmap size.
+            base_pm = getattr(self, "_base_display_pixmap", None)
+            if base_pm is not None and not base_pm.isNull():
+                base_w, base_h = base_pm.width(), base_pm.height()
+            elif degrees in (90, 270):
+                # current_pixmap dims are swapped relative to the base when rotated 90/270.
+                base_w, base_h = pm.height(), pm.width()
+            else:
+                base_w, base_h = pm.width(), pm.height()
+
+            hint = pixmap_ltwh_focus_hint(path, base_w, base_h, orientation)
             if hint is not None:
                 ltwh, src = hint
+                # Map from base space into the displayed (visually rotated) pixmap space.
+                if degrees:
+                    ocode = {90: 6, 180: 3, 270: 8}.get(degrees, 1)
+                    ltwh = _rotate_rect(ltwh, base_w, base_h, ocode)
                 self._focus_subject_rect_image = QRect(
                     ltwh[0], ltwh[1], ltwh[2], ltwh[3]
                 )
@@ -5527,12 +5853,31 @@ class RAWImageViewer(QMainWindow):
         self._redraw_single_view_pixmap_without_relayout()
 
     def _redraw_single_view_pixmap_without_relayout(self) -> None:
+        if getattr(self, "gpu_view", None) is not None:
+            # GPU path: the dashed focus/subject outline is a scene overlay, not painted
+            # onto the pixmap, so just refresh that overlay without touching the transform.
+            self._gpu_update_focus_overlay()
+            return
         if not self.current_pixmap:
             return
         if self.fit_to_window:
             self.scale_image_to_fit()
         else:
             self.apply_zoom_and_pan()
+
+    def _gpu_update_focus_overlay(self) -> None:
+        """Reflect the current focus/subject rect onto the GPU scene overlay."""
+        gv = getattr(self, "gpu_view", None)
+        if gv is None:
+            return
+        rect = getattr(self, "_focus_subject_rect_image", None)
+        active = getattr(self, "_focus_subject_outline_active", False)
+        if active and isinstance(rect, QRect) and not rect.isNull():
+            src = getattr(self, "_focus_rect_source", None) or ""
+            color = QColor(255, 185, 45) if src == "makernote_af" else QColor(165, 255, 95)
+            gv.set_overlay_rect(rect, color)
+        else:
+            gv.clear_overlay()
 
     def _maybe_refresh_focus_subject_outline_after_display(self) -> None:
         if (
@@ -5597,50 +5942,94 @@ class RAWImageViewer(QMainWindow):
             return True
         return container._pointer_in_bottom_hotzone()
 
+    def _is_semantic_search_filter_active(self) -> bool:
+        query = (getattr(self, "_last_semantic_query", "") or "").strip()
+        return bool(query and getattr(self, "_semantic_search_backup_files", None) is not None)
+
+    def _navigation_files(self) -> list:
+        """Files used for filmstrip and prev/next while browsing."""
+        if self._is_semantic_search_filter_active():
+            result = getattr(self, "_semantic_search_result_paths", None)
+            if result is not None:
+                return [p for p in result if os.path.isfile(p)]
+        return list(getattr(self, "image_files", []) or [])
+
     def _ensure_filmstrip_synced(self) -> None:
-        """Lazy sync when folder list exists but strip was never enabled (e.g. session restore)."""
+        """Ensure filmstrip matches the current navigation scope (incl. search filter)."""
         bar = self._filmstrip_bar()
         if bar is None:
             return
-        files = getattr(self, "image_files", []) or []
-        if len(files) > 1 and not bar.isEnabled():
+        nav = self._navigation_files()
+        if len(nav) <= 1:
+            return
+        try:
+            stale = tuple(bar.current_files()) != tuple(nav)
+        except Exception:
+            stale = True
+        if not bar.isEnabled() or stale:
             self._sync_filmstrip_to_folder()
 
     def _sync_filmstrip_to_folder(self) -> None:
-        bar = self._filmstrip_bar()
-        if bar is None:
+        if getattr(self, "_sync_filmstrip_in_progress", False):
             return
-        if getattr(self, "view_mode", "single") != "single":
-            bar.hide()
-            bar.setEnabled(False)
-            return
-        files = list(getattr(self, "image_files", []) or [])
-        enabled = len(files) > 1
-        bar.setEnabled(enabled)
-        if not enabled:
-            bar.hide()
-            return
-        bulk = getattr(self, "_gallery_bulk_metadata", None) or {}
-        bar.set_files(files, bulk_metadata=bulk)
-        self._sync_filmstrip_index(center=True)
+        self._sync_filmstrip_in_progress = True
+        try:
+            bar = self._filmstrip_bar()
+            if bar is None:
+                return
+            if getattr(self, "view_mode", "single") != "single":
+                bar.hide()
+                bar.setEnabled(False)
+                return
+            files = self._navigation_files()
+            if self._is_semantic_search_filter_active() and files != list(
+                getattr(self, "image_files", []) or []
+            ):
+                self.image_files = list(files)
+                path = getattr(self, "current_file_path", None)
+                if path and path in self.image_files:
+                    self.current_file_index = self.image_files.index(path)
+            enabled = len(files) > 1
+            bar.setEnabled(enabled)
+            if not enabled:
+                bar.hide()
+                return
+            bulk = getattr(self, "_gallery_bulk_metadata", None) or {}
+            idx = getattr(self, "current_file_index", -1)
+            bar.set_files(files, bulk_metadata=bulk, select_index=idx)
+            self._sync_filmstrip_index(center=True)
+        finally:
+            self._sync_filmstrip_in_progress = False
 
     def _sync_filmstrip_index(self, center: bool = False) -> None:
         bar = self._filmstrip_bar()
         if bar is None or not bar.isEnabled():
             return
+        files = self._navigation_files()
         idx = getattr(self, "current_file_index", -1)
+        path = getattr(self, "current_file_path", None)
+        if path and files:
+            try:
+                target = _norm_path(path)
+                for i, fp in enumerate(files):
+                    if _norm_path(fp) == target:
+                        idx = i
+                        self.current_file_index = i
+                        break
+            except Exception:
+                pass
         if idx >= 0:
             bar.set_current_index(idx, center=center)
             bar.refresh_visible_thumbnails(refresh_cache=True)
 
     def _on_filmstrip_committed(self, index: int) -> None:
-        files = getattr(self, "image_files", None) or []
+        files = self._navigation_files()
         if index < 0 or index >= len(files):
             return
         path = files[index]
         if _norm_path(path) == _norm_path(getattr(self, "current_file_path", "")):
             return
-
+            
         # Maintain zoom state if not in fit-to-window mode
         if not getattr(self, "fit_to_window", True):
             self._preserve_nav_zoom_active = True
@@ -5668,7 +6057,7 @@ class RAWImageViewer(QMainWindow):
             self._restore_zoom_level = None
             self._restore_start_scroll_x = None
             self._restore_start_scroll_y = None
-
+                
         self.current_file_index = index
         self.load_raw_image(path)
 
@@ -6449,8 +6838,30 @@ class RAWImageViewer(QMainWindow):
 
         self.single_image_histogram = ImageHistogramWidget()
         self._histogram_overlay_visible = True
+
+        # Route B: optional GPU-accelerated single-image view (QGraphicsView + OpenGL).
+        # Opt-in via RAWVIEWER_GPU_VIEW=1. The legacy QScrollArea/QLabel path is kept
+        # intact as the default and as a fallback.
+        self.gpu_view = None
+        if _env_true("RAWVIEWER_GPU_VIEW", default=False):
+            try:
+                from SkySpotter_ui.gpu_image_view import GpuImageView
+                self.gpu_view = GpuImageView()
+                # Reuse the legacy instruction screen text as the empty-state placeholder.
+                self.gpu_view.set_placeholder_text(self.image_label.text())
+                self.gpu_view.wheelNavigate.connect(self._on_gpu_wheel_navigate)
+                self.gpu_view.fitModeChanged.connect(self._on_gpu_fit_mode_changed)
+                self.gpu_view.zoomChanged.connect(self._on_gpu_zoom_changed)
+            except Exception as _gpu_exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "GPU view requested but failed to initialize: %s", _gpu_exc
+                )
+                self.gpu_view = None
+
         self.single_view_container = SingleImageViewOverlay(
-            self.scroll_area, self.single_image_histogram, viewer=self)
+            self.scroll_area, self.single_image_histogram, viewer=self,
+            gpu_view=self.gpu_view)
         self._wire_filmstrip()
         main_layout.addWidget(self.single_view_container)
         # --- Status bar with Material Design 3 styling ---
@@ -6592,10 +7003,15 @@ class RAWImageViewer(QMainWindow):
         self.share_bottom_button = QPushButton()
         self.share_bottom_button.setFlat(True)
         self.share_bottom_button.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.share_bottom_button.setIcon(qta.icon("fa5s.share-alt", color="#B0B0B0"))
+        if sys.platform == "darwin":
+            self.share_bottom_button.setIcon(qta.icon("fa5s.share-alt", color="#B0B0B0"))
+            self.share_bottom_button.setToolTip("Share")
+        else:
+            self.share_bottom_button.setIcon(qta.icon("fa5s.external-link-alt", color="#B0B0B0"))
+            self.share_bottom_button.setToolTip("Open with another app")
         self.share_bottom_button.setIconSize(QSize(20, 20))
         self.share_bottom_button.setStyleSheet(bottom_icon_btn_style)
-        self.share_bottom_button.clicked.connect(self._share_current_image_os)
+        self.share_bottom_button.clicked.connect(self._on_share_bottom_button_clicked)
         self.share_bottom_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.share_bottom_button.hide()
 
@@ -7109,6 +7525,7 @@ class RAWImageViewer(QMainWindow):
     def _reset_semantic_search_for_new_folder(self):
         """Clear gallery search UI and stale query when the folder scope changes."""
         self._semantic_search_backup_files = None
+        self._semantic_search_result_paths = None
         self._last_semantic_query = ""
         self._semantic_indexing_in_progress = False
         self._semantic_index_active_token = None
@@ -7185,7 +7602,8 @@ class RAWImageViewer(QMainWindow):
                 self.gallery_search_status_label.hide()
         
         if getattr(self, "view_mode", "single") != "gallery":
-            return
+            if not getattr(self, "_search_panel_expanded", False):
+                return
 
         user_collapsed = getattr(
             self, "_gallery_search_user_collapsed_while_busy", False
@@ -7201,20 +7619,31 @@ class RAWImageViewer(QMainWindow):
             self._set_search_panel_expanded(True, animate=animate)
 
     def _set_gallery_search_input_visible(self):
-        if getattr(self, "view_mode", "single") != "gallery":
-            return
         if hasattr(self, "search_expand_layout") and hasattr(self, "gallery_search_panel"):
             self.search_expand_layout.setCurrentWidget(self.gallery_search_panel)
         self._set_search_panel_expanded(True)
+
+    def _switch_to_gallery_for_search(self):
+        """Enter gallery mode to show semantic search results or empty state."""
+        if getattr(self, "view_mode", "single") == "gallery":
+            return
+        self.view_mode = "gallery"
+        self._stop_slideshow()
+        self._show_gallery_view()
 
     def _set_search_panel_expanded(self, expanded: bool, animate: bool = True):
         if not hasattr(self, "search_expand_container") or self.search_expand_container is None:
             return
         target = self._search_panel_target_width if expanded else 0
         self._search_panel_expanded = bool(expanded)
-        
-        if expanded:
-            self.search_expand_container.show()
+
+        # Keep the container in the layout at all times (never hide() on collapse).
+        # Hiding/showing a layout item discretely adds/removes the row's inter-item
+        # spacing, which makes the neighbouring icons jump by a few pixels. By keeping
+        # it visible and only animating its width, the row stays glitch-free; we just
+        # disable it when collapsed so its zero-width input can't grab focus/Tab.
+        self.search_expand_container.show()
+        self.search_expand_container.setEnabled(bool(expanded))
 
         if not expanded and hasattr(self, "gallery_search_input") and self.gallery_search_input is not None:
             try:
@@ -7231,8 +7660,6 @@ class RAWImageViewer(QMainWindow):
         if not animate:
             self.search_expand_container.setMinimumWidth(target)
             self.search_expand_container.setMaximumWidth(target)
-            if not expanded:
-                self.search_expand_container.hide()
             return
             
         anim = QPropertyAnimation(self.search_expand_container, b"maximumWidth")
@@ -7247,8 +7674,6 @@ class RAWImageViewer(QMainWindow):
             self.search_expand_container.setMinimumWidth(target)
             self.search_expand_container.setMaximumWidth(target)
             self._search_panel_animation = None
-            if not expanded:
-                self.search_expand_container.hide()
 
         anim.finished.connect(_finish)
         anim.start()
@@ -7287,7 +7712,7 @@ class RAWImageViewer(QMainWindow):
                 pass
             self._set_gallery_search_input_visible()
             if (
-                getattr(self, "view_mode", "single") == "gallery"
+                getattr(self, "_search_panel_expanded", False)
                 and hasattr(self, "gallery_search_input")
                 and self.gallery_search_input is not None
             ):
@@ -7415,7 +7840,7 @@ class RAWImageViewer(QMainWindow):
         if not user_hid:
             self._set_gallery_search_input_visible()
             if (
-                getattr(self, "view_mode", "single") == "gallery"
+                getattr(self, "_search_panel_expanded", False)
                 and hasattr(self, "gallery_search_input")
                 and self.gallery_search_input is not None
             ):
@@ -8062,9 +8487,6 @@ class RAWImageViewer(QMainWindow):
         self.status_bar.showMessage(f"Semantic model download failed: {error}", 7000)
 
     def _on_search_bottom_clicked(self):
-        if getattr(self, "view_mode", "single") != "gallery":
-            return
-            
         safe_print(
             f"[SEARCH_DEBUG] Search button clicked. Current expansion state: {getattr(self, '_search_panel_expanded', False)}"
         )
@@ -8268,6 +8690,7 @@ class RAWImageViewer(QMainWindow):
                 used_semantic_backend = True
             if not hits:
                 self.image_files = []
+                self._semantic_search_result_paths = []
                 self.current_file_index = -1
                 self.current_file_path = None
                 from semantic_search import semantic_embeddings_enabled as _see
@@ -8280,7 +8703,8 @@ class RAWImageViewer(QMainWindow):
                 empty_msg = (
                     "Semantic search unavailable" if backend_missing else "No matching images"
                 )
-                if getattr(self, "view_mode", "single") == "gallery" and hasattr(self, "gallery_justified") and self.gallery_justified:
+                self._switch_to_gallery_for_search()
+                if hasattr(self, "gallery_justified") and self.gallery_justified:
                     self.gallery_justified.clear_thumbnail_widgets()
                     self.gallery_justified.set_images([])
                     self.gallery_justified.show_empty_message(empty_msg)
@@ -8295,9 +8719,11 @@ class RAWImageViewer(QMainWindow):
             ranked_paths = [h.file_path for h in hits]
             if not ranked_paths:
                 self.image_files = []
+                self._semantic_search_result_paths = []
                 self.current_file_index = -1
                 self.current_file_path = None
-                if getattr(self, "view_mode", "single") == "gallery" and hasattr(self, "gallery_justified") and self.gallery_justified:
+                self._switch_to_gallery_for_search()
+                if hasattr(self, "gallery_justified") and self.gallery_justified:
                     self.gallery_justified.clear_thumbnail_widgets()
                     self.gallery_justified.set_images([])
                     self.gallery_justified.show_empty_message("No matching images")
@@ -8308,17 +8734,16 @@ class RAWImageViewer(QMainWindow):
                 return
 
             self.image_files = ranked_paths
+            self._semantic_search_result_paths = list(ranked_paths)
             self.current_file_index = 0
             self.current_file_path = self.image_files[0]
-            self._update_gallery_counter()
 
-            if getattr(self, "view_mode", "single") == "gallery":
-                if hasattr(self, "gallery_justified") and self.gallery_justified:
-                    self.gallery_justified.hide_empty_message()
-                self._sync_gallery_scrollbar_policy()
-                self._update_gallery_view()
-            else:
-                self.load_raw_image(self.current_file_path)
+            self._switch_to_gallery_for_search()
+            self._update_gallery_counter()
+            if hasattr(self, "gallery_justified") and self.gallery_justified:
+                self.gallery_justified.hide_empty_message()
+            self._sync_gallery_scrollbar_policy()
+            self._update_gallery_view()
 
             top = hits[0]
             if used_semantic_backend:
@@ -8342,6 +8767,7 @@ class RAWImageViewer(QMainWindow):
         else:
             restored = [p for p in self._semantic_search_backup_files if os.path.isfile(p)]
         self._semantic_search_backup_files = None
+        self._semantic_search_result_paths = None
         self._last_semantic_query = ""
         if not restored:
             if not silent:
@@ -8365,6 +8791,7 @@ class RAWImageViewer(QMainWindow):
             self._update_gallery_view()
         else:
             self.load_raw_image(self.current_file_path)
+            self._sync_filmstrip_to_folder()
         if not silent:
             self.status_bar.showMessage("Semantic search filter cleared", 3000)
 
@@ -8554,11 +8981,15 @@ class RAWImageViewer(QMainWindow):
         if hasattr(self, 'view_mode_button'):
             self.view_mode_button.show()
         if hasattr(self, "search_bottom_button"):
-            self.search_bottom_button.hide()
+            self.search_bottom_button.setVisible(bool(self.image_files))
         if hasattr(self, "magic_wand_button"):
             self.magic_wand_button.hide()
         if hasattr(self, "search_expand_container") and self.search_expand_container:
-            self.search_expand_container.hide()
+            # Keep the (possibly zero-width) container in the layout so toggling search
+            # never adds/removes the row spacing and shifts the neighbouring icons.
+            self._set_search_panel_expanded(
+                getattr(self, "_search_panel_expanded", False), animate=False
+            )
         # Update icon if using qtawesome
         if qta is not None:
             try:
@@ -8641,7 +9072,7 @@ class RAWImageViewer(QMainWindow):
             logger.info(f"[VIEW_MODE] Step 4: No image to reload, status bar updated")
 
         self._sync_single_image_histogram()
-        QTimer.singleShot(0, self._sync_filmstrip_to_folder)
+        self._sync_filmstrip_to_folder()
         
         total_time = time.time() - start_time
         logger.info(f"[VIEW_MODE] ========== TIMING BREAKDOWN ==========")
@@ -11141,7 +11572,7 @@ class RAWImageViewer(QMainWindow):
             filename = os.path.basename(requested_file_path)
             folder_name = os.path.basename(os.path.dirname(requested_file_path))
             title_text = f"{folder_name} / {filename}" if folder_name else filename
-
+            
             logger.debug(f"Setting window title to: {title_text}")
             self.setWindowTitle(title_text)
             # Update custom title bar
@@ -11825,8 +12256,38 @@ class RAWImageViewer(QMainWindow):
                 self._slideshow_timer.stop()
             self._sync_slideshow_button_icon(False)
 
+    def _on_share_bottom_button_clicked(self):
+        """macOS: system share sheet. Windows: native Open With dialog."""
+        if sys.platform == "darwin":
+            self._share_current_image_os()
+        elif sys.platform == "win32":
+            self._open_current_image_with_app()
+        else:
+            self._open_current_image_with_app()
+
+    def _open_current_image_with_app(self):
+        """Windows: show the native Open With dialog for the current file."""
+        p = getattr(self, "current_file_path", None)
+        if not p:
+            self.status_bar.showMessage("No file to open", 2000)
+            return
+        path = os.path.abspath(p)
+        if not os.path.isfile(path):
+            self.status_bar.showMessage("No file to open", 2000)
+            return
+
+        def _show_open_with_dialog():
+            owner = self._share_windows_owner_hwnd() if sys.platform == "win32" else 0
+            if _open_windows_open_with_dialog(path, owner_hwnd=owner):
+                self.status_bar.showMessage("Choose an app to open this file", 2500)
+            else:
+                self.status_bar.showMessage("Open With unavailable for this file", 3500)
+
+        # Defer so the shell dialog is not opened re-entrantly from the click handler.
+        QTimer.singleShot(0, _show_open_with_dialog)
+
     def _share_current_image_os(self):
-        """Open the system share sheet (macOS / Windows) for the current file path."""
+        """Open the macOS share sheet for the current file path."""
         p = getattr(self, "current_file_path", None)
         if not p or not os.path.isfile(p):
             self.status_bar.showMessage("No file to share", 2000)
@@ -11836,26 +12297,44 @@ class RAWImageViewer(QMainWindow):
             if self._share_macos(path):
                 self.status_bar.showMessage("Share", 1500)
                 return
-        elif sys.platform == "win32":
-            QTimer.singleShot(0, lambda fp=path: self._share_windows_ui_chain(fp))
-            return
         self._copy_current_file_path_to_clipboard()
         self.status_bar.showMessage("Share unavailable — path copied to clipboard", 4000)
 
-    def _share_windows_ui_chain(self, path: str):
-        """Run after the next event-loop tick so Shell share UI can attach to a pumped UI thread."""
-        owner = 0
+    def _share_windows_owner_hwnd(self) -> int:
+        """Return a usable top-level HWND for anchoring the share UI."""
+        try:
+            self.raise_()
+            self.activateWindow()
+            app = QApplication.instance()
+            if app is not None:
+                app.processEvents()
+        except Exception:
+            pass
         wh = self.windowHandle()
         if wh is not None:
             try:
                 owner = int(wh.winId())
+                if owner:
+                    return owner
             except Exception:
-                owner = 0
-        if owner == 0:
-            try:
-                owner = int(self.effectiveWinId())
-            except Exception:
-                owner = 0
+                pass
+        try:
+            return int(self.effectiveWinId())
+        except Exception:
+            return 0
+
+    def _share_windows_ui_chain(self, path: str):
+        """Open the Windows share sheet for a file path."""
+        owner = self._share_windows_owner_hwnd()
+        # Prefer the bundled .NET helper: it uses CsWinRT's MarshalInterface.FromAbi to
+        # project the DataTransferManager, which the in-process Python WinRT path cannot do
+        # on pywinrt 3.x (raw ABI pointers are not projectable from Python).
+        if _share_windows_via_helper(path, owner):
+            self.status_bar.showMessage("Share", 1500)
+            return
+        if _share_windows_via_winrt(path, owner):
+            self.status_bar.showMessage("Share", 1500)
+            return
         if self._share_windows_shell(path, owner):
             self.status_bar.showMessage("Share", 1500)
             return
@@ -11891,21 +12370,9 @@ class RAWImageViewer(QMainWindow):
             return False
 
     def _share_windows_shell(self, path: str, owner_hwnd: int = 0) -> bool:
-        """Invoke Windows share where available.
-
-        Microsoft documents programmatic sharing for desktop apps via WinRT
-        ``DataTransferManager`` + ``IDataTransferManagerInterop`` (GetForWindow /
-        ShowShareUIForWindow), not via the legacy Explorer ``share`` shell verb:
-        https://learn.microsoft.com/en-us/windows/apps/develop/ui/display-ui-objects
-
-        Calling ``ShellExecute*`` with verb ``share`` often raises Win32 error 1155 /
-        "no application is associated with this file" for many paths (including
-        common image types) because that verb is not a guaranteed shell association.
-        We therefore avoid ShellExecute-based share here and rely on Explorer COM
-        verbs first, then clipboard fallbacks in ``_share_windows_ui_chain``.
-        """
+        """Legacy Explorer shell verb fallback when WinRT share is unavailable."""
         abs_path = _norm_path(os.path.abspath(path))
-        _ = owner_hwnd  # reserved for a future WinRT (IDataTransferManagerInterop) implementation
+        _ = owner_hwnd
         try:
             import win32com.client  # type: ignore
 
@@ -12075,6 +12542,12 @@ class RAWImageViewer(QMainWindow):
                 self.loading_overlay.hide_loading()
             return
 
+        # New content is arriving (thumbnail/preview/full upgrade or navigation). Request a
+        # one-shot cross-fade; it is consumed by the next _set_single_view_pixmap() in this
+        # synchronous call chain. Reset defensively at the end so it can never leak to a
+        # later zoom/pan repaint.
+        self._crossfade_next_paint = True
+
         if getattr(self, "_slideshow_force_fit_next", False):
             sb = getattr(self, "slideshow_bottom_button", None)
             if sb is not None and sb.isChecked():
@@ -12100,6 +12573,52 @@ class RAWImageViewer(QMainWindow):
             self._manager_displayed_max_dim = max(
                 getattr(self, "_manager_displayed_max_dim", 0), pm_max
             )
+
+        # Route B: GPU view owns fit/zoom/pan. Push the full pixmap (GPU scales it) and let
+        # the QGraphicsView handle the transform. New file -> fit; same-file resolution
+        # upgrade -> preserve framing while zoomed.
+        if getattr(self, "gpu_view", None) is not None:
+            self._crossfade_next_paint = False
+            gv = self.gpu_view
+            cur_path = getattr(self, "current_file_path", None)
+            new_file = _norm_path(cur_path) != _norm_path(getattr(self, "_gpu_last_path", None))
+            maintain_zoom = (
+                getattr(self, "_preserve_nav_zoom_active", False)
+                or getattr(self, "_maintain_zoom_on_navigation", False)
+            )
+            if new_file:
+                # New image: fit by default, but keep the current zoom/scale when the user
+                # is navigating between images while zoomed in (legacy "maintain zoom").
+                gv.set_pixmap(pixmap, preserve_view=False)
+                if not (maintain_zoom and not gv.is_fit_mode()):
+                    gv.fit_to_window()
+            else:
+                # Same file (resolution upgrade): preserve framing while zoomed.
+                gv.set_pixmap(pixmap)
+            self._gpu_last_path = cur_path
+
+            # Focus/subject outline lives as a scene overlay; clear stale rect from the
+            # previous image, then let the scheduled refresh re-derive it for this one.
+            gv.clear_overlay()
+
+            # Navigation zoom-preserve flags are consumed here in GPU mode.
+            self._preserve_nav_zoom_active = False
+            if hasattr(self, "_maintain_zoom_on_navigation"):
+                try:
+                    delattr(self, "_maintain_zoom_on_navigation")
+                except AttributeError:
+                    pass
+
+            if getattr(self, "_pending_zoom_toggle", False):
+                self._pending_zoom_toggle = False
+                gv.toggle_fit()
+                if not gv.is_fit_mode():
+                    self._gpu_request_full_resolution_if_needed()
+            if hasattr(self, "loading_overlay"):
+                self.loading_overlay.hide_loading()
+            self._update_gpu_status()
+            self._maybe_refresh_focus_subject_outline_after_display()
+            return
 
         # Handle pending zoom toggle from spacebar/double click (when pixmap wasn't ready)
         if hasattr(self, '_pending_zoom_toggle') and self._pending_zoom_toggle:
@@ -13751,10 +14270,55 @@ class RAWImageViewer(QMainWindow):
             if hasattr(self, attr):
                 delattr(self, attr)
 
+    def _gpu_request_full_resolution_if_needed(self):
+        """When zooming in on the GPU view, request the full-res buffer if we only have a preview."""
+        try:
+            self._maybe_request_full_res_for_smooth_zoom()
+        except Exception:
+            pass
+
+    def _on_gpu_wheel_navigate(self, direction: int):
+        """Plain wheel while fit-to-window navigates images (legacy parity)."""
+        if direction > 0:
+            self.navigate_to_next_image()
+        else:
+            self.navigate_to_previous_image()
+
+    def _on_gpu_fit_mode_changed(self, fit_mode: bool):
+        # Keep legacy state roughly in sync for any code that still reads it.
+        self.fit_to_window = bool(fit_mode)
+        if not fit_mode:
+            self._gpu_request_full_resolution_if_needed()
+        self._update_gpu_status()
+
+    def _on_gpu_zoom_changed(self, scale: float):
+        self.current_zoom_level = float(scale)
+        self._update_gpu_status()
+
+    def _update_gpu_status(self):
+        gv = getattr(self, "gpu_view", None)
+        if gv is None or not gv.has_pixmap():
+            return
+        try:
+            if gv.is_fit_mode():
+                self.update_status_bar()
+            else:
+                pct = int(round(gv.current_scale() * 100))
+                self.update_status_bar()
+        except Exception:
+            pass
+
     def toggle_zoom(self):
         """Toggle between fit-to-window and 100% zoom modes"""
         import logging
         logger = logging.getLogger(__name__)
+        # Route B: GPU view manages its own fit/zoom transform.
+        if getattr(self, "gpu_view", None) is not None:
+            self._stop_slideshow()
+            self.gpu_view.toggle_fit()
+            if not self.gpu_view.is_fit_mode():
+                self._gpu_request_full_resolution_if_needed()
+            return
         # Allow toggle even if pixmap is not ready yet - check if image is loading
         if not self.current_pixmap:
             # If image is currently loading, wait a bit and try again
@@ -13878,7 +14442,12 @@ class RAWImageViewer(QMainWindow):
         """Scale image to fit the current window size while maintaining aspect ratio"""
         import logging
         logger = logging.getLogger(__name__)
-        
+
+        if getattr(self, "gpu_view", None) is not None:
+            self.gpu_view.fit_to_window()
+            self.fit_to_window = True
+            return
+
         if not self.current_pixmap:
             return
         
@@ -13920,7 +14489,13 @@ class RAWImageViewer(QMainWindow):
         """Display image at 100% zoom (actual pixel size)"""
         import logging
         logger = logging.getLogger(__name__)
-        
+
+        if getattr(self, "gpu_view", None) is not None:
+            self.gpu_view.zoom_to_actual()
+            self.fit_to_window = False
+            self._gpu_request_full_resolution_if_needed()
+            return
+
         if not self.current_pixmap:
             return
 
@@ -14450,6 +15025,7 @@ class RAWImageViewer(QMainWindow):
                 self.image_files = []
                 self._semantic_search_corpus_files = []
                 self._semantic_search_backup_files = None
+                self._semantic_search_result_paths = None
                 self._last_semantic_query = ""
                 self.current_file_index = -1
                 self.current_file_path = None
@@ -14463,6 +15039,7 @@ class RAWImageViewer(QMainWindow):
             # Keep semantic search corpus aligned with the currently scanned folder.
             self._semantic_search_corpus_files = list(self.image_files)
             self._semantic_search_backup_files = None
+            self._semantic_search_result_paths = None
             self._last_semantic_query = ""
 
             # Find current file index
@@ -14740,16 +15317,13 @@ class RAWImageViewer(QMainWindow):
             )
         if hasattr(self, "share_bottom_button"):
             vis = bool(self.image_files) and self.view_mode == "single"
-            # Share is not offered on Windows (no stable system share UX without WinRT interop).
-            self.share_bottom_button.setVisible(vis and sys.platform != "win32")
+            self.share_bottom_button.setVisible(vis)
             self.slideshow_bottom_button.setVisible(vis)
             cp = getattr(self, "current_file_path", None)
             show_rotate = bool(vis and cp and os.path.isfile(cp))
             self.rotate_bottom_button.setVisible(show_rotate)
         if hasattr(self, "search_bottom_button"):
-            self.search_bottom_button.setVisible(
-                bool(self.image_files) and self.view_mode == "gallery"
-            )
+            self.search_bottom_button.setVisible(bool(self.image_files))
 
         # Gallery mode should stay lightweight: avoid expensive per-image EXIF/status
         # recomputation (fallback reads can block UI and delay gallery paint).
@@ -15602,9 +16176,263 @@ class RAWImageViewer(QMainWindow):
         )
         return True
 
+    def _resolve_start_file_path(self, folder_path: str, start_file: str) -> str | None:
+        """Resolve start_file (basename or path) to an absolute file path in folder_path."""
+        if not folder_path or not start_file:
+            return None
+        if os.path.isabs(start_file) and os.path.isfile(start_file):
+            return os.path.abspath(start_file)
+        direct = os.path.join(folder_path, start_file)
+        if os.path.isfile(direct):
+            return os.path.abspath(direct)
+        base_norm = os.path.normcase(os.path.basename(start_file))
+        try:
+            with os.scandir(folder_path) as it:
+                for entry in it:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    if os.path.normcase(entry.name) == base_norm:
+                        return os.path.abspath(entry.path)
+        except OSError:
+            pass
+        return None
+
+    def _should_fast_open_single_file(self, start_file, start_view) -> bool:
+        """True when opening one file for single view (Explorer, drag-drop, Open File)."""
+        if not start_file:
+            return False
+        if start_view == "gallery":
+            return False
+        if start_view == "single":
+            return True
+        return getattr(self, "view_mode", "single") == "single"
+
+    def _mtime_sort_image_files(self, image_files, file_stats, newest_first=None):
+        """Order folder entries by file mtime (and RAW/JPEG tie-breakers); no EXIF reads."""
+        if not image_files:
+            return []
+        if newest_first is None:
+            newest_first = self.get_sort_preference()
+        sort_keys = {}
+        for fp in image_files:
+            mtime = file_stats.get(fp, (0, 0))[1]
+            base_name = os.path.basename(fp).lower()
+            stem = os.path.splitext(base_name)[0]
+            ext = os.path.splitext(base_name)[1]
+            raw_rank = 1 if is_raw_file(fp) else 0
+            primary_ts = -mtime if newest_first else mtime
+            sort_keys[fp] = (primary_ts, stem, raw_rank, ext, base_name)
+        return sorted(image_files, key=lambda fp: sort_keys[fp])
+
+    def _scan_folder_image_paths(self, folder_path: str):
+        """Yield absolute paths and file stats for supported images (top level only)."""
+        extensions = set(self.get_supported_extensions())
+        seen_paths = set()
+        for full_path, stat_info in self._scan_folder_generator(folder_path, extensions):
+            ap = os.path.abspath(full_path)
+            if ap in seen_paths:
+                continue
+            seen_paths.add(ap)
+            yield ap, stat_info
+
+    def _build_quick_folder_image_list(self, folder_path: str, start_path: str | None = None):
+        """Scandir + mtime sort only. Returns (image_files, file_stats, start_index)."""
+        image_files = []
+        file_stats = {}
+        for ap, stat_info in self._scan_folder_image_paths(folder_path):
+            image_files.append(ap)
+            file_stats[ap] = (stat_info.st_size, stat_info.st_mtime)
+
+        if not image_files:
+            if start_path:
+                return [os.path.abspath(start_path)], {}, 0
+            return [], {}, 0
+
+        image_files = self._mtime_sort_image_files(image_files, file_stats)
+        start_idx = 0
+        if start_path:
+            start_norm = _norm_path(start_path)
+            for i, fp in enumerate(image_files):
+                if _norm_path(fp) == start_norm:
+                    start_idx = i
+                    break
+        return image_files, file_stats, start_idx
+
+    def _start_quick_folder_index(self, folder_path: str, start_path: str, token: int) -> None:
+        """Background scandir to expand the fast-open navigation list before EXIF sort completes."""
+        signals = QuickFolderIndexSignals()
+        signals.ready.connect(self._on_quick_folder_index_ready)
+        self._active_quick_folder_index_signals = signals
+        viewer = self
+
+        class _QuickFolderIndexWorker(QRunnable):
+            def run(self_inner):
+                import time
+
+                try:
+                    t0 = time.time()
+                    files, stats, start_idx = viewer._build_quick_folder_image_list(
+                        folder_path, start_path
+                    )
+                    scan_s = time.time() - t0
+                    signals.ready.emit(token, files, stats, start_idx, scan_s)
+                except Exception:
+                    pass
+
+        QThreadPool.globalInstance().start(_QuickFolderIndexWorker())
+
+    def _on_quick_folder_index_ready(
+        self, token, image_files, file_stats, start_idx, scan_s
+    ) -> None:
+        if token != getattr(self, "_folder_load_generation", None):
+            return
+        if token != getattr(self, "_folder_fast_open_token", None):
+            return
+        if not image_files:
+            return
+
+        import logging
+
+        logger = logging.getLogger(__name__)
+        preserved = self.current_file_path
+        self.image_files = list(image_files)
+        self._semantic_search_corpus_files = list(image_files)
+        self._quick_folder_file_stats = file_stats
+
+        if preserved:
+            preserved_norm = _norm_path(preserved)
+            idx = start_idx
+            for i, fp in enumerate(image_files):
+                if _norm_path(fp) == preserved_norm:
+                    idx = i
+                    break
+            self.current_file_index = idx
+            self.current_file_path = image_files[idx]
+        else:
+            self.current_file_index = start_idx
+            self.current_file_path = image_files[start_idx]
+
+        self._sync_filmstrip_to_folder()
+        self.update_status_bar()
+        logger.info(
+            "[FOLDER] Quick folder index ready: %d images in %.3fs (navigation enabled)",
+            len(image_files),
+            scan_s,
+        )
+        if len(image_files) > 1:
+            self._schedule_folder_sort_refinement(token, file_stats)
+
+    def _apply_instant_single_file_open(self, folder_path: str, start_path: str, token: int) -> None:
+        """Show the requested image immediately while the folder scan continues in background."""
+        import logging
+
+        logger = logging.getLogger(__name__)
+        self._folder_fast_open_token = token
+        self.current_folder = folder_path
+        self.image_files = [start_path]
+        self._semantic_search_corpus_files = [start_path]
+        self.current_file_index = 0
+        self.current_file_path = start_path
+        self._quick_folder_file_stats = {}
+        self._filmstrip_warmed_paths = set()
+        self._gallery_bulk_metadata = {}
+        try:
+            if getattr(self, "image_manager", None) is not None:
+                self.image_manager.cancel_all_tasks()
+        except Exception:
+            pass
+        self._displayed_content_path = None
+        self._manager_display_track_path = None
+        self._manager_displayed_max_dim = 0
+        self._last_loaded_path = None
+        self._last_manager_exif_path = None
+        self._last_manager_exif_ts = 0.0
+        self.current_image = None
+        self.current_pixmap = None
+        self._is_half_size_displayed = False
+        self._full_resolution_loading = False
+        self._preserve_nav_zoom_active = False
+        self._pending_zoom_restore = False
+        self._restore_zoom_center = None
+        self._restore_zoom_level = None
+        if hasattr(self, "_maintain_zoom_on_navigation"):
+            try:
+                delattr(self, "_maintain_zoom_on_navigation")
+            except AttributeError:
+                pass
+        if hasattr(self, "image_label"):
+            self.image_label.clear()
+        if hasattr(self, "loading_overlay"):
+            self.loading_overlay.show_loading("Loading image...")
+        if getattr(self, "view_mode", "single") != "single":
+            self.view_mode = "single"
+        logger.info(
+            "[FOLDER] Fast single-file open: %s (quick index + EXIF sort continue in background)",
+            os.path.basename(start_path),
+        )
+        self._show_single_view()
+        self._start_quick_folder_index(folder_path, start_path, token)
+
+    def _schedule_folder_sort_refinement(self, token: int, file_stats: dict) -> None:
+        """Refine mtime-based folder order to EXIF capture-time order in the background."""
+        if token != getattr(self, "_folder_load_generation", None):
+            return
+        if getattr(self, "_folder_sort_refinement_token", None) == token:
+            return
+        paths = list(getattr(self, "image_files", []) or [])
+        if len(paths) <= 1:
+            return
+        self._folder_sort_refinement_token = token
+        newest_first = self.get_sort_preference()
+        viewer = self
+
+        class _FolderSortRefineWorker(QRunnable):
+            def run(self_inner):
+                try:
+                    sorted_files, bulk_metadata = viewer.sort_files_by_capture_time(
+                        paths,
+                        newest_first=newest_first,
+                        file_stats=file_stats,
+                    )
+                except Exception:
+                    return
+
+                def _apply():
+                    viewer._apply_folder_sort_refinement(token, sorted_files, bulk_metadata)
+
+                QTimer.singleShot(0, _apply)
+
+        QThreadPool.globalInstance().start(_FolderSortRefineWorker())
+
+    def _apply_folder_sort_refinement(self, token: int, sorted_files: list, bulk_metadata: dict) -> None:
+        if token != getattr(self, "_folder_load_generation", None):
+            return
+        if self._is_semantic_search_filter_active():
+            return
+        if not sorted_files:
+            return
+        preserved = self.current_file_path
+        self.image_files = sorted_files
+        self._semantic_search_corpus_files = list(sorted_files)
+        if bulk_metadata:
+            self._gallery_bulk_metadata = bulk_metadata
+        if preserved:
+            preserved_norm = _norm_path(preserved)
+            for i, fp in enumerate(sorted_files):
+                if _norm_path(fp) == preserved_norm:
+                    self.current_file_index = i
+                    self.current_file_path = fp
+                    break
+        self._sync_filmstrip_to_folder()
+        self.update_status_bar()
+        if getattr(self, "view_mode", "single") == "gallery":
+            self._update_gallery_view()
+
     def _on_folder_load_error(self, token, title, message):
         if token != getattr(self, "_folder_load_generation", None):
             return
+        if getattr(self, "_folder_fast_open_token", None) == token:
+            self._folder_fast_open_token = None
         self._active_folder_load_worker = None
         self._active_folder_load_signals = None
         self._folder_fast_open_path = None
@@ -15622,6 +16450,10 @@ class RAWImageViewer(QMainWindow):
         apply_start = time.time()
         self._active_folder_load_worker = None
         self._active_folder_load_signals = None
+        was_fast_open = getattr(self, "_folder_fast_open_token", None) == token
+        if was_fast_open:
+            self._folder_fast_open_token = None
+        preserved_path = self.current_file_path if was_fast_open else None
 
         try:
             extensions = self.get_supported_extensions()
@@ -15648,7 +16480,7 @@ class RAWImageViewer(QMainWindow):
             self._semantic_search_corpus_files = list(image_files)
             self._filmstrip_warmed_paths = set()
             self._gallery_bulk_metadata = bulk_metadata
-            if not keep_visible_image:
+            if not was_fast_open:
                 # Folder switched: invalidate render/task state from previous folder so
                 # stale async callbacks cannot keep the old content visible.
                 try:
@@ -15692,7 +16524,14 @@ class RAWImageViewer(QMainWindow):
                     pass
 
             try:
-                if start_file:
+                idx = 0
+                if preserved_path:
+                    preserved_norm = _norm_path(preserved_path)
+                    for i, img_file in enumerate(self.image_files):
+                        if _norm_path(img_file) == preserved_norm:
+                            idx = i
+                            break
+                elif start_file:
                     start_file_path = None
                     # Windows-friendly matching for file-open/folder-switch flows:
                     # caller may pass full path, basename, or different casing/slashes.
@@ -15724,6 +16563,13 @@ class RAWImageViewer(QMainWindow):
                 self.current_file_index = 0
                 self.current_file_path = self.image_files[0] if self.image_files else None
 
+            skip_single_reload = bool(
+                was_fast_open
+                and preserved_path
+                and self.current_file_path
+                and _norm_path(preserved_path) == _norm_path(self.current_file_path)
+            )
+
             if hasattr(self, 'view_mode') and self.view_mode == 'gallery' and getattr(self, 'gallery_justified', None):
                 self.gallery_justified.show_loading_message("Preparing gallery...")
 
@@ -15737,13 +16583,15 @@ class RAWImageViewer(QMainWindow):
                 QTimer.singleShot(120, self._update_gallery_view)
                 if getattr(self, "_gallery_restore_after_folder_load", None):
                     QTimer.singleShot(150, self._apply_gallery_restore_after_folder_load)
-            elif keep_visible_image:
+            elif skip_single_reload:
                 QTimer.singleShot(0, self._sync_filmstrip_to_folder)
                 self.update_status_bar()
-                if hasattr(self, 'gallery_justified') and self.gallery_justified:
-                    self.gallery_justified._background_loading_active = False
-                    if hasattr(self.gallery_justified, '_load_timer') and self.gallery_justified._load_timer:
-                        self.gallery_justified._load_timer.stop()
+                logger.info(
+                    "[FOLDER] Folder index ready (%d images); kept fast-opened image on screen",
+                    len(self.image_files),
+                )
+                if len(self.image_files) > 1:
+                    self._schedule_folder_sort_refinement(token, file_stats)
             else:
                 self._show_single_view()
                 QTimer.singleShot(0, self._sync_filmstrip_to_folder)
@@ -15799,10 +16647,18 @@ class RAWImageViewer(QMainWindow):
                 # Legacy behavior: opening a specific file from gallery focuses single view.
                 self.view_mode = "single"
 
-            self._folder_fast_open_path = None
-            fast_open_active = False
-            if start_file and getattr(self, "view_mode", "single") == "single":
-                fast_open_active = self._try_fast_open_start_image(folder_path, start_file)
+            self._folder_load_generation = getattr(self, "_folder_load_generation", 0) + 1
+            token = self._folder_load_generation
+            extensions = set(self.get_supported_extensions())
+            newest_first = self.get_sort_preference()
+
+            fast_open = self._should_fast_open_single_file(start_file, start_view)
+            if fast_open:
+                start_path = self._resolve_start_file_path(folder_path, start_file)
+                if start_path:
+                    self._apply_instant_single_file_open(folder_path, start_path, token)
+                else:
+                    fast_open = False
 
             if hasattr(self, 'view_mode'):
                 if self.view_mode == 'gallery':
@@ -15813,21 +16669,19 @@ class RAWImageViewer(QMainWindow):
                         self.gallery_justified.show_loading_message("Scanning folder...")
                     if hasattr(self, 'gallery_widget') and self.gallery_widget:
                         self.gallery_widget.show()
-                elif not fast_open_active:
+                elif not fast_open:
                     if hasattr(self, 'loading_overlay'):
-                        self.loading_overlay.show_loading("Scanning folder...")
-                    if hasattr(self, 'image_label'):
+                        if not fast_open:
+                            self.loading_overlay.show_loading("Scanning folder...")
+                    if hasattr(self, 'image_label') and not fast_open:
                         self.image_label.clear()
-
-            self._folder_load_generation = getattr(self, "_folder_load_generation", 0) + 1
-            token = self._folder_load_generation
-            extensions = set(self.get_supported_extensions())
-            newest_first = self.get_sort_preference()
 
             signals = FolderLoadSignals()
             signals.ready.connect(self._on_folder_load_ready)
             signals.error.connect(self._on_folder_load_error)
             self._active_folder_load_signals = signals
+            self._folder_sort_refinement_token = None
+            viewer = self
 
             class _FolderLoadWorker(QRunnable):
                 def __init__(self_inner, token, folder_path, extensions, newest_first,
@@ -15848,14 +16702,9 @@ class RAWImageViewer(QMainWindow):
                         scan_start = time.time()
                         image_files = []
                         file_stats = {}
-                        seen_paths = set()
-                        for full_path, stat_info in RAWImageViewer._iter_folder_images_shallow(
-                            self_inner.folder_path, self_inner.extensions
+                        for ap, stat_info in viewer._scan_folder_image_paths(
+                            self_inner.folder_path
                         ):
-                            ap = os.path.abspath(full_path)
-                            if ap in seen_paths:
-                                continue
-                            seen_paths.add(ap)
                             image_files.append(ap)
                             file_stats[ap] = (stat_info.st_size, stat_info.st_mtime)
 
@@ -15864,32 +16713,37 @@ class RAWImageViewer(QMainWindow):
                         sort_start = time.time()
                         bulk_metadata = {}
                         if image_files:
-                            from image_cache import get_image_cache
-                            cache = get_image_cache()
-                            bulk_metadata = cache.get_multiple_exif(image_files, file_stats)
-
                             from common_image_loader import capture_timestamp_for_sort
 
-                            sort_keys = {}
-                            for fp in image_files:
-                                meta = bulk_metadata.get(fp)
-                                mtime = file_stats.get(fp, (0, 0))[1]
-                                timestamp = capture_timestamp_for_sort(
-                                    fp, meta, mtime, probe_file=False
+                            if self_inner.start_file:
+                                image_files = viewer._mtime_sort_image_files(
+                                    image_files, file_stats, self_inner.newest_first
                                 )
-                                base_name = os.path.basename(fp).lower()
-                                stem = os.path.splitext(base_name)[0]
-                                ext = os.path.splitext(base_name)[1]
-                                # Keep DNG+JPEG backup pairs adjacent while preferring
-                                # display-friendly non-RAW variants first.
-                                raw_rank = 1 if is_raw_file(fp) else 0
-                                primary_ts = -timestamp if self_inner.newest_first else timestamp
-                                sort_keys[fp] = (primary_ts, stem, raw_rank, ext, base_name)
+                            else:
+                                from image_cache import get_image_cache
+                                cache = get_image_cache()
+                                bulk_metadata = cache.get_multiple_exif(image_files, file_stats)
 
-                            image_files = sorted(
-                                image_files,
-                                key=lambda fp: sort_keys[fp],
-                            )
+                                sort_keys = {}
+                                for fp in image_files:
+                                    meta = bulk_metadata.get(fp)
+                                    mtime = file_stats.get(fp, (0, 0))[1]
+                                    timestamp = capture_timestamp_for_sort(
+                                        fp, meta, mtime, probe_file=True
+                                    )
+                                    base_name = os.path.basename(fp).lower()
+                                    stem = os.path.splitext(base_name)[0]
+                                    ext = os.path.splitext(base_name)[1]
+                                    # Keep DNG+JPEG backup pairs adjacent while preferring
+                                    # display-friendly non-RAW variants first.
+                                    raw_rank = 1 if is_raw_file(fp) else 0
+                                    primary_ts = -timestamp if self_inner.newest_first else timestamp
+                                    sort_keys[fp] = (primary_ts, stem, raw_rank, ext, base_name)
+
+                                image_files = sorted(
+                                    image_files,
+                                    key=lambda fp: sort_keys[fp],
+                                )
                         sort_time = time.time() - sort_start
 
                         self_inner.signals.ready.emit(
@@ -16402,7 +17256,7 @@ def main():
             # 4. Continue with initialization
             if is_windows:
                 safe_print("  [Windows] Setting AppUserModelID...", flush=True)
-                myappid = 'RAWviewer.2.0.1'
+                myappid = 'SkySpotter.2.0.1'
                 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
                 safe_print("  [Windows] AppUserModelID set", flush=True)
 
