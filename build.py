@@ -212,7 +212,7 @@ def install_dependencies():
         # Windows semantic backend will move to ONNX
         dependencies.append('onnxruntime-directml')
         dependencies.append('mediapipe')
-        dependencies.append('opencv-python-headless')
+        dependencies.append('opencv-contrib-python')
     elif system_name == "Darwin":
         dependencies.append('onnxruntime-silicon')
         dependencies.append('huggingface-hub')
@@ -285,8 +285,59 @@ def _darwin_preflight_pyexiv2_import() -> None:
         sys.exit(1)
 
 
+def apply_build_feature_flags(*, enable_blur_score: bool | None = None) -> None:
+    """Write config/skyspotter_features.json before packaging."""
+    script = REPO_ROOT / "scripts" / "set_features.py"
+    if not script.is_file():
+        print(f"[WARNING] Missing {script}; skipping feature flag update")
+        return
+    if enable_blur_score is True:
+        cmd = [sys.executable, str(script), "--copy-experimental"]
+        label = "experimental (blur_score on)"
+    elif enable_blur_score is False:
+        cmd = [sys.executable, str(script), "--blur-score", "off"]
+        label = "default (blur_score off)"
+    else:
+        env = os.environ.get("SkySpotter_BUILD_ENABLE_BLUR_SCORE", "").strip().lower()
+        if env in ("1", "true", "yes", "on"):
+            cmd = [sys.executable, str(script), "--copy-experimental"]
+            label = "experimental (blur_score on, from env)"
+        elif env in ("0", "false", "no", "off"):
+            cmd = [sys.executable, str(script), "--blur-score", "off"]
+            label = "default (blur_score off, from env)"
+        else:
+            return
+    print(f"[INFO] Applying build feature flags: {label}")
+    if not run_command(cmd):
+        print("[WARNING] Feature flag update failed; continuing with existing config")
+
+
 def main():
     ensure_project_venv_and_reexec()
+
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Build SkySpotter installer / executable")
+    parser.add_argument(
+        "--enable-blur-score",
+        action="store_true",
+        help="Bake experimental blur scoring into config/skyspotter_features.json for this build",
+    )
+    parser.add_argument(
+        "--disable-blur-score",
+        action="store_true",
+        help="Ensure blur scoring is off in config/skyspotter_features.json (default release)",
+    )
+    args, _unknown = parser.parse_known_args()
+    if args.enable_blur_score and args.disable_blur_score:
+        print("[ERROR] Use only one of --enable-blur-score / --disable-blur-score")
+        sys.exit(1)
+    if args.enable_blur_score:
+        apply_build_feature_flags(enable_blur_score=True)
+    elif args.disable_blur_score:
+        apply_build_feature_flags(enable_blur_score=False)
+    else:
+        apply_build_feature_flags(enable_blur_score=None)
 
     system_name = platform.system()
     if system_name == 'Windows':
@@ -414,7 +465,8 @@ def main():
     # Add --add-data for imageformats and icons directory
     add_data_args = [
         f'--add-data "{imageformats_src}{add_data_sep}imageformats"',
-        f'--add-data "icons{add_data_sep}icons"'
+        f'--add-data "icons{add_data_sep}icons"',
+        f'--add-data "config{add_data_sep}config"',
     ]
     if platform.system() == "Darwin":
         m2 = Path("models/mobileclip2_coreml")
@@ -623,6 +675,7 @@ def build_installer():
         f"src{os.pathsep}src",
         f"scripts{os.pathsep}scripts",
         f"icons{os.pathsep}icons",
+        f"config{os.pathsep}config",
         f"pixi.toml{os.pathsep}.",
         f"pixi.lock{os.pathsep}.",
         f"uninstall.bat{os.pathsep}.",

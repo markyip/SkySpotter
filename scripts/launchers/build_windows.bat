@@ -18,7 +18,16 @@ echo Checking MobileCLIP2 ONNX models...
 python scripts/download_mobileclip_onnx.py
 
 echo Installing dependencies...
-pip install --upgrade PyQt6 rawpy send2trash pyinstaller natsort exifread pyexiv2 Pillow psutil numpy qtawesome pyqtgraph onnxruntime-directml reverse-geocoder pycountry pywin32 opencv-python-headless
+pip install --upgrade PyQt6 rawpy send2trash pyinstaller natsort exifread pyexiv2 Pillow psutil numpy qtawesome pyqtgraph onnxruntime-directml reverse-geocoder pycountry pywin32 opencv-contrib-python
+python scripts/pixi_fix_opencv.py
+
+echo Optional: enable experimental blur scoring for this build (default OFF)
+if /I "%SkySpotter_BUILD_ENABLE_BLUR_SCORE%"=="1" (
+  echo Building with experimental blur scoring enabled...
+  python scripts/set_features.py --copy-experimental
+) else (
+  python scripts/set_features.py --blur-score off
+)
 
 echo Checking for running SkySpotter instances...
 taskkill /F /IM SkySpotter.exe /T >nul 2>&1
@@ -36,7 +45,11 @@ if exist dist (
 if exist *.spec del /q *.spec 2>nul
 
 echo Building SkySpotter...
-python build.py
+if /I "%SkySpotter_BUILD_ENABLE_BLUR_SCORE%"=="1" (
+  python build.py --enable-blur-score
+) else (
+  python build.py --disable-blur-score
+)
 if %errorlevel% neq 0 (
     echo.
     echo [ERROR] Build failed! Check the error messages above.

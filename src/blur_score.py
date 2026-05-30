@@ -1,9 +1,10 @@
 """
-Sharpness score for gallery filters (sharp / blurry).
+Experimental sharpness score for gallery filters (sharp / blurry).
 
-Laplacian variance on a downscaled frame **without** rembg: EXIF / maker focus ROI when
-available, else a central crop, else the full thumbnail. ViT classification still uses
-rembg separately. Higher score = sharper.
+**Disabled by default** — set ``SkySpotter_ENABLE_BLUR_SCORE=1`` to index scores and
+use search tokens. See README (Experimental features).
+
+Laplacian variance on a downscaled ``subject_rect`` crop (original RGB + rembg bbox).
 """
 
 from __future__ import annotations
@@ -18,6 +19,13 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+def blur_score_enabled() -> bool:
+    """See ``skyspotter_features.blur_score_enabled()``."""
+    from skyspotter_features import blur_score_enabled as _enabled
+
+    return _enabled()
 
 
 def blur_blurry_fraction() -> float:
@@ -77,9 +85,9 @@ def filter_rows_by_blur_rank(
 
 def blur_index_max_size() -> int:
     try:
-        return max(128, int(os.environ.get("SkySpotter_BLUR_MAX_SIZE", "1280")))
+        return max(128, int(os.environ.get("SkySpotter_BLUR_MAX_SIZE", "1920")))
     except (TypeError, ValueError):
-        return 1280
+        return 1920
 
 
 def center_crop_fraction() -> float:
@@ -87,6 +95,68 @@ def center_crop_fraction() -> float:
         return max(0.3, min(1.0, float(os.environ.get("SkySpotter_BLUR_CENTER_FRACTION", "0.7"))))
     except (TypeError, ValueError):
         return 0.7
+
+
+def subject_bbox_pad_fraction() -> float:
+    try:
+        return max(0.0, min(0.5, float(os.environ.get("SkySpotter_BLUR_SUBJECT_BBOX_PAD", "0.08"))))
+    except (TypeError, ValueError):
+        return 0.08
+
+
+def bbox_from_rgba_alpha(
+    rgba_image: Image.Image, threshold: int = 20
+) -> Optional[Tuple[int, int, int, int]]:
+    """Return (left, top, right, bottom) from rembg alpha; right/bottom are exclusive."""
+    import numpy as np
+
+    if rgba_image is None or rgba_image.mode != "RGBA":
+        return None
+    alpha = np.asarray(rgba_image.split()[-1], dtype=np.uint8)
+    ys, xs = np.where(alpha > threshold)
+    if ys.size == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def crop_rgb_by_bbox(
+    rgb_image: Image.Image,
+    bbox: Tuple[int, int, int, int],
+    pad_fraction: Optional[float] = None,
+) -> Optional[Image.Image]:
+    """Pad bbox and crop original RGB (no background removal)."""
+    if rgb_image is None or bbox is None:
+        return None
+    left, top, right, bottom = bbox
+    w, h = rgb_image.size
+    bw = max(1, right - left)
+    bh = max(1, bottom - top)
+    frac = subject_bbox_pad_fraction() if pad_fraction is None else float(pad_fraction)
+    pad_l = int(round(bw * frac))
+    pad_t = int(round(bh * frac))
+    pad_r = pad_l
+    pad_b = pad_t
+    left = max(0, left - pad_l)
+    top = max(0, top - pad_t)
+    right = min(w, right + pad_r)
+    bottom = min(h, bottom + pad_b)
+    if right - left < 32 or bottom - top < 32:
+        return None
+    return rgb_image.crop((left, top, right, bottom))
+
+
+def subject_rect_crop_rgb(
+    src_rgb: Image.Image, rgba_for_bbox: Image.Image
+) -> Optional[Image.Image]:
+    """Crop ``src_rgb`` to rembg alpha bbox; keeps natural background inside the rect."""
+    if src_rgb is None or rgba_for_bbox is None:
+        return None
+    if src_rgb.size != rgba_for_bbox.size:
+        return None
+    bbox = bbox_from_rgba_alpha(rgba_for_bbox)
+    if bbox is None:
+        return None
+    return crop_rgb_by_bbox(src_rgb, bbox)
 
 
 def _orientation_for_path(file_path: str) -> int:
@@ -181,43 +251,35 @@ def center_crop_rgb(rgb_image: Image.Image, fraction: Optional[float] = None) ->
 
 
 def compute_blur_score_for_index(
-    file_path: str, rgb_image: Image.Image
+    file_path: str,
+    rgb_image: Image.Image,
+    *,
+    rgba_for_bbox: Optional[Image.Image] = None,
 ) -> Tuple[Optional[float], str]:
     """
-    Laplacian sharpness without rembg.
+    Laplacian sharpness on a ``subject_rect`` crop of original RGB (no white compositing).
 
-    Returns (score, region tag): ``exif``, ``center``, or ``full``.
+    Requires ``rgba_for_bbox`` from ``prepare_subject_pipeline``. Returns (None, \"\") when
+    the subject bbox cannot be derived.
     """
-    if rgb_image is None:
+    if rgb_image is None or rgba_for_bbox is None:
         return None, ""
     w, h = rgb_image.size
     if w < 8 or h < 8:
         return None, ""
 
-    exif_crop = exif_focus_crop_rgb(file_path, rgb_image)
-    if exif_crop is not None:
-        score = laplacian_sharpness_from_rgb(exif_crop)
+    subject_crop = subject_rect_crop_rgb(rgb_image, rgba_for_bbox)
+    if subject_crop is None or min(subject_crop.size) < 32:
         logger.debug(
-            "[BLUR] score=%.1f region=exif file=%s",
-            score,
-            os.path.basename(file_path),
+            "[BLUR] no subject_rect for %s",
+            os.path.basename(file_path or ""),
         )
-        return score, "exif"
+        return None, ""
 
-    center = center_crop_rgb(rgb_image)
-    if min(center.size) >= 32:
-        score = laplacian_sharpness_from_rgb(center)
-        logger.debug(
-            "[BLUR] score=%.1f region=center file=%s",
-            score,
-            os.path.basename(file_path),
-        )
-        return score, "center"
-
-    score = laplacian_sharpness_from_rgb(rgb_image)
+    score = laplacian_sharpness_from_rgb(subject_crop)
     logger.debug(
-        "[BLUR] score=%.1f region=full file=%s",
+        "[BLUR] score=%.1f region=subject_rect file=%s",
         score,
-        os.path.basename(file_path),
+        os.path.basename(file_path or ""),
     )
-    return score, "full"
+    return score, "subject_rect"

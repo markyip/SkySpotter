@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""POC: Laplacian blur scores (EXIF ROI / center / full — no rembg)."""
+"""POC: Laplacian blur scores (subject_rect on original RGB @ 1920, shared rembg bbox)."""
 
 from __future__ import annotations
 
@@ -34,11 +34,21 @@ def main() -> int:
         help="Write CSV (default: <folder>/blur_scores.csv)",
     )
     parser.add_argument("--limit", type=int, default=0, help="Max files (0 = all)")
+    parser.add_argument(
+        "--max-size",
+        type=int,
+        default=0,
+        help="Max thumbnail side (0 = SkySpotter_BLUR_MAX_SIZE default)",
+    )
     args = parser.parse_args()
     folder = os.path.abspath(args.folder)
     if not os.path.isdir(folder):
         print(f"Not a folder: {folder}", file=sys.stderr)
         return 1
+
+    from poc_cv2 import ensure_cv2
+
+    ensure_cv2()
 
     from blur_score import (
         blur_blurry_fraction,
@@ -46,20 +56,24 @@ def main() -> int:
         blur_rank_blurry_count,
         compute_blur_score_for_index,
     )
-    from semantic_search import _load_index_source_image
+    from semantic_search import MilitaryAircraftClassifier
 
     blurry_frac = blur_blurry_fraction()
-    max_size = blur_index_max_size()
+    max_size = args.max_size if args.max_size > 0 else blur_index_max_size()
+    os.environ["SkySpotter_BLUR_MAX_SIZE"] = str(max_size)
 
-    rows: list[tuple[float | None, str, str, str]] = []
     paths = list(iter_images(folder))
     if args.limit > 0:
         paths = paths[: args.limit]
 
     print(f"Scanning {len(paths)} images under:\n  {folder}\n")
     print(f"Rating: bottom {blurry_frac * 100:.0f}% of folder = blurry (relative rank)")
-    print(f"Mode: Laplacian on EXIF focus ROI, else center crop (max side {max_size}, no rembg)\n")
+    print(
+        f"Mode: Laplacian on subject_rect (original RGB, rembg bbox, max side {max_size})\n"
+    )
 
+    clf = MilitaryAircraftClassifier()
+    rows: list[tuple[float | None, str, str, str]] = []
     t0 = time.perf_counter()
     for i, path in enumerate(paths, 1):
         rel = os.path.relpath(path, folder)
@@ -67,8 +81,11 @@ def main() -> int:
         region = ""
         note = ""
         try:
-            rgb = _load_index_source_image(path, max_size=max_size)
-            score, region = compute_blur_score_for_index(path, rgb)
+            src, rgba, _crop = clf.prepare_subject_pipeline(path, max_size)
+            if src is not None and rgba is not None:
+                score, region = compute_blur_score_for_index(path, src, rgba_for_bbox=rgba)
+            if score is None and not region:
+                note = "no_subject_rect"
         except Exception as exc:
             note = f"err:{exc.__class__.__name__}"
 
@@ -109,11 +126,14 @@ def main() -> int:
 
     sharp_n = sum(1 for _, _, lb, _ in rows if lb == "sharp")
     blurry_n = sum(1 for _, _, lb, _ in rows if lb == "blurry")
+    skipped = sum(1 for r in rows if r[0] < 0)
     by_region: dict[str, int] = {}
     for _, _, _, reg in rows:
-        if reg in ("exif", "center", "full"):
+        if reg == "subject_rect":
             by_region[reg] = by_region.get(reg, 0) + 1
-    print(f"\n--- Summary ---\n  sharp:  {sharp_n}\n  blurry: {blurry_n}")
+    print(
+        f"\n--- Summary ---\n  sharp:  {sharp_n}\n  blurry: {blurry_n}\n  skipped: {skipped}"
+    )
     print(f"  regions: {by_region}")
 
     print("\n--- Lowest 10 scores ---")

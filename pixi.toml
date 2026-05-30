@@ -9,12 +9,30 @@ platforms = ["win-64"]
 [tasks]
 start = "python src/main.py"
 start-windowless = "pythonw src/main.py"
+start-experimental = "python src/main.py"
 batch-test-classifier = "python scripts/batch_test_classifier.py"
 verify-model = "python scripts/batch_test_classifier.py"
 test-aircraft-model = "python scripts/batch_test_classifier.py"
+fix-opencv = "python scripts/pixi_fix_opencv.py"
+poc-blur-compare-modes = "python scripts/poc_blur_compare_modes.py"
+poc-blur-compare-sizes = "python scripts/poc_blur_compare_sizes.py"
+set-features-off = "python scripts/set_features.py --blur-score off"
+set-features-experimental = "python scripts/set_features.py --copy-experimental"
+features-show = "python scripts/set_features.py --show"
+
+[feature.experimental-blur]
+platforms = ["win-64"]
+
+[feature.experimental-blur.activation.env]
+SkySpotter_ENABLE_BLUR_SCORE = "1"
+
+[environments]
+default = { features = [], solve-group = "default" }
+experimental = { features = ["experimental-blur"], solve-group = "default" }
 
 [activation.env]
 PYTHONNOUSERSITE = "1"
+SkySpotter_FEATURES_FILE = "config/skyspotter_features.json"
 
 [dependencies]
 python = ">=3.10,<3.13"
@@ -38,7 +56,7 @@ pywin32 = "*"
 tokenizers = "*"
 sentencepiece = "*"
 mediapipe = "*"
-opencv-python-headless = "*"
+opencv-contrib-python = "*" # not opencv-python-headless (conflicts with mediapipe cv2)
 huggingface_hub = "*"
 requests = "*"
 rembg = "*"

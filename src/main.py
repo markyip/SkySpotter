@@ -467,7 +467,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QFileDialog,
                              QMessageBox, QScrollArea, QSizePolicy, QPushButton, QFrame,
                              QGridLayout, QScrollBar, QDialog, QSplashScreen, QInputDialog,
-                             QLineEdit, QStackedLayout)
+                             QLineEdit, QStackedLayout, QProgressDialog)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint, QEvent, QSettings, QSize, QRect, QObject, QRunnable, QThreadPool, QTimer, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import (QPixmap, QImage, QAction, QKeySequence, QShortcut, QGuiApplication,
                          QDragEnterEvent, QDropEvent, QCursor, QIcon,
@@ -6679,7 +6679,7 @@ class RAWImageViewer(QMainWindow):
 
         self.gallery_search_input = QLineEdit()
         self.gallery_search_input.setPlaceholderText(
-            "Filter gallery (camera:, aircraft:F-35, sharp, blurry, …)"
+            "Filter gallery (camera:, aircraft:F-35, …)"
         )
         self.gallery_search_input.setClearButtonEnabled(True)
         self.gallery_search_input.setMinimumWidth(140)
@@ -6939,6 +6939,172 @@ class RAWImageViewer(QMainWindow):
         if self._semantic_index is None:
             self._semantic_index = SemanticImageIndex()
         return self._semantic_index
+
+    def _project_root(self) -> str:
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _schedule_reindex_after_classifier_change(self) -> None:
+        corpus = list(
+            getattr(self, "_semantic_search_corpus_files", None)
+            or getattr(self, "image_files", [])
+            or []
+        )
+        if not corpus:
+            return
+        if getattr(self, "_semantic_indexing_in_progress", False):
+            return
+        try:
+            coverage = self._is_semantic_index_ready(corpus)
+            self._start_semantic_index_build_background(corpus, coverage=coverage)
+            self.status_bar.showMessage("Re-classifying aircraft after model change…", 5000)
+        except Exception as exc:
+            logger.warning("[MODEL] Could not restart indexing after classifier change: %s", exc)
+
+    def _maybe_check_gallery_classifier_update(self) -> None:
+        if getattr(self, "_classifier_update_checked", False):
+            return
+        self._classifier_update_checked = True
+
+        try:
+            index = self._get_semantic_index()
+        except Exception as exc:
+            logger.warning("[MODEL] Classifier update check skipped: %s", exc)
+            return
+
+        if getattr(index, "classifier_fingerprint_changed", False):
+            self._schedule_reindex_after_classifier_change()
+
+        try:
+            from gallery_classifier_version import check_official_update_status
+
+            status = check_official_update_status(self._project_root())
+        except Exception as exc:
+            logger.warning("[MODEL] Classifier update status unavailable: %s", exc)
+            return
+
+        if status.state != "update_available":
+            return
+
+        from PyQt6.QtWidgets import QMessageBox
+
+        reply = QMessageBox.question(
+            self,
+            "Gallery classifier update",
+            (
+                f"A newer official aircraft classifier is available "
+                f"(v{status.local_version} → v{status.remote_version}).\n\n"
+                "Download it now? Existing aircraft labels in this folder will be "
+                "re-computed after the update."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._download_gallery_classifier_update()
+
+    def _download_gallery_classifier_update(self) -> None:
+        if getattr(self, "_classifier_download_in_progress", False):
+            return
+        self._classifier_download_in_progress = True
+
+        progress = QProgressDialog(
+            "Downloading gallery classifier update…",
+            "",
+            0,
+            100,
+            self,
+        )
+        progress.setWindowTitle("Gallery classifier update")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.show()
+        self._classifier_download_progress = progress
+
+        project_root = self._project_root()
+
+        class _Signals(QObject):
+            progress = pyqtSignal(int, int, str)
+            finished = pyqtSignal(int)
+
+        class _Worker(QRunnable):
+            def __init__(self_inner, root_path: str, signals: _Signals):
+                super().__init__()
+                self_inner.root_path = root_path
+                self_inner.signals = signals
+
+            def run(self_inner):
+                try:
+                    from pathlib import Path
+
+                    from gallery_classifier_version import install_gallery_classifier
+
+                    def _report(done: int, total: int, phase: str) -> None:
+                        self_inner.signals.progress.emit(done, total, phase)
+
+                    code = install_gallery_classifier(
+                        Path(self_inner.root_path),
+                        update_if_older=True,
+                        progress_callback=_report,
+                    )
+                    self_inner.signals.finished.emit(int(code))
+                except Exception as exc:
+                    logger.error("[MODEL] Classifier download failed: %s", exc)
+                    self_inner.signals.finished.emit(1)
+
+        signals = _Signals()
+        worker = _Worker(project_root, signals)
+
+        def _on_progress(done: int, total: int, phase: str) -> None:
+            dlg = getattr(self, "_classifier_download_progress", None)
+            if dlg is None:
+                return
+            if phase == "download":
+                if total > 0:
+                    pct = min(90, int(done * 90 / total))
+                    mb_done = done / (1024 * 1024)
+                    mb_total = total / (1024 * 1024)
+                    dlg.setLabelText(
+                        f"Downloading gallery classifier update… "
+                        f"({mb_done:.1f} / {mb_total:.1f} MB)"
+                    )
+                    dlg.setValue(pct)
+                else:
+                    dlg.setLabelText("Downloading gallery classifier update…")
+            elif phase == "verify":
+                dlg.setLabelText("Verifying download…")
+                dlg.setValue(92)
+            elif phase in ("install", "complete"):
+                dlg.setLabelText("Installing gallery classifier…")
+                dlg.setValue(100)
+
+        def _on_done(code: int) -> None:
+            dlg = getattr(self, "_classifier_download_progress", None)
+            if dlg is not None:
+                dlg.close()
+                self._classifier_download_progress = None
+            self._classifier_download_in_progress = False
+            if code != 0:
+                self.status_bar.showMessage("Gallery classifier update failed", 6000)
+                return
+            self._semantic_index = None
+            try:
+                index = self._get_semantic_index()
+                if getattr(index, "classifier_fingerprint_changed", False):
+                    self._schedule_reindex_after_classifier_change()
+            except Exception as exc:
+                logger.warning("[MODEL] Post-update index refresh failed: %s", exc)
+            self.status_bar.showMessage(
+                "Gallery classifier updated; re-indexing aircraft labels",
+                6000,
+            )
+
+        signals.progress.connect(_on_progress, Qt.ConnectionType.QueuedConnection)
+        signals.finished.connect(_on_done, Qt.ConnectionType.QueuedConnection)
+        QThreadPool.globalInstance().start(worker)
 
     def _reset_semantic_search_for_new_folder(self):
         """Clear gallery search UI and stale query when the folder scope changes."""
@@ -16264,6 +16430,7 @@ def main():
             
             # Show main window and close splash screen
             viewer.show()
+            QTimer.singleShot(800, viewer._maybe_check_gallery_classifier_update)
             # macOS native title bar tweaks disabled for stability.
             if splash:
                 splash.finish(viewer)  # Close splash screen when main window is ready

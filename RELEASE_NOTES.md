@@ -12,17 +12,13 @@ Work in progress on the **SkySpotter** aviation specialist viewer—not yet tagg
 - Minimum crop size for classification uses a fraction of the source image (default 20% per axis) instead of a fixed pixel floor.
 - Faster open when launching on a single file: show that image first while the rest of the folder scans in the background.
 
-### Blur detection — sharp / blurry gallery filters (experimental)
+### Blur detection — sharp / blurry gallery filters (experimental, **disabled by default**)
 
-> **Experimental — reference only.** These features are under active tuning. Outputs are **not** guaranteed to match how sharp a photo looks to you; use them as a starting point for culling, not as ground truth.
+> **Experimental — reference only.** Not enabled in the default app build. Laplacian + subject-rect scoring did not match visual culling well enough in our tests. Enable with `SkySpotter_ENABLE_BLUR_SCORE=1` and re-index; see README **Experimental features**.
 
-- **`sharp` / `blurry` search tokens** filter the current gallery folder (or the current filter result) using an indexed **Laplacian sharpness score** on a downscaled frame—**no** separate blur ML model and **no** rembg for this step.
-- **ROI priority:** EXIF / maker focus area when available → else central crop (default 70%) → else full thumbnail (`SkySpotter_BLUR_MAX_SIZE`, default 1280 px).
-- **Folder-relative ranking:** the lowest-scoring fraction of indexed images in the active set is treated as **blurry** (default **20%**, `SkySpotter_BLUR_BLURRY_FRACTION=0.2`); the rest with scores count as **sharp**. Absolute cutoffs remain available via `blur>=N` / `blur<N` tokens (`SkySpotter_BLUR_SHARP_THRESHOLD` for legacy numeric filters only).
-- **Re-index** after upgrading blur logic so `blur_score` values in the semantic index match the new pipeline.
-- **POC:** `scripts/poc_blur_detect.py` writes `blur_scores.csv` for batch validation on a folder.
-
-Aircraft **type** labels still come from the ViT classifier (below); blur scoring is independent of that model.
+- **`sharp` / `blurry` search tokens** (when enabled) use indexed `blur_score` on a **`subject_rect`** crop of original RGB (rembg bbox).
+- **Folder-relative ranking:** lowest fraction = blurry (default **20%**, `SkySpotter_BLUR_BLURRY_FRACTION`).
+- **POC:** `scripts/poc_blur_detect.py` (requires `pixi run fix-opencv` for rembg).
 
 ### Models & installer
 

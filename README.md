@@ -173,8 +173,7 @@ Separate tokens with spaces. Filters use `key:value` or comparison forms.
 | Kind | Example |
 | --- | --- |
 | Aircraft label | `aircraft:F-35` or `Typhoon` (indexed `detected_aircraft`) |
-| Sharp / blurry | `sharp` · `blurry` (Laplacian score; **bottom 20%** of current folder = blurry; `SkySpotter_BLUR_BLURRY_FRACTION`) |
-| Filter combo | `camera:sony iso<800 aircraft:viper blurry` |
+| Filter combo | `camera:sony iso<800 aircraft:viper` |
 | Camera / lens | `camera:canon` · `lens:70-200` |
 | ISO / year | `iso<=800` · `year>=2024` |
 | Place | `city:tokyo` · `country:jp` · `admin:california` |
@@ -182,6 +181,62 @@ Separate tokens with spaces. Filters use `key:value` or comparison forms.
 | File format | `format:cr3` · `type:jpeg` · `format:raw` (see [`src/raw_file_extensions.py`](src/raw_file_extensions.py)) |
 | Date prefix | `date:2024-05` |
 | GPS | `has:gps` · `no:gps` |
+
+---
+
+## Experimental features
+
+These capabilities exist in the codebase but are **off by default**. We tried them in real airshow folders; results were **not reliable enough** for everyday culling (rankings did not always match how sharp a photo looks). You can still enable them to experiment on your own machine.
+
+### Blur detection (`sharp` / `blurry` gallery filters)
+
+Laplacian sharpness on a **`subject_rect`** crop of the original image (rembg bounding box, no white compositing), indexed as `blur_score`. Gallery tokens such as `sharp`, `blurry`, and `blur>=N` rank images within the current folder (default: bottom **20%** = blurry).
+
+**Default:** off — see [`config/skyspotter_features.json`](config/skyspotter_features.json) (`"blur_score": false`).
+
+Flags are resolved in order: **environment variable** → **features JSON file** → default (off).
+
+#### Development (Pixi / launchers)
+
+| Method | Command |
+| --- | --- |
+| Normal dev (blur off) | `pixi run start` or `scripts\launchers\launch_dev.bat` |
+| Experimental Pixi env | `pixi run -e experimental start` |
+| Experimental launcher | `scripts\launchers\launch_dev_experimental.bat` (Windows) / `launch_dev_experimental.sh` (macOS) |
+| One-off env override | `$env:SkySpotter_ENABLE_BLUR_SCORE = "1"` then `pixi run start` |
+| Write flags file | `pixi run set-features-experimental` or `pixi run set-features-off` |
+| Show active file | `pixi run features-show` |
+
+After enabling, **re-index** the folder so `blur_score` is written.
+
+#### Building the Windows app
+
+| Build type | How |
+| --- | --- |
+| **Release (blur off)** | `scripts\launchers\build_windows.bat` (writes `"blur_score": false` into the bundled config) |
+| **Experimental build** | `set SkySpotter_BUILD_ENABLE_BLUR_SCORE=1` then `build_windows.bat`, or `python build.py --enable-blur-score` |
+
+The installer bundles `config/skyspotter_features.json`; end users inherit whatever you baked at build time unless they override env vars.
+
+**Optional tuning**
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SkySpotter_BLUR_MAX_SIZE` | `1920` | Max thumbnail side for blur scoring |
+| `SkySpotter_BLUR_BLURRY_FRACTION` | `0.2` | Fraction ranked as blurry |
+| `SkySpotter_BLUR_SUBJECT_BBOX_PAD` | `0.08` | Padding around rembg bbox |
+| `SkySpotter_INDEX_MAX_SIZE` | `1280` | Classifier load size (independent unless you align with blur) |
+
+**POC scripts (batch validation, not required for normal use)**
+
+```powershell
+pixi run fix-opencv
+pixi run python scripts/poc_blur_detect.py "D:\path\to\photos"
+```
+
+See also `scripts/poc_blur_compare_modes.py` and `scripts/poc_blur_compare_sizes.py`. Implementation: [`src/blur_score.py`](src/blur_score.py).
+
+Treat scores as **reference only**, not ground truth.
 
 ---
 
@@ -472,7 +527,7 @@ Gallery search uses a local index (EXIF + aircraft labels written while the fold
 
 This project is licensed under the MIT License — see [LICENSE](LICENSE).
 
-**Third-party software and models** (ViT checkpoints, rembg / IS-Net, PyQt6, optional CLIP weights, etc.) are **not** covered by SkySpotter’s MIT license alone. See **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)** for copyrights, attribution, and redistribution requirements. Blur **sharp** / **blurry** filters use a Laplacian heuristic only (no extra model license).
+**Third-party software and models** (ViT checkpoints, rembg / IS-Net, PyQt6, optional CLIP weights, etc.) are **not** covered by SkySpotter’s MIT license alone. See **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)** for copyrights, attribution, and redistribution requirements.
 
 ## 🤝 Contributing
 

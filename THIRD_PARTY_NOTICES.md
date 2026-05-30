@@ -151,7 +151,7 @@ SkySpotter depends on many open-source packages via Pixi/conda-forge and PyPI. T
 
 ### Other dependencies
 
-A non-exhaustive list of runtime dependencies appears in `pixi.toml` (e.g. `torch`, `transformers`, `huggingface_hub`, `opencv-python-headless`, `mediapipe`, `Pillow`, `numpy`). Each package ships its own license metadata on PyPI or conda-forge. Use your environment’s license report tools (e.g. `pip-licenses`, `conda list --license`) for a complete bill of materials when preparing a release.
+A non-exhaustive list of runtime dependencies appears in `pixi.toml` (e.g. `torch`, `transformers`, `huggingface_hub`, `opencv-contrib-python`, `mediapipe`, `Pillow`, `numpy`). Each package ships its own license metadata on PyPI or conda-forge. Use your environment’s license report tools (e.g. `pip-licenses`, `conda list --license`) for a complete bill of materials when preparing a release.
 
 ---
 

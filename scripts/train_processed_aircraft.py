@@ -233,7 +233,10 @@ def train():
     print(f"\nSUCCESS! Model saved to {OUTPUT_DIR}")
     print("Next steps:")
     print("  1. pixi run batch-test-classifier   # test on testing_data/test_images/")
-    print("  2. When satisfied, copy checkpoint files to models/gallery-classifier/<your-id>/ for gallery use.")
+    print("  2. Copy the four checkpoint files into models/gallery-classifier/<your-id>/")
+    print("     or replace the default folder, then run:")
+    print("        pixi run python scripts/download_app_model.py --install-dir . --mark-custom")
+    print("     so SkySpotter will not auto-replace your trained model with a GitHub update.")
     print("You can run 'python scripts/plot_training_history.py --model-dir customized_model' for training curves.")
 
 if __name__ == "__main__":

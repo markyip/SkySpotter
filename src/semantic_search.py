@@ -2065,7 +2065,9 @@ class SemanticImageIndex:
         self._index_conn = None
         self._rg_lock = threading.Lock()
         self._logged_classifier_source = False
+        self.classifier_fingerprint_changed = False
         self._init_db_if_needed()
+        self._sync_classifier_fingerprint()
         self._stop_requested = False
 
     def _defer_face_scan_during_build(self) -> bool:
@@ -2210,9 +2212,80 @@ class SemanticImageIndex:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_semantic_ready_model ON semantic_index(semantic_ready, model_name)"
         )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
         self._conn.commit()
         # Backfill in a background thread to prevent UI freeze on large databases
         threading.Thread(target=self._backfill_file_signatures, daemon=True).start()
+
+    _APP_META_CLASSIFIER_FP = "classifier_fingerprint"
+
+    def _get_app_meta(self, key: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM app_meta WHERE key = ?", (key,)
+        ).fetchone()
+        return str(row[0]) if row else None
+
+    def _set_app_meta(self, key: str, value: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO app_meta (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+
+    def _invalidate_aircraft_classification_index(self) -> int:
+        cur = self._conn.execute(
+            """
+            UPDATE semantic_index
+            SET detected_aircraft = ''
+            WHERE COALESCE(detected_aircraft, '') != ''
+            """
+        )
+        return int(cur.rowcount or 0)
+
+    def _sync_classifier_fingerprint(self) -> bool:
+        """
+        Detect gallery ViT checkpoint changes and clear stale aircraft labels.
+
+        Returns True when the fingerprint changed since the last app session.
+        """
+        from gallery_classifier_version import (
+            compute_checkpoint_fingerprint,
+            project_root_from_module,
+            resolve_active_checkpoint_dir,
+        )
+
+        project_root = project_root_from_module()
+        checkpoint_dir = resolve_active_checkpoint_dir(project_root)
+        if checkpoint_dir is None:
+            return False
+
+        fingerprint = compute_checkpoint_fingerprint(checkpoint_dir)
+        if not fingerprint:
+            return False
+
+        previous = self._get_app_meta(self._APP_META_CLASSIFIER_FP)
+        changed = bool(previous and previous != fingerprint)
+        if changed:
+            cleared = self._invalidate_aircraft_classification_index()
+            logger.info(
+                "[INDEX] Gallery classifier changed (%s); cleared aircraft labels on %d row(s).",
+                checkpoint_dir.name,
+                cleared,
+            )
+            self.classifier_fingerprint_changed = True
+
+        self._set_app_meta(self._APP_META_CLASSIFIER_FP, fingerprint)
+        self._conn.commit()
+        return changed
 
     def _ensure_model(self):
         if self._model is not None:
@@ -3112,21 +3185,6 @@ class SemanticImageIndex:
                             )
                         except (TypeError, ValueError):
                             index_max = 1280
-                        try:
-                            from blur_score import blur_index_max_size, compute_blur_score_for_index
-
-                            blur_rgb = _load_index_source_image(
-                                canonical_fp, max_size=blur_index_max_size()
-                            )
-                            blur_score_val, _blur_region = compute_blur_score_for_index(
-                                canonical_fp, blur_rgb
-                            )
-                        except Exception as blur_exc:
-                            logger.debug(
-                                "[BLUR] Laplacian score failed for %s: %s",
-                                os.path.basename(canonical_fp),
-                                blur_exc,
-                            )
                         prog = (
                             lambda m, _i=i, _t=total_sem: progress_callback(_i, _t, m)
                             if progress_callback
@@ -3137,6 +3195,26 @@ class SemanticImageIndex:
                                 canonical_fp, index_max, progress_callback=prog
                             )
                         )
+                        # Experimental blur scoring (off by default). See blur_score.blur_score_enabled().
+                        try:
+                            from blur_score import blur_score_enabled, compute_blur_score_for_index
+
+                            if (
+                                blur_score_enabled()
+                                and _src is not None
+                                and _rgba is not None
+                            ):
+                                blur_score_val, _blur_region = compute_blur_score_for_index(
+                                    canonical_fp,
+                                    _src,
+                                    rgba_for_bbox=_rgba,
+                                )
+                        except Exception as blur_exc:
+                            logger.debug(
+                                "[BLUR] Laplacian score failed for %s: %s",
+                                os.path.basename(canonical_fp),
+                                blur_exc,
+                            )
                         if subject_crop is not None:
                             detected_aircraft = (
                                 self._aviation_classifier.classify_from_subject_crop(
@@ -3639,9 +3717,9 @@ class SemanticImageIndex:
         Parse a mixed query and filter rows.
 
         Supported filter tokens:
-        - sharp / blurry / blur:sharp / blur:blurry (indexed blur_score; bottom 20% of
-          current gallery/filter set = blurry; env SkySpotter_BLUR_BLURRY_FRACTION)
-        - blur>=N / blur>N / blur<=N / blur<N / blur=N (numeric Laplacian variance)
+        - sharp / blurry / blur:sharp / blur:blurry (experimental; requires
+          SkySpotter_ENABLE_BLUR_SCORE=1 and re-index)
+        - blur>=N / blur>N / blur<=N / blur<N / blur=N (experimental numeric Laplacian)
         - camera:<text>
         - lens:<text>
         - city:<text>
@@ -3726,11 +3804,12 @@ class SemanticImageIndex:
 
             if low in ("sharp", "blur:sharp", "focus:sharp", "infocus", "in-focus"):
                 matched = True
-                from blur_score import filter_rows_by_blur_rank
+                from blur_score import blur_score_enabled, filter_rows_by_blur_rank
 
-                filtered = filter_rows_by_blur_rank(
-                    filtered, self._row_blur_score, want="sharp"
-                )
+                if blur_score_enabled():
+                    filtered = filter_rows_by_blur_rank(
+                        filtered, self._row_blur_score, want="sharp"
+                    )
                 continue
 
             if low in (
@@ -3743,36 +3822,40 @@ class SemanticImageIndex:
                 "defocused",
             ):
                 matched = True
-                from blur_score import filter_rows_by_blur_rank
+                from blur_score import blur_score_enabled, filter_rows_by_blur_rank
 
-                filtered = filter_rows_by_blur_rank(
-                    filtered, self._row_blur_score, want="blurry"
-                )
+                if blur_score_enabled():
+                    filtered = filter_rows_by_blur_rank(
+                        filtered, self._row_blur_score, want="blurry"
+                    )
                 continue
 
             blur_cmp = re.match(r"^blur\s*(>=|>|<=|<|=)\s*(\d+(?:\.\d+)?)$", low)
             if blur_cmp:
                 matched = True
-                op, val_str = blur_cmp.group(1), blur_cmp.group(2)
-                val = float(val_str)
+                from blur_score import blur_score_enabled
 
-                def _blur_ok(score: float) -> bool:
-                    if op == "<":
-                        return score < val
-                    if op == "<=":
-                        return score <= val
-                    if op == ">":
-                        return score > val
-                    if op == ">=":
-                        return score >= val
-                    return abs(score - val) < 1e-6
+                if blur_score_enabled():
+                    op, val_str = blur_cmp.group(1), blur_cmp.group(2)
+                    val = float(val_str)
 
-                filtered = [
-                    r
-                    for r in filtered
-                    if self._row_blur_score(r) is not None
-                    and _blur_ok(self._row_blur_score(r))
-                ]
+                    def _blur_ok(score: float) -> bool:
+                        if op == "<":
+                            return score < val
+                        if op == "<=":
+                            return score <= val
+                        if op == ">":
+                            return score > val
+                        if op == ">=":
+                            return score >= val
+                        return abs(score - val) < 1e-6
+
+                    filtered = [
+                        r
+                        for r in filtered
+                        if self._row_blur_score(r) is not None
+                        and _blur_ok(self._row_blur_score(r))
+                    ]
                 continue
 
             if low.startswith("date:"):
