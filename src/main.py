@@ -465,7 +465,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QMessageBox, QScrollArea, QSizePolicy, QPushButton, QFrame,
                              QGridLayout, QScrollBar, QDialog, QSplashScreen, QInputDialog,
                              QLineEdit, QStackedLayout, QProgressDialog, QGraphicsOpacityEffect)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint, QEvent, QSettings, QSize, QRect, QObject, QRunnable, QThreadPool, QTimer, QPropertyAnimation, QEasingCurve
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint, QEvent, QSettings, QSize, QRect, QObject, QRunnable, QThreadPool, QTimer, QPropertyAnimation, QEasingCurve, QAbstractAnimation
 from PyQt6.QtGui import (QPixmap, QImage, QAction, QKeySequence, QShortcut, QGuiApplication,
                          QDragEnterEvent, QDropEvent, QCursor, QIcon,
                          QTransform, QRegion, QPainterPath, QPainter, QColor, QPen, QBrush, QPalette)
@@ -4224,6 +4224,45 @@ class CustomTitleBar(QFrame):
         self.title_label.setText(title)
 
 
+def center_dialog_on_parent(dialog: QWidget, parent: QWidget | None = None) -> None:
+    """Center a dialog on the main window (or primary screen), matching delete confirmation."""
+    anchor = parent if parent is not None else dialog.parentWidget()
+    app = QApplication.instance()
+    screen = app.primaryScreen() if app is not None else None
+    if anchor is not None:
+        center_global = anchor.mapToGlobal(anchor.rect().center())
+        dialog.move(
+            center_global.x() - dialog.width() // 2,
+            center_global.y() - dialog.height() // 2,
+        )
+    elif screen is not None:
+        ag = screen.availableGeometry()
+        dialog.move(
+            ag.x() + (ag.width() - dialog.width()) // 2,
+            ag.y() + (ag.height() - dialog.height()) // 2,
+        )
+
+
+class CenteredProgressDialog(QProgressDialog):
+    """Progress dialog that stays centered on the parent window (like CustomConfirmDialog)."""
+
+    def __init__(self, *args, center_parent: QWidget | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._center_parent = center_parent
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self._recenter_on_parent)
+
+    def _recenter_on_parent(self) -> None:
+        self.adjustSize()
+        center_dialog_on_parent(self, self._center_parent or self.parentWidget())
+
+    def setLabelText(self, text: str) -> None:
+        super().setLabelText(text)
+        QTimer.singleShot(0, self._recenter_on_parent)
+
+
 class CustomConfirmDialog(QDialog):
     """Material Design 3 style confirmation dialog with custom title bar."""
     def __init__(
@@ -4425,19 +4464,7 @@ class CustomConfirmDialog(QDialog):
         self.container.setFixedSize(width, height)
         self.setFixedSize(width, height)
 
-        # Center on parent (or screen)
-        if parent is not None:
-            center_global = parent.mapToGlobal(parent.rect().center())
-            self.move(
-                center_global.x() - self.width() // 2,
-                center_global.y() - self.height() // 2,
-            )
-        elif screen is not None:
-            ag = screen.availableGeometry()
-            self.move(
-                ag.x() + (ag.width() - self.width()) // 2,
-                ag.y() + (ag.height() - self.height()) // 2,
-            )
+        center_dialog_on_parent(self, parent)
         
         # Store result
         self.result_value = False
@@ -4611,11 +4638,7 @@ class MobileCLIPDownloadDialog(QDialog):
         self.setFixedSize(460, 220)
         self.container.setFixedSize(460, 220)
 
-        if parent:
-            parent_geometry = parent.geometry()
-            dialog_x = parent_geometry.x() + (parent_geometry.width() - self.width()) // 2
-            dialog_y = parent_geometry.y() + (parent_geometry.height() - self.height()) // 2
-            self.move(dialog_x, dialog_y)
+        center_dialog_on_parent(self, parent)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -4648,7 +4671,11 @@ class SingleImageViewOverlay(QWidget):
 
     _HIST_MARGIN = 8
     _FILMSTRIP_HEIGHT = 88
-    _BOTTOM_HOTZONE = 72
+    # Hot zone extends above the strip so reveal starts before the cursor reaches thumbnails.
+    _FILMSTRIP_HOTZONE_EXTRA = 40
+    _BOTTOM_HOTZONE = _FILMSTRIP_HEIGHT + _FILMSTRIP_HOTZONE_EXTRA
+    _FILMSTRIP_FADE_MS = 200
+    _FILMSTRIP_HIDE_DELAY_MS = 90
 
     def __init__(self, scroll_area, histogram_widget, viewer=None, parent=None,
                  gpu_view=None):
@@ -4672,10 +4699,116 @@ class SingleImageViewOverlay(QWidget):
 
         from SkySpotter_ui.filmstrip_view import FilmStripBar
         self._filmstrip = FilmStripBar(self, viewer=viewer)
+        self._filmstrip_opacity = QGraphicsOpacityEffect(self._filmstrip)
+        self._filmstrip.setGraphicsEffect(self._filmstrip_opacity)
+        self._filmstrip_opacity.setOpacity(0.0)
+        self._filmstrip_fade_anim = None
         self._filmstrip.hide()
         self._hide_filmstrip_timer = QTimer(self)
         self._hide_filmstrip_timer.setSingleShot(True)
         self._hide_filmstrip_timer.timeout.connect(self._hide_filmstrip_if_inactive)
+
+    def _stop_filmstrip_fade(self) -> None:
+        anim = getattr(self, "_filmstrip_fade_anim", None)
+        if anim is not None and anim.state() == QAbstractAnimation.State.Running:
+            anim.stop()
+        self._filmstrip_fade_anim = None
+
+    def _filmstrip_opacity_value(self) -> float:
+        try:
+            return float(self._filmstrip_opacity.opacity())
+        except Exception:
+            return 0.0
+
+    def _filmstrip_accepts_pointer(self) -> bool:
+        return (
+            self._filmstrip.isVisible()
+            and self._filmstrip_opacity_value() > 0.35
+        )
+
+    def _update_filmstrip_hit_testing(self) -> None:
+        accept = self._filmstrip_accepts_pointer()
+        self._filmstrip.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, not accept
+        )
+
+    def _animate_filmstrip_opacity(self, target: float, on_finished=None) -> None:
+        target = max(0.0, min(1.0, float(target)))
+        current = self._filmstrip_opacity_value()
+        if abs(current - target) < 0.02:
+            self._filmstrip_opacity.setOpacity(target)
+            self._update_filmstrip_hit_testing()
+            if on_finished is not None:
+                on_finished()
+            return
+
+        self._stop_filmstrip_fade()
+        anim = QPropertyAnimation(self._filmstrip_opacity, b"opacity", self)
+        anim.setDuration(self._FILMSTRIP_FADE_MS)
+        anim.setStartValue(current)
+        anim.setEndValue(target)
+        if target >= current:
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        else:
+            anim.setEasingCurve(QEasingCurve.Type.InCubic)
+
+        def _on_value_changed(_value):
+            self._update_filmstrip_hit_testing()
+
+        def _on_finished():
+            self._filmstrip_fade_anim = None
+            self._update_filmstrip_hit_testing()
+            if on_finished is not None:
+                on_finished()
+
+        anim.valueChanged.connect(_on_value_changed)
+        anim.finished.connect(_on_finished)
+        self._filmstrip_fade_anim = anim
+        anim.start()
+
+    def _fade_in_filmstrip(self) -> None:
+        if not self._filmstrip.isEnabled():
+            return
+        self._hide_filmstrip_timer.stop()
+        starting = not self._filmstrip.isVisible()
+        if not starting and self._filmstrip_opacity_value() >= 0.99:
+            return
+        anim = getattr(self, "_filmstrip_fade_anim", None)
+        if (
+            not starting
+            and anim is not None
+            and anim.state() == QAbstractAnimation.State.Running
+            and float(anim.endValue()) >= 0.99
+        ):
+            return
+        self._stop_filmstrip_fade()
+        if starting:
+            self._filmstrip_reveal = True
+            self._filmstrip_opacity.setOpacity(0.0)
+            self._filmstrip.show()
+            self._layout_filmstrip()
+            if hasattr(self._filmstrip, "center_on_current"):
+                QTimer.singleShot(0, lambda: self._filmstrip.center_on_current())
+            if hasattr(self._filmstrip, "refresh_visible_thumbnails"):
+                QTimer.singleShot(0, lambda: self._filmstrip.refresh_visible_thumbnails(
+                    refresh_cache=True
+                ))
+        self._filmstrip.raise_()
+        self._hist.raise_()
+        self._animate_filmstrip_opacity(1.0)
+
+    def _fade_out_filmstrip(self) -> None:
+        if not self._filmstrip.isVisible():
+            return
+
+        def _finish_hide():
+            self._filmstrip.hide()
+            self._filmstrip_opacity.setOpacity(0.0)
+            self._update_filmstrip_hit_testing()
+            if self._viewer is not None:
+                self._viewer._filmstrip_pointer_active = False
+
+        self._animate_filmstrip_opacity(0.0, on_finished=_finish_hide)
 
     def filmstrip_widget(self):
         return getattr(self, "_filmstrip", None)
@@ -4686,7 +4819,7 @@ class SingleImageViewOverlay(QWidget):
                 return
             self._filmstrip_pointer_active = True
             self._hide_filmstrip_timer.stop()
-            self._reveal_filmstrip()
+            self._fade_in_filmstrip()
             if self._viewer is not None:
                 self._viewer._filmstrip_pointer_active = True
             return
@@ -4696,7 +4829,7 @@ class SingleImageViewOverlay(QWidget):
         self._schedule_hide_filmstrip()
 
     def _schedule_hide_filmstrip(self) -> None:
-        self._hide_filmstrip_timer.start(0)
+        self._hide_filmstrip_timer.start(self._FILMSTRIP_HIDE_DELAY_MS)
 
     def _hide_filmstrip_if_inactive(self) -> None:
         if self._filmstrip_pointer_active:
@@ -4704,9 +4837,7 @@ class SingleImageViewOverlay(QWidget):
         if self._pointer_in_bottom_hotzone():
             return
         self._filmstrip_reveal = False
-        self._filmstrip.hide()
-        if self._viewer is not None:
-            self._viewer._filmstrip_pointer_active = False
+        self._fade_out_filmstrip()
 
     def _pointer_in_bottom_hotzone(self) -> bool:
         pos = self.mapFromGlobal(QCursor.pos())
@@ -4723,28 +4854,19 @@ class SingleImageViewOverlay(QWidget):
             return
         pos = self._local_pos_from_global(global_pos)
         in_hot = self.rect().contains(pos) and (pos.y() >= self.height() - self._BOTTOM_HOTZONE)
-        over_strip = self._filmstrip.isVisible() and self._filmstrip.geometry().contains(pos)
+        over_strip = (
+            self._filmstrip_accepts_pointer()
+            and self._filmstrip.geometry().contains(pos)
+        )
         if in_hot or over_strip or self._filmstrip.underMouse():
             self._hide_filmstrip_timer.stop()
-            self._reveal_filmstrip()
+            self._fade_in_filmstrip()
         elif not self._filmstrip_pointer_active:
             self._schedule_hide_filmstrip()
 
     def _reveal_filmstrip(self) -> None:
-        if not self._filmstrip.isEnabled():
-            return
-        if not self._filmstrip.isVisible():
-            self._filmstrip_reveal = True
-            self._filmstrip.show()
-            self._layout_filmstrip()
-            self._filmstrip.raise_()
-            self._hist.raise_()
-            if hasattr(self._filmstrip, "center_on_current"):
-                QTimer.singleShot(0, lambda: self._filmstrip.center_on_current())
-            if hasattr(self._filmstrip, "refresh_visible_thumbnails"):
-                QTimer.singleShot(0, lambda: self._filmstrip.refresh_visible_thumbnails(
-                    refresh_cache=True
-                ))
+        """Backward-compatible alias for fade-in."""
+        self._fade_in_filmstrip()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -4759,7 +4881,7 @@ class SingleImageViewOverlay(QWidget):
         self._layout_histogram()
 
     def _layout_filmstrip(self):
-        if not self._filmstrip.isVisible():
+        if not self._filmstrip.isVisible() and self._filmstrip_opacity_value() <= 0.0:
             return
         fh = self._FILMSTRIP_HEIGHT
         self._filmstrip.setGeometry(0, self.height() - fh, self.width(), fh)
@@ -7174,7 +7296,7 @@ class RAWImageViewer(QMainWindow):
         else:
             self.magic_wand_button.setText("Sort")
         self.magic_wand_button.setStyleSheet(bottom_icon_btn_style)
-        self.magic_wand_button.setToolTip("Auto-sort by aircraft type")
+        self.magic_wand_button.setToolTip("Sort new photos in this folder into aircraft subfolders")
         self.magic_wand_button.clicked.connect(self._on_magic_wand_clicked)
         self.magic_wand_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.magic_wand_button.hide()
@@ -7401,21 +7523,21 @@ class RAWImageViewer(QMainWindow):
         if status.state != "update_available":
             return
 
-        from PyQt6.QtWidgets import QMessageBox
-
-        reply = QMessageBox.question(
-            self,
-            "Gallery classifier update",
-            (
+        dialog = CustomConfirmDialog(
+            parent=self,
+            title="Gallery classifier update",
+            message=(
                 f"A newer official aircraft classifier is available "
-                f"(v{status.local_version} → v{status.remote_version}).\n\n"
+                f"(v{status.local_version} → v{status.remote_version})."
+            ),
+            informative_text=(
                 "Download it now? Existing aircraft labels in this folder will be "
                 "re-computed after the update."
             ),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+            confirm_label="Download",
         )
-        if reply != QMessageBox.StandardButton.Yes:
+        dialog.exec()
+        if not dialog.result_value:
             return
         self._download_gallery_classifier_update()
 
@@ -7424,12 +7546,13 @@ class RAWImageViewer(QMainWindow):
             return
         self._classifier_download_in_progress = True
 
-        progress = QProgressDialog(
+        progress = CenteredProgressDialog(
             "Downloading gallery classifier update…",
             "",
             0,
             100,
             self,
+            center_parent=self,
         )
         progress.setWindowTitle("Gallery classifier update")
         progress.setWindowModality(Qt.WindowModality.WindowModal)
@@ -8019,8 +8142,29 @@ class RAWImageViewer(QMainWindow):
         safe = cls._sanitize_aircraft_folder_name(text)
         return safe or cls._MAGIC_WAND_UNCLASSIFIED_FOLDER
 
-    def _folder_has_sortable_aircraft_labels(self) -> bool:
-        """True when indexing has run and Magic Wand can sort labeled or unlabeled files."""
+    @staticmethod
+    def _root_level_image_paths(folder: str, corpus: list[str]) -> list[str]:
+        """Image paths sitting directly in folder (not in aircraft subfolders)."""
+        if not folder:
+            return []
+        try:
+            folder_norm = os.path.normcase(os.path.abspath(folder))
+        except OSError:
+            return []
+        root: list[str] = []
+        for path in corpus:
+            if not path:
+                continue
+            try:
+                parent_norm = os.path.normcase(os.path.dirname(os.path.abspath(path)))
+            except OSError:
+                continue
+            if parent_norm == folder_norm:
+                root.append(path)
+        return root
+
+    def _folder_has_unsorted_root_images(self) -> bool:
+        """True when the parent folder has root-level photos that Magic Wand should sort."""
         if getattr(self, "view_mode", "single") != "gallery":
             return False
         folder = getattr(self, "current_folder", None)
@@ -8031,23 +8175,24 @@ class RAWImageViewer(QMainWindow):
             or getattr(self, "image_files", None)
             or []
         )
-        if not corpus:
+        root_paths = self._root_level_image_paths(folder, corpus)
+        if not root_paths:
             return False
+        if getattr(self, "_semantic_indexing_in_progress", False):
+            return True
         try:
             index = self._get_semantic_index()
-            labels = index.get_detected_aircraft_for_paths(corpus)
+            labels = index.get_detected_aircraft_for_paths(root_paths)
         except Exception:
             return False
         if not labels:
-            return False
-        skip = self._MAGIC_WAND_SKIP_LABELS
-        for path in corpus:
-            label = (labels.get(path) or "").strip().lower()
-            if label and label not in skip:
+            return True
+        for path in root_paths:
+            if path not in labels:
                 return True
-        # Indexed but no aircraft label (too small, low confidence, etc.) → Unclassified sort.
-        for path in corpus:
-            if path in labels:
+            safe = self._magic_wand_folder_for_label(labels.get(path, ""))
+            _, reason = self._plan_aircraft_auto_sort_move(folder, path, safe)
+            if reason == "move":
                 return True
         return False
 
@@ -8058,22 +8203,16 @@ class RAWImageViewer(QMainWindow):
         if getattr(self, "view_mode", "single") != "gallery":
             btn.hide()
             return
-        btn.setToolTip("Auto-sort by aircraft type")
+        btn.setToolTip("Sort new photos in this folder into aircraft subfolders")
         indexing = bool(getattr(self, "_semantic_indexing_in_progress", False))
         sort_busy = bool(getattr(self, "_aircraft_auto_sort_in_progress", False))
-        if self._folder_has_sortable_aircraft_labels():
+        if self._folder_has_unsorted_root_images():
             btn.show()
             self._set_magic_wand_enabled(not sort_busy and not indexing)
             if indexing:
                 btn.setToolTip(
-                    "Auto-sort by aircraft type (wait for indexing to finish)"
+                    "Sort new photos into aircraft subfolders (wait for indexing to finish)"
                 )
-        elif indexing:
-            btn.show()
-            self._set_magic_wand_enabled(False)
-            btn.setToolTip(
-                "Auto-sort by aircraft type (wait for indexing to finish)"
-            )
         else:
             btn.hide()
 
@@ -8094,22 +8233,25 @@ class RAWImageViewer(QMainWindow):
             or getattr(self, "image_files", None)
             or []
         )
-        if not corpus:
-            self.status_bar.showMessage("No images in this folder", 3000)
+        root_corpus = self._root_level_image_paths(folder, corpus)
+        if not root_corpus:
+            self.status_bar.showMessage(
+                "No new photos in the parent folder to sort", 4000
+            )
             return
         try:
             index = self._get_semantic_index()
-            labels = index.get_detected_aircraft_for_paths(corpus)
+            labels = index.get_detected_aircraft_for_paths(root_corpus)
         except Exception as e:
             self.show_error("Auto-sort", f"Could not read aircraft labels:\n{e}")
             return
         skip_labels = self._MAGIC_WAND_SKIP_LABELS
         labeled = [
             p
-            for p in corpus
+            for p in root_corpus
             if (labels.get(p) or "").strip().lower() not in skip_labels
         ]
-        unlabeled = [p for p in corpus if p not in labeled]
+        unlabeled = [p for p in root_corpus if p not in labeled]
         if not labels:
             self.show_error(
                 "Auto-sort",
@@ -8120,24 +8262,24 @@ class RAWImageViewer(QMainWindow):
         dialog = CustomConfirmDialog(
             parent=self,
             title="Auto-sort by aircraft",
-            message="Move images into subfolders based on detected aircraft type?",
+            message="Move new photos in this folder into aircraft subfolders?",
             informative_text=(
                 f"Folder: {os.path.basename(folder)}\n"
-                f"With aircraft label: {len(labeled)} of {len(corpus)}\n"
+                f"Photos in parent folder: {len(root_corpus)}\n"
+                f"With aircraft label: {len(labeled)}\n"
                 f"To Unclassified: {len(unlabeled)}\n\n"
-                f"Files will be moved to:\n"
+                f"Only files in the parent folder are moved (not photos already "
+                f"in subfolders):\n"
                 f"  {folder}/<aircraft label>/filename\n"
                 f"  {folder}/{self._MAGIC_WAND_UNCLASSIFIED_FOLDER}/filename  "
-                f"(no label, too small, or low confidence)\n\n"
-                "The gallery will show images in the folder and one level of "
-                "subfolders after sorting (not deeper nested paths)."
+                f"(no label, too small, or low confidence)"
             ),
             confirm_label="Sort",
         )
         dialog.exec()
         if not dialog.result_value:
             return
-        self._start_aircraft_auto_sort(folder, corpus, labels)
+        self._start_aircraft_auto_sort(folder, root_corpus, labels)
 
     def _capture_gallery_scroll_restore(self) -> dict | None:
         """Remember gallery scroll anchor and active search before a same-folder reload."""

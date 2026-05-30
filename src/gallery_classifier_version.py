@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -31,6 +32,8 @@ SOURCE_DOWNLOAD = "download"
 SOURCE_EXISTING = "existing"
 
 ClassifierProgressCallback = Callable[[int, int, str], None]
+
+logger = logging.getLogger(__name__)
 
 _PROTECTED_SOURCES = frozenset({SOURCE_CUSTOM})
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
@@ -392,7 +395,17 @@ def _download_and_install(
             _emit_progress(progress_callback, 0, 0, "verify")
             digest = _sha256_file(zip_path)
             if digest.lower() != expected_sha256.lower():
+                logger.error(
+                    "[MODEL] Gallery classifier zip SHA256 mismatch (got %s, expected %s)",
+                    digest,
+                    expected_sha256,
+                )
                 return 1
+        else:
+            logger.info(
+                "[MODEL] No SHA256 configured for gallery classifier release; "
+                "skipping zip checksum (checkpoint files validated after extract)."
+            )
         try:
             _install_from_zip(
                 zip_path, dest, version, progress_callback=progress_callback
