@@ -14,13 +14,26 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+from raw_file_extensions import RAW_FILE_EXTENSIONS  # noqa: E402
+
+IMAGE_EXTS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    *{f".{ext}" for ext in RAW_FILE_EXTENSIONS},
+}
 
 
 def iter_images(folder: Path) -> list[Path]:
     files = []
     for p in sorted(folder.iterdir()):
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+        if not p.is_file() or p.name.startswith("._"):
+            continue
+        if p.suffix.lower() in IMAGE_EXTS:
             files.append(p)
     return files
 
@@ -83,7 +96,7 @@ def main() -> int:
         "input_dir",
         type=Path,
         nargs="?",
-        default=Path(r"D:\Development\Test Image set"),
+        default=Path(r"K:\Photos\23092025 Mach Loop"),
     )
     parser.add_argument("--max-images", type=int, default=0)
     parser.add_argument(
@@ -91,7 +104,20 @@ def main() -> int:
         type=int,
         default=int(os.environ.get("SkySpotter_INDEX_MAX_SIZE", "1280")),
     )
+    parser.add_argument(
+        "--skip-pytorch",
+        action="store_true",
+        help="Benchmark DirectML ONNX only (default runtime env).",
+    )
     args = parser.parse_args()
+
+    try_pytorch = not args.skip_pytorch
+    if try_pytorch:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            print("PyTorch not installed — skipping PyTorch path (use dev-ml env to compare).")
+            try_pytorch = False
 
     if not args.input_dir.is_dir():
         print(f"Not a directory: {args.input_dir}", file=sys.stderr)
@@ -108,14 +134,16 @@ def main() -> int:
     print(f"max_source_size={args.max_source_size}")
     print()
 
-    print("=== PyTorch path (SkySpotter_PREFER_DIRECTML=0) ===")
-    pytorch = run_mode(
-        "pytorch",
-        files,
-        prefer_dml=False,
-        max_source_size=args.max_source_size,
-    )
-    print()
+    pytorch = None
+    if try_pytorch:
+        print("=== PyTorch path (SkySpotter_PREFER_DIRECTML=0) ===")
+        pytorch = run_mode(
+            "pytorch",
+            files,
+            prefer_dml=False,
+            max_source_size=args.max_source_size,
+        )
+        print()
 
     print("=== DirectML ONNX path (SkySpotter_PREFER_DIRECTML=1) ===")
     dml = run_mode(
@@ -126,20 +154,24 @@ def main() -> int:
     )
     print()
 
-    speedup = pytorch["total_s"] / dml["total_s"] if dml["total_s"] > 0 else 0.0
     print("=== Summary ===")
-    for r in (pytorch, dml):
+    rows = [dml]
+    if pytorch is not None:
+        rows.insert(0, pytorch)
+    for r in rows:
         print(
             f"{r['mode']:10} total={r['total_s']:.1f}s  "
             f"mean={r['mean_s']:.2f}s/img  median={r['median_s']:.2f}s  "
             f"first={r['first_s']:.2f}s  rest_mean={r['rest_mean_s']:.2f}s  "
             f"labeled={r['labels_non_empty']}/{r['n']}"
         )
-    print(f"DirectML speedup (total time): {speedup:.2f}x")
-    if pytorch["labels_non_empty"] != dml["labels_non_empty"]:
-        print(
-            "NOTE: label counts differ between paths — compare timings only if labels match."
-        )
+    if pytorch is not None:
+        speedup = pytorch["total_s"] / dml["total_s"] if dml["total_s"] > 0 else 0.0
+        print(f"DirectML speedup vs PyTorch (total time): {speedup:.2f}x")
+        if pytorch["labels_non_empty"] != dml["labels_non_empty"]:
+            print(
+                "NOTE: label counts differ between paths — compare timings only if labels match."
+            )
     return 0
 
 

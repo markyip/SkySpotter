@@ -29,7 +29,7 @@ def _cv2_ok() -> bool:
 
 def repair_opencv(*, quiet: bool = False) -> bool:
     """
-    Remove opencv-python-headless (breaks cv2 with mediapipe's contrib build).
+    Remove opencv-python-headless when it conflicts with opencv-contrib-python.
     Reinstall opencv-contrib-python when the cv2 extension is missing.
     """
     import importlib.metadata as md

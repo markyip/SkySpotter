@@ -10,25 +10,41 @@ platforms = ["win-64"]
 start = "python src/main.py"
 start-windowless = "pythonw src/main.py"
 start-experimental = "python src/main.py"
+setup = "python scripts/pixi_setup.py"
+fix-opencv = "python scripts/pixi_fix_opencv.py"
+setup-torch = "python scripts/pixi_setup_classifier_torch.py"
 batch-test-classifier = "python scripts/batch_test_classifier.py"
 verify-model = "python scripts/batch_test_classifier.py"
 test-aircraft-model = "python scripts/batch_test_classifier.py"
-fix-opencv = "python scripts/pixi_fix_opencv.py"
+train-model = "python scripts/train_processed_aircraft.py"
+export-classifier-onnx = "python scripts/export_classifier_onnx.py"
+benchmark-classifier = "python scripts/benchmark_classifier_paths.py"
 poc-blur-compare-modes = "python scripts/poc_blur_compare_modes.py"
 poc-blur-compare-sizes = "python scripts/poc_blur_compare_sizes.py"
 set-features-off = "python scripts/set_features.py --blur-score off"
 set-features-experimental = "python scripts/set_features.py --copy-experimental"
 features-show = "python scripts/set_features.py --show"
 
-[feature.experimental-blur]
+[feature.dev-ml]
 platforms = ["win-64"]
 
-[feature.experimental-blur.activation.env]
-SkySpotter_ENABLE_BLUR_SCORE = "1"
+[feature.dev-ml.pypi-dependencies]
+onnxscript = "*"
+torchvision = "*"
+tqdm = "*"
+
+[feature.semantic-search]
+platforms = ["win-64"]
+
+[feature.semantic-search.pypi-dependencies]
+tokenizers = "*"
+sentencepiece = "*"
 
 [environments]
 default = { features = [], solve-group = "default" }
-experimental = { features = ["experimental-blur"], solve-group = "default" }
+dev-ml = { features = ["dev-ml"], solve-group = "default" }
+semantic = { features = ["semantic-search"], solve-group = "default" }
+full = { features = ["dev-ml", "semantic-search"], solve-group = "default" }
 
 [activation.env]
 PYTHONNOUSERSITE = "1"
@@ -54,9 +70,6 @@ reverse-geocoder = "*"
 onnxruntime-directml = ">=1.18.0"
 pyexiv2 = "*"
 pywin32 = "*"
-tokenizers = "*"
-sentencepiece = "*"
-mediapipe = "*"
 comtypes = "*"
 "winrt-Windows.ApplicationModel.DataTransfer" = "*"
 "winrt-Windows.Storage" = "*"
@@ -64,9 +77,7 @@ opencv-contrib-python = "*"
 huggingface_hub = "*"
 requests = "*"
 rembg = "*"
-onnxscript = "*"
-numba = "<0.62"
-torch = "*"
-transformers = "*"
 scikit-image = "*"
-tqdm = "*"
+torch = "*"
+torchvision = "*"
+transformers = "*"

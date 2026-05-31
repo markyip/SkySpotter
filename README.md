@@ -49,13 +49,13 @@ See **where the camera focused** before you zoom in for sharpness:
 - **One-click auto-sort**: **Magic Wand** moves images into subfolders by detected aircraft type; images without a label go to **`Unclassified/`**. After sorting, the gallery still shows those files (see folder scope in search section below)
 - **Gallery filters — search by aircraft type**: `aircraft:F-35`, `aircraft:typhoon`, or type a model name after indexing; combine with EXIF (`camera:sony iso<800 aircraft:viper`, `format:raw`, `year>=2024`, and more)
 
-Full search syntax: **[Gallery search](#-gallery-search-gallery-view)**.
+### 3. Ultra-Fast Viewing & Background Loading
 
-### 3. Wide format support & fast performance
+Optimized to handle folders containing thousands of heavy camera RAW photos seamlessly:
 
-- **Many image formats**: Camera **RAW** (via LibRaw), **JPEG**, **TIFF**, and **HEIF** — open with a double-click, no import catalog
-- **Lightning-fast** folder scans, decoding, and navigation across every supported format; single-image open shows your file first while the rest of the folder loads in the background
-- Details: [Supported Image Formats](#-supported-image-formats)
+- **Instant Photo Opening**: Double-click any photo on your computer and the viewer launches it instantly. You can view, zoom, and check your photo immediately without waiting for the rest of the folder to finish scanning.
+- **Silky-Smooth Grid Scrolling**: Browse through massive galleries of large RAW images without stuttering, freezes, or lag.
+- **Reliable 100% Zooming**: Double-clicking or pressing Spacebar to zoom in to check sharpness on DNG and RAW files is perfectly sharp, responsive, and consistent every single time.
 
 ---
 
@@ -73,28 +73,24 @@ This is a **pre-filtering tool**, letting you go through hundreds of RAW files e
 
 ## ✨ Features
 
-- **100% local AI**: Aircraft detection and gallery indexing run on your PC or Mac only; nothing is uploaded for AI processing
-- **Automated Aircraft Classification**: ViT model recognizes about **70** military and civil aircraft types (see [`labels.txt`](models/gallery-classifier/skyspotter-military-aircraft-vit/labels.txt))
-- **One-Click Auto-Sort**: **Magic Wand** moves images into subfolders by detected aircraft type
-- **Precision focus area detection**: MakerNote + EXIF subject overlays; press **`F`** to toggle (see [Highlights](#-highlights))
-- **Gallery filters**: EXIF/metadata plus **aircraft label** search (`aircraft:`, or type a model name after indexing)
-- **Wide RAW format support**: Canon (CR2, CR3), Nikon (NEF), Sony (ARW), Adobe DNG, and many more — plus JPEG, TIFF, HEIF
-- **Ultra-fast performance**: Optimized folder loading and decoding for all supported formats
-- **GPU acceleration**: Uses your graphics card when available to speed up folder indexing (no manual setup required)
-- **Cross-platform support**: Windows and macOS
-- **macOS file association**: Finder integration; set as default viewer; double-click to open
-- **Intuitive navigation**: Keyboard shortcuts, mouse controls, and scroll wheel support
-- **Zoom functionality**: Fit-to-window and 100% zoom modes with smooth panning, including native Mac trackpad pinch-to-zoom
-- **DNG zoom reliability**: Single-view DNG now prioritizes full-resolution decoding to keep Space / double-click 100% zoom behavior consistent
-- **File management**: Move images to discard folder or delete permanently
-- **EXIF data display**: Camera settings, focal length, ISO, aperture, and capture information
-- **Session persistence**: Remembers your last opened folder, image, and view mode
-- **Single-image histogram**: Press **`H`** to show or hide the strip while viewing one image
-- **Modern installer**: Lightweight executable that automatically provisions a self-contained Python environment and downloads AI models on first launch
-- **Professional startup**: Synchronized native and Qt splash screens for a flicker-free launch experience
-- **Modern UI**: Material Design 3 aesthetics with Font Awesome icons (via qtawesome) and non-intrusive loading indicators
-- **Platform-specific chrome**: **Share** (macOS system share sheet) on macOS; **Open with another app** (native Windows picker) on Windows — send or edit the current file in Lightroom, Photoshop, etc.
-- **Non-destructive visual rotate**: Rotate in the viewer by 90° steps without modifying originals (including RAW); gallery tiles refresh immediately
+- **100% Local AI**: All aircraft detection and gallery organizing run entirely offline on your own computer—your photos are never uploaded to the internet or shared.
+- **Automated Aircraft Classification**: Smart recognition for about **70** military and civil aircraft types (see [`labels.txt`](models/gallery-classifier/skyspotter-military-aircraft-vit/labels.txt))
+- **One-Click Auto-Sort**: **Magic Wand** files your photos into neat subfolders by detected aircraft type in a single click.
+- **Precision Focus Area Detection**: See exactly where the camera focused on the aircraft before you zoom in; press **`F`** to toggle.
+- **Smart Film Strip Sync**: The film strip at the bottom of the screen matches your active search filters perfectly. When you browse using the arrow keys, you will only see the filtered photos.
+- **Seamless Search & Navigation**: Clicking a filtered thumbnail keeps your browsing restricted only to those search results.
+- **Quick Send to Editors ("Open with...")**: Send your active photo to Lightroom, Photoshop, or any photo editor on your PC with a single click using the bottom-bar button.
+- **Auto-Session Restore**: Reopens your last viewed folder, active image, and view mode (gallery vs. full screen) automatically when you launch the app.
+- **Powerful Gallery Search**: Filter your grid easily using simple tags like `aircraft:F-35`, `camera:sony`, `iso<800`, or format types (`format:raw`).
+- **Wide Format Support**: Canon (CR2, CR3), Nikon (NEF), Sony (ARW), Adobe DNG, and many more—plus JPEGs, TIFFs, and HEIF.
+- **GPU Acceleration**: Speeds up organizing by automatically utilizing your graphics card, no setup required.
+- **macOS File Association**: Integrates into Finder so you can set it as your default viewer and open files directly.
+- **Intuitive Zoom & Pan**: Easy fit-to-window and 100% zoom modes with smooth dragging, plus native Mac trackpad pinch-to-zoom.
+- **Fast File Management**: Discard bad shots instantly to clean up your folders.
+- **EXIF Data HUD**: Transparent overlay showing camera model, lens, focal length, shutter speed, ISO, and capture time.
+- **Histogram Visualizer**: Press **`H`** to slide out a color histogram when inspecting single images.
+- **Modern UI**: Sleek Material Design 3 interface with beautiful modern icons and clean loading indicators.
+- **Non-Destructive Rotation**: Rotate photos by 90° in the viewer without modifying or corrupting the original files on disk.
 
 ---
 
@@ -176,19 +172,59 @@ Open the bottom search panel to filter the grid. SkySpotter gallery search is **
 
 Indexing must finish before aircraft-name filters match; Magic Wand also needs detected labels on your images.
 
-### Semantic + face indexing behavior (current default)
+### Indexing behavior (current default)
 
-- Semantic indexing and face detection are both enabled by default.
-- To keep the app responsive on very large RAW folders, indexing runs in two passes:
-  1. metadata + semantic embeddings (search-ready first)
-  2. face-count backfill in background
-- Background face pass starts automatically after semantic indexing is ready and resumes from persisted DB state.
-- Thumbnail warm-up before face scan is conservative by default to avoid long "warming" stalls on multi-thousand-image folders.
-- Advanced environment switches:
-  - `RAWVIEWER_INDEX_DEFER_FACE_SCAN=1` (default): run face scan after semantic pass
+- **Aircraft classification** runs during semantic indexing (search-ready when labels are written).
+- **Face detection** is **off by default** in SkySpotter (`"face_scan": false` in [`config/skyspotter_features.json`](config/skyspotter_features.json)). It only powers RAWviewer-style gallery tokens such as `people` and `portrait`; enable it if you need those filters.
+- When face scan is enabled, indexing may run in two passes: metadata + semantic first, then face-count backfill in the background.
+- Advanced face-scan environment switches (only when `face_scan` is on):
+  - `RAWVIEWER_INDEX_DEFER_FACE_SCAN=1` (default): run face scan after the semantic pass
   - `RAWVIEWER_FACE_SCAN_WARM_THUMBS=0` (default): disable full warm-up prepass
   - `RAWVIEWER_FACE_SCAN_WARM_MAX_FILES=256` (default): cap warm-up batch size
   - `RAWVIEWER_FACE_SCAN_WARM_MAX_SECONDS=25` (default): cap warm-up wall time
+
+### Classifier speed vs accuracy (GPU tuning)
+
+Indexing runs **rembg + ViT** per image. ViT inference is fast on CUDA; **rembg and RAW decode** often dominate wall time. Parallel workers help when the GPU has spare VRAM.
+
+| Goal | Setting | Notes |
+| --- | --- | --- |
+| **Faster index** (default auto) | *(no env)* | CUDA ViT + DirectML rembg: **2 workers** on 4070; rembg on CPU allows 4 |
+| **Max throughput** | `SkySpotter_AIRCRAFT_CLASSIFY_WORKERS=3` | Raise only if stable; lower to `1` if ORT/DML crashes |
+| **rembg on CPU** | `SkySpotter_REMBG_CPU=1` | Frees GPU for more ViT workers |
+| **Sharper crops / labels** | `SkySpotter_INDEX_MAX_SIZE=2048` | Larger source before rembg; slower per file |
+| **Fewer false labels** | `SkySpotter_CLASSIFIER_MIN_CONF=0.50` | Higher = stricter (more “unidentified”) |
+| **More labels (riskier)** | `SkySpotter_CLASSIFIER_MIN_CONF=0.30` | Lower = more detections, more mistakes |
+
+Auto defaults (when env vars are unset):
+
+- **Workers:** CUDA ViT + DirectML rembg → **2** on 11+ GiB (`RTX 4070`); set `SkySpotter_REMBG_CPU=1` for up to **4** ViT workers.
+- **Index resolution:** `1920` px long edge on CUDA ≥10 GiB, else `1280`.
+- **Thumbnail warm-up** (before classify, uncached RAW only):
+
+Embedded thumbnails are warmed **during the metadata parallel pass** by default (`SkySpotter_AIRCRAFT_WARM_WITH_METADATA=1`). A short top-up pass before classify covers files that skipped metadata extraction. Set `SkySpotter_AIRCRAFT_WARM_WITH_METADATA=0` to restore a separate warm phase before classify.
+
+| GPU VRAM | Folder (uncached) | max files | time budget |
+| --- | --- | --- | --- |
+| ≥11 GiB | any | all | unlimited |
+| ≥8 GiB | ≤2000 | all | unlimited |
+| ≥8 GiB | >2000 | 1500 | 180s |
+| ≥6 GiB | any | up to 1024 | ~30–120s (scaled) |
+| else | any | up to 384 | ~20–45s (scaled) |
+
+Override: `SkySpotter_AIRCRAFT_WARM_MAX_FILES=-1` (all), `SkySpotter_AIRCRAFT_WARM_MAX_SECONDS=0` (no limit).
+
+Benchmark warm-up vs no warm:
+
+```powershell
+pixi run python scripts/benchmark_thumbnail_warmup.py "K:\Photos\23092025 Mach Loop" --max-images 50
+```
+
+Benchmark classifier throughput:
+
+```powershell
+pixi run benchmark-classifier "K:\Photos\23092025 Mach Loop" --max-images 50
+```
 
 ### Gallery search syntax examples
 

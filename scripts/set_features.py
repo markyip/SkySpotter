@@ -20,7 +20,7 @@ def _load(path: Path) -> dict:
                 return data
         except Exception:
             pass
-    return {"blur_score": False}
+    return {"blur_score": False, "face_scan": False}
 
 
 def main() -> int:
@@ -35,6 +35,11 @@ def main() -> int:
         "--blur-score",
         choices=("on", "off"),
         help="Enable or disable experimental blur scoring",
+    )
+    parser.add_argument(
+        "--face-scan",
+        choices=("on", "off"),
+        help="Enable or disable face-count indexing (people/portrait gallery filters)",
     )
     parser.add_argument(
         "--copy-experimental",
@@ -66,18 +71,23 @@ def main() -> int:
         data["blur_score"] = True
     elif args.blur_score == "off":
         data["blur_score"] = False
+    if args.face_scan == "on":
+        data["face_scan"] = True
+    elif args.face_scan == "off":
+        data["face_scan"] = False
 
-    if args.show and args.blur_score is None and not args.copy_experimental:
+    changed = args.blur_score is not None or args.face_scan is not None
+    if args.show and not changed and not args.copy_experimental:
         print(json.dumps(data, indent=2))
         return 0
 
-    if args.blur_score is not None:
+    if changed:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         print(f"Updated {path}")
         print(json.dumps(data, indent=2))
 
-    if args.blur_score is None and not args.show and not args.copy_experimental:
+    if not changed and not args.show and not args.copy_experimental:
         parser.print_help()
         return 1
     return 0

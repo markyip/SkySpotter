@@ -102,6 +102,43 @@ def use_libraw_consistent_preview_first() -> bool:
     return v not in ("0", "false", "no", "off")
 
 
+def use_progressive_raw_loading() -> bool:
+    """
+    When True (default while LibRaw-consistent), show embedded preview/thumbnail first and
+    upgrade to LibRaw half-res in the background. Set SkySpotter_PROGRESSIVE_RAW_LOAD=0 to disable.
+    """
+    v = os.environ.get("SkySpotter_PROGRESSIVE_RAW_LOAD", "").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return False
+    if v in ("1", "true", "yes", "on"):
+        return True
+    return use_libraw_consistent_preview_first()
+
+
+def metadata_index_idle_delay_ms() -> int:
+    """Idle delay after first single-view paint before background metadata indexing starts."""
+    raw = os.environ.get("RAWVIEWER_AUTO_METADATA_INDEX_IDLE_MS", "5000").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 5000
+
+
+def use_raw_process_pool() -> bool:
+    """
+    Offload LibRaw postprocess to a process pool (multi-core). Opt-out with
+    SkySpotter_USE_PROCESS_POOL=0. Default: on when CPU count >= 4.
+    """
+    raw = os.environ.get("SkySpotter_USE_PROCESS_POOL", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    import os as _os
+
+    return (_os.cpu_count() or 0) >= 4
+
+
 def check_cache_for_image(file_path: str, use_full_resolution: bool = False) -> Tuple[Optional[Any], Optional[str]]:
     """
     檢查快取中是否存在圖像或相關數據。

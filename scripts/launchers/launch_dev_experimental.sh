@@ -5,7 +5,6 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
 export PYTHONUTF8=1
-export SkySpotter_PREFER_DIRECTML=1
 export SkySpotter_FEATURES_FILE=config/skyspotter_features.json
 export SkySpotter_ENABLE_BLUR_SCORE=1
 export RAWVIEWER_USE_PROCESS_POOL=0
@@ -18,7 +17,7 @@ export RAWVIEWER_DEBUG=1
 
 echo "[SkySpotter] Launching with EXPERIMENTAL features (blur scoring)..."
 if command -v pixi >/dev/null 2>&1; then
-  exec pixi run -e experimental start "$@"
+  exec pixi run start "$@"
 else
   export PYTHONPATH="${ROOT}/src:${PYTHONPATH:-}"
   exec python3 -u src/main.py "$@"

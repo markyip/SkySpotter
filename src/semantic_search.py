@@ -38,7 +38,12 @@ from onnxruntime_providers import (
     create_onnxruntime_session,
     dml_available,
     onnxruntime_providers_prefer_dml,
+    onnxruntime_providers_for_rembg,
+    rembg_uses_directml,
+    suggested_aircraft_classify_workers,
     prefer_directml_classifier,
+    torch_gpu_available,
+    gpu_vram_gib,
 )
 
 try:
@@ -48,6 +53,130 @@ except Exception:
 
 
 ProgressCallback = Optional[Callable[[int, int, str], None]]
+
+# Per-thread ViT classifier; rembg uses one shared DirectML session + lock.
+_AIRCRAFT_CLASSIFY_TLS = threading.local()
+_WARM_THUMB_TLS = threading.local()
+_REMBG_LOCK = threading.Lock()
+_SHARED_REMBG_SESSION = None
+_SHARED_REMBG_SESSION_LOCK = threading.Lock()
+_TORCH_VIT_LOAD_LOCK = threading.Lock()
+_SHARED_TORCH_VIT: Dict[str, Any] = {
+    "checkpoint_dir": None,
+    "model": None,
+    "processor": None,
+    "device": None,
+    "labels": None,
+}
+_classifier_device_logged = False
+
+
+def _import_vit_hf_classes():
+    """
+    Import ViT HF classes reliably across transformers versions.
+
+    transformers 5.x uses lazy exports from ``transformers.__init__``; concurrent
+    first imports from worker threads can intermittently raise ImportError. Retry
+    briefly, then fall back to direct submodule imports.
+    """
+    last_err: Optional[BaseException] = None
+    for attempt in range(4):
+        try:
+            from transformers import ViTForImageClassification, ViTImageProcessor
+
+            return ViTForImageClassification, ViTImageProcessor
+        except ImportError as exc:
+            last_err = exc
+            if attempt < 3:
+                time.sleep(0.05 * (attempt + 1))
+    try:
+        from transformers.models.vit.modeling_vit import ViTForImageClassification
+        try:
+            from transformers.models.vit.image_processing_vit import ViTImageProcessor
+        except ImportError:
+            from transformers import ViTImageProcessor
+        return ViTForImageClassification, ViTImageProcessor
+    except ImportError:
+        if last_err is not None:
+            raise last_err
+        raise
+
+
+def _labels_from_vit_config(model) -> Optional[List[str]]:
+    try:
+        id2label = getattr(model.config, "id2label", {}) or {}
+        if not id2label:
+            return None
+        ordered = []
+        for k in sorted(id2label.keys(), key=lambda x: int(x)):
+            ordered.append(str(id2label[k]))
+        return ordered or None
+    except Exception:
+        return None
+
+
+def _load_shared_torch_vit(checkpoint_dir: str) -> Dict[str, Any]:
+    """Load the gallery ViT checkpoint once; reuse across classify worker threads."""
+    global _classifier_device_logged
+
+    norm_dir = os.path.normcase(os.path.normpath(os.path.abspath(checkpoint_dir)))
+    with _TORCH_VIT_LOAD_LOCK:
+        if (
+            _SHARED_TORCH_VIT["model"] is not None
+            and _SHARED_TORCH_VIT["checkpoint_dir"] == norm_dir
+        ):
+            return _SHARED_TORCH_VIT
+
+        import torch
+
+        ViTForImageClassification, ViTImageProcessor = _import_vit_hf_classes()
+        processor = ViTImageProcessor.from_pretrained(checkpoint_dir)
+        model = ViTForImageClassification.from_pretrained(checkpoint_dir)
+        device = _resolve_classifier_torch_device()
+        model.to(device)
+        model.eval()
+        if str(device) == "cpu":
+            try:
+                threads = int(os.environ.get("SkySpotter_TORCH_THREADS", "0"))
+                if threads > 0:
+                    torch.set_num_threads(threads)
+            except (TypeError, ValueError):
+                pass
+
+        labels = _labels_from_vit_config(model)
+        _SHARED_TORCH_VIT.update(
+            {
+                "checkpoint_dir": norm_dir,
+                "model": model,
+                "processor": processor,
+                "device": device,
+                "labels": labels,
+            }
+        )
+
+        if not _classifier_device_logged:
+            _classifier_device_logged = True
+            logger.warning(
+                "[MODEL] Aircraft classifier (PyTorch): checkpoint='%s' device='%s' "
+                "torch.cuda.is_available=%s dml_available=%s prefer_directml=%s strict_rembg=%s",
+                checkpoint_dir,
+                device,
+                torch.cuda.is_available(),
+                dml_available(),
+                prefer_directml_classifier(),
+                os.environ.get("SkySpotter_STRICT_REMBG", "").strip().lower()
+                in {"1", "true", "yes", "on"},
+            )
+
+        return _SHARED_TORCH_VIT
+
+
+def _thread_local_aircraft_classifier() -> "MilitaryAircraftClassifier":
+    clf = getattr(_AIRCRAFT_CLASSIFY_TLS, "classifier", None)
+    if clf is None:
+        clf = MilitaryAircraftClassifier()
+        _AIRCRAFT_CLASSIFY_TLS.classifier = clf
+    return clf
 
 # SkySpotter default: ViT aircraft labels + EXIF gallery filters only (no SigLIP download).
 AVIATION_INDEX_MODEL_ID = "aviation-classifier-vit"
@@ -95,9 +224,6 @@ def _resolve_classifier_torch_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
-
-
-_classifier_device_logged = False
 
 
 def _skyspotter_cache_root() -> str:
@@ -895,6 +1021,36 @@ def _classifier_min_crop_thresholds(
     return min_w, min_h
 
 
+def _classifier_min_confidence() -> float:
+    """Minimum softmax confidence to store a ViT aircraft label (default 0.40)."""
+    try:
+        raw = os.environ.get("SkySpotter_CLASSIFIER_MIN_CONF", "0.40").strip()
+        return min(0.99, max(0.05, float(raw)))
+    except (TypeError, ValueError):
+        return 0.40
+
+
+def _classifier_index_max_size() -> int:
+    """
+    Longest edge when loading images for rembg + ViT during indexing.
+
+    Resolution order: ``SkySpotter_INDEX_MAX_SIZE`` → ``SkySpotter_CLASSIFY_MAX_SIZE``
+    → auto (1920 on CUDA ≥10 GiB, else 1280).
+    """
+    for env_name in ("SkySpotter_INDEX_MAX_SIZE", "SkySpotter_CLASSIFY_MAX_SIZE"):
+        raw = os.environ.get(env_name, "").strip()
+        if raw:
+            try:
+                return max(256, min(4096, int(raw)))
+            except (TypeError, ValueError):
+                pass
+    if torch_gpu_available():
+        vram = gpu_vram_gib()
+        if vram is not None and vram >= 10:
+            return 1920
+    return 1280
+
+
 class MilitaryAircraftClassifier:
     """Specialist ViT classifier for precise military aircraft identification."""
     HUB_REPO_ID = "dima806/military_aircraft_image_detection"
@@ -984,10 +1140,27 @@ class MilitaryAircraftClassifier:
         if prefer_directml_classifier() and self._local_checkpoint_dir:
             if not self._ensure_onnx_classifier_session():
                 logger.warning(
-                    "[MODEL] DirectML ONNX classifier not ready (export or session failed). "
-                    "ViT will fall back to PyTorch CPU unless you fix ONNX export. "
-                    "Try PYTHONUTF8=1 and see logs above."
+                    "[MODEL] DirectML ONNX classifier not ready. "
+                    "Export once with: pixi run -e dev-ml export-classifier-onnx "
+                    "(or set SkySpotter_PREFER_DIRECTML=0 and use PyTorch). "
+                    "Classification is skipped until model.onnx exists."
                 )
+        elif self._local_checkpoint_dir:
+            from onnxruntime_providers import classifier_backend_name
+
+            logger.info(
+                "[MODEL] Aircraft classifier backend: %s",
+                classifier_backend_name(),
+            )
+
+    def export_onnx_for_directml(self, progress_callback=None) -> bool:
+        """Export checkpoint to ONNX for the lean default runtime (dev-ml env only)."""
+        if not self._local_checkpoint_dir:
+            logger.error("[MODEL] No local checkpoint found for ONNX export.")
+            return False
+        self._sync_labels_from_checkpoint()
+        self._onnx_export_disabled = False
+        return self._export_checkpoint_to_onnx(progress_callback)
 
     def _load_labels(self):
         # Try to find labels.txt in the same directory as the model
@@ -1055,67 +1228,43 @@ class MilitaryAircraftClassifier:
         if self._torch_model is not None and self._torch_processor is not None:
             return True
         try:
-            import torch
-            from transformers import ViTForImageClassification, ViTImageProcessor
-
-            self._torch_processor = ViTImageProcessor.from_pretrained(self._local_checkpoint_dir)
-            self._torch_model = ViTForImageClassification.from_pretrained(self._local_checkpoint_dir)
-            self._torch_device = _resolve_classifier_torch_device()
-            self._torch_model.to(self._torch_device)
-            self._torch_model.eval()
-            if str(self._torch_device) == "cpu":
-                try:
-                    threads = int(os.environ.get("SkySpotter_TORCH_THREADS", "0"))
-                    if threads > 0:
-                        torch.set_num_threads(threads)
-                except (TypeError, ValueError):
-                    pass
-
-            # Align label list with checkpoint config when present.
-            try:
-                id2label = getattr(self._torch_model.config, "id2label", {}) or {}
-                if id2label:
-                    ordered = []
-                    for k in sorted(id2label.keys(), key=lambda x: int(x)):
-                        ordered.append(str(id2label[k]))
-                    if ordered:
-                        self.LABELS = ordered
-            except Exception:
-                pass
-
-            global _classifier_device_logged
-            if not _classifier_device_logged:
-                _classifier_device_logged = True
-                logger.warning(
-                    "[MODEL] Aircraft classifier (PyTorch): checkpoint='%s' device='%s' "
-                    "torch.cuda.is_available=%s dml_available=%s prefer_directml=%s strict_rembg=%s",
-                    self._local_checkpoint_dir,
-                    self._torch_device,
-                    torch.cuda.is_available(),
-                    dml_available(),
-                    prefer_directml_classifier(),
-                    self._strict_rembg,
-                )
+            state = _load_shared_torch_vit(self._local_checkpoint_dir)
+            self._torch_processor = state["processor"]
+            self._torch_model = state["model"]
+            self._torch_device = state["device"]
+            labels = state.get("labels")
+            if labels:
+                self.LABELS = labels
             return True
+        except ImportError as e:
+            logger.warning("[MODEL] transformers ViT classes unavailable: %s", e)
+            return False
         except Exception as e:
-            logger.warning("[MODEL] HF checkpoint path unavailable, fallback to ONNX: %s", e)
+            logger.warning("[MODEL] PyTorch checkpoint load failed: %s", e)
             return False
 
     def _legacy_bg_remove(self, image: Image.Image) -> Image.Image:
         """Legacy PoC background removal: rembg isnet-general-use first."""
+        global _SHARED_REMBG_SESSION
         try:
             from rembg import new_session, remove
 
-            if self._rembg_session is None:
-                providers = onnxruntime_providers_prefer_dml()
-                self._rembg_session = new_session(
-                    "isnet-general-use", providers=providers
+            if _SHARED_REMBG_SESSION is None:
+                with _SHARED_REMBG_SESSION_LOCK:
+                    if _SHARED_REMBG_SESSION is None:
+                        providers = onnxruntime_providers_for_rembg()
+                        _SHARED_REMBG_SESSION = new_session(
+                            "isnet-general-use", providers=providers
+                        )
+                        logger.info(
+                            "[AVIATION AI] rembg session initialized (shared): "
+                            "isnet-general-use providers=%s",
+                            providers,
+                        )
+            with _REMBG_LOCK:
+                return remove(
+                    image, session=_SHARED_REMBG_SESSION, alpha_matting=False
                 )
-                logger.info(
-                    "[AVIATION AI] rembg session initialized: isnet-general-use providers=%s",
-                    providers,
-                )
-            return remove(image, session=self._rembg_session, alpha_matting=False)
         except Exception as e:
             if self._strict_rembg:
                 logger.warning("[AVIATION AI] strict rembg mode: rembg failed (%s), skip classification", e)
@@ -1239,8 +1388,9 @@ class MilitaryAircraftClassifier:
             import warnings
 
             import torch
-            from transformers import ViTForImageClassification
             from transformers.utils import logging as hf_transformers_logging
+
+            ViTForImageClassification, _ViTImageProcessor = _import_vit_hf_classes()
 
             export_kw = dict(
                 input_names=["pixel_values"],
@@ -1295,6 +1445,20 @@ class MilitaryAircraftClassifier:
             self._sync_labels_from_checkpoint()
             logger.info("[AVIATION AI] Exported ONNX classifier to %s", self.onnx_path)
             return True
+        except ImportError as e:
+            self._onnx_export_disabled = True
+            if os.path.exists(self.onnx_path) and os.path.getsize(self.onnx_path) > 0:
+                logger.info(
+                    "[AVIATION AI] PyTorch not installed; using existing ONNX at %s",
+                    self.onnx_path,
+                )
+                return True
+            logger.warning(
+                "[AVIATION AI] ONNX export requires PyTorch (pixi env dev-ml). "
+                "Run: pixi run -e dev-ml export-classifier-onnx — %s",
+                e,
+            )
+            return False
         except Exception as e:
             self._onnx_export_disabled = True
             logger.warning("[AVIATION AI] ONNX export for DirectML failed: %s", e)
@@ -1388,7 +1552,7 @@ class MilitaryAircraftClassifier:
                     conf,
                     os.path.basename(file_path),
                 )
-                if label and conf >= 0.40:
+                if label and conf >= _classifier_min_confidence():
                     return label
                 return ""
             if self._session is not None:
@@ -1401,7 +1565,7 @@ class MilitaryAircraftClassifier:
                 conf,
                 os.path.basename(file_path),
             )
-            if label and conf >= 0.40:
+            if label and conf >= _classifier_min_confidence():
                 return label
         return ""
 
@@ -1454,7 +1618,8 @@ class MilitaryAircraftClassifier:
             try:
                 import shutil
                 import torch
-                from transformers import ViTForImageClassification
+
+                ViTForImageClassification, _ViTImageProcessor = _import_vit_hf_classes()
 
                 os.makedirs(self.model_dir, exist_ok=True)
 
@@ -1550,7 +1715,8 @@ class MilitaryAircraftClassifier:
 
         try:
             import torch
-            from transformers import ViTForImageClassification
+
+            ViTForImageClassification, _ViTImageProcessor = _import_vit_hf_classes()
             
             model = ViTForImageClassification.from_pretrained(self.HUB_REPO_ID)
             model.eval()
@@ -1739,7 +1905,8 @@ class MilitaryAircraftClassifier:
             if label:
                 # Confidence thresholding (Combine knowledge logic)
                 # If confidence is too low, we return empty so the caller can fallback to SigLIP Zero-Shot
-                if conf < 0.40:
+                min_conf = _classifier_min_confidence()
+                if conf < min_conf:
                     logger.warning(f"[AVIATION AI] {os.path.basename(file_path)}: Ambiguous classification ({label} @ {conf:.2f}). Leaving unidentified.")
                     return ""
                     
@@ -2145,16 +2312,6 @@ class SemanticImageIndex:
         self._init_db_if_needed()
         self._sync_classifier_fingerprint()
         self._stop_requested = False
-
-    def _defer_face_scan_during_build(self) -> bool:
-        """
-        Compatibility hook expected by newer main.py background index worker.
-
-        SkySpotter build disables face detection, so we always defer/skip face scan
-        during semantic index build unless explicitly forced for debugging.
-        """
-        force_faces = os.environ.get("SkySpotter_FORCE_FACE_SCAN", "").strip().lower()
-        return force_faces not in {"1", "true", "yes", "on"}
 
     @property
     def backend(self):
@@ -3258,9 +3415,14 @@ class SemanticImageIndex:
     @staticmethod
     def _defer_face_scan_during_build() -> bool:
         """
-        When true, build_index finishes after metadata + semantic embeddings.
-        Face backfill runs in a second background pass so search becomes usable sooner.
+        When true, build_index skips inline face scan (second background pass may still run).
+
+        SkySpotter defaults face_scan off via skyspotter_features.json; when disabled we always defer.
         """
+        from skyspotter_features import face_scan_enabled
+
+        if not face_scan_enabled():
+            return True
         v = os.environ.get("RAWVIEWER_INDEX_DEFER_FACE_SCAN", "1").strip().lower()
         return v not in ("0", "false", "no", "off")
 
@@ -3296,6 +3458,111 @@ class SemanticImageIndex:
         return 25.0
 
     @staticmethod
+    def _aircraft_warm_thumbnails_enabled() -> bool:
+        v = os.environ.get("SkySpotter_AIRCRAFT_WARM_THUMBS", "1").strip().lower()
+        return v not in ("0", "false", "no", "off")
+
+    @staticmethod
+    def _warm_with_metadata_enabled() -> bool:
+        """When true, thumbnail warm runs inside the metadata parallel pass (default)."""
+        v = os.environ.get("SkySpotter_AIRCRAFT_WARM_WITH_METADATA", "1").strip().lower()
+        return v not in ("0", "false", "no", "off")
+
+    @staticmethod
+    def _warm_thumbnail_one(path: str) -> bool:
+        """Cache one embedded thumbnail if missing. Thread-safe; cheap on cache hit."""
+        from image_cache import get_image_cache
+
+        cache = get_image_cache()
+        if cache.get_thumbnail(path) is not None:
+            return True
+        try:
+            from enhanced_raw_processor import (
+                _thumbnail_via_qimage_reader,
+                extract_embedded_jpeg_by_scan,
+            )
+
+            arr = extract_embedded_jpeg_by_scan(path, 1024)
+            if arr is None:
+                arr = _thumbnail_via_qimage_reader(path, 1024)
+            if arr is not None:
+                cache.put_thumbnail(path, arr, None)
+                return True
+            proc = getattr(_WARM_THUMB_TLS, "processor", None)
+            if proc is None:
+                from unified_image_processor import UnifiedImageProcessor
+
+                proc = UnifiedImageProcessor()
+                _WARM_THUMB_TLS.processor = proc
+            thumb = proc.process_thumbnail(path, allow_heavy_fallback=False)
+            return thumb is not None
+        except Exception:
+            return False
+
+    @staticmethod
+    def _aircraft_warm_limits(pending_count: int) -> tuple[int, float]:
+        """
+        Auto thumbnail warm caps from GPU VRAM and uncached file count.
+
+        Returns ``(max_files, max_seconds)``. ``max_files <= 0`` or ``max_seconds <= 0``
+        means no cap on that dimension. Override with ``SkySpotter_AIRCRAFT_WARM_MAX_*``.
+        """
+        raw_files = os.environ.get("SkySpotter_AIRCRAFT_WARM_MAX_FILES", "").strip()
+        raw_secs = os.environ.get("SkySpotter_AIRCRAFT_WARM_MAX_SECONDS", "").strip()
+        if raw_files or raw_secs:
+            max_files = 512
+            if raw_files:
+                try:
+                    max_files = int(raw_files)
+                except ValueError:
+                    pass
+            max_seconds = 60.0
+            if raw_secs:
+                try:
+                    max_seconds = max(0.0, float(raw_secs))
+                except ValueError:
+                    pass
+            return max_files, max_seconds
+
+        pending = max(0, int(pending_count))
+        workers = max(1, min(4, suggested_aircraft_classify_workers()))
+        vram = gpu_vram_gib()
+
+        if torch_gpu_available() and vram is not None and vram >= 11:
+            return -1, 0.0
+
+        if torch_gpu_available() and vram is not None and vram >= 8:
+            if pending <= 2000:
+                return -1, 0.0
+            return 1500, 180.0
+
+        if torch_gpu_available() and vram is not None and vram >= 6:
+            cap_files = min(pending, 1024) if pending > 0 else 1024
+            est_secs = max(30.0, (cap_files / workers) * 0.25)
+            return cap_files, min(120.0, est_secs)
+
+        cap_files = min(pending, 384) if pending > 0 else 384
+        est_secs = max(20.0, (cap_files / workers) * 0.3)
+        return cap_files, min(45.0, est_secs)
+
+    @staticmethod
+    def _aircraft_classify_parallel_enabled() -> bool:
+        v = os.environ.get("SkySpotter_AIRCRAFT_CLASSIFY_PARALLEL", "1").strip().lower()
+        return v not in ("0", "false", "no", "off")
+
+    @staticmethod
+    def _aircraft_classify_worker_count() -> int:
+        raw = os.environ.get("SkySpotter_AIRCRAFT_CLASSIFY_WORKERS", "").strip()
+        if raw:
+            try:
+                return max(1, min(8, int(raw)))
+            except ValueError:
+                pass
+        if torch_gpu_available():
+            return suggested_aircraft_classify_workers()
+        return min(4, max(2, (os.cpu_count() or 4) - 1))
+
+    @staticmethod
     def face_detection_max_edge() -> int:
         """Longest edge passed to YuNet/Vision (see _load_index_source_image in _detect_face_count)."""
         raw = os.environ.get("RAWVIEWER_FACE_DETECT_MAX_EDGE", "").strip()
@@ -3306,63 +3573,45 @@ class SemanticImageIndex:
                 pass
         return 1280
 
-    def _warm_thumbnail_cache_for_face_scan(
+    def _warm_thumbnail_cache_paths(
         self,
         paths: List[str],
         progress_callback: ProgressCallback = None,
+        *,
+        max_files: int,
+        max_seconds: float,
+        workers: int,
+        log_label: str,
     ) -> int:
         """
-        Pre-extract embedded thumbnails into ImageCache so face scan avoids per-file RAW decode.
-        Face detection only needs a downscaled RGB image (~1280px); cached thumbs are enough.
+        Pre-extract embedded thumbnails into ImageCache so indexing avoids per-file RAW decode.
         """
-        import logging
         from image_cache import get_image_cache
-        from unified_image_processor import UnifiedImageProcessor
 
-        logger = logging.getLogger(__name__)
-        if not paths or not self._thumbnail_warm_before_face_scan():
+        if not paths:
             return 0
 
         cache = get_image_cache()
         pending = [p for p in paths if cache.get_thumbnail(p) is None]
         if not pending:
-            logger.info("[INDEX] Thumbnail warm-up: all %d face-scan paths already cached", len(paths))
+            logger.info("[INDEX] %s thumbnail warm-up: all %d paths already cached", log_label, len(paths))
             return 0
-        max_files = self._face_scan_warm_max_files()
         if max_files == 0:
-            logger.info("[INDEX] Thumbnail warm-up disabled by RAWVIEWER_FACE_SCAN_WARM_MAX_FILES=0")
+            logger.info("[INDEX] %s thumbnail warm-up disabled (max_files=0)", log_label)
             return 0
         if max_files > 0 and len(pending) > max_files:
             pending = pending[:max_files]
-        max_seconds = self._face_scan_warm_max_seconds()
 
-        workers = min(4, self._face_scan_worker_count())
-        processor = UnifiedImageProcessor()
+        workers = max(1, min(workers, 8))
         t0 = time.time()
         warmed = 0
 
         def _warm_one(path: str) -> bool:
-            if cache.get_thumbnail(path) is not None:
-                return True
-            try:
-                from enhanced_raw_processor import (
-                    _thumbnail_via_qimage_reader,
-                    extract_embedded_jpeg_by_scan,
-                )
-
-                arr = extract_embedded_jpeg_by_scan(path, 1024)
-                if arr is None:
-                    arr = _thumbnail_via_qimage_reader(path, 1024)
-                if arr is not None:
-                    cache.put_thumbnail(path, arr, None)
-                    return True
-                thumb = processor.process_thumbnail(path, allow_heavy_fallback=False)
-                return thumb is not None
-            except Exception:
-                return False
+            return SemanticImageIndex._warm_thumbnail_one(path)
 
         logger.info(
-            "[INDEX] Warming thumbnail cache for face scan: %d/%d files (%d workers, %.1fs budget)",
+            "[INDEX] %s thumbnail warm-up: %d/%d files (%d workers, %.1fs budget)",
+            log_label,
             len(pending),
             len(paths),
             workers,
@@ -3372,12 +3621,17 @@ class SemanticImageIndex:
         if workers <= 1 or total < 8:
             for i, path in enumerate(pending, start=1):
                 if max_seconds > 0 and (time.time() - t0) >= max_seconds:
-                    logger.info("[INDEX] Thumbnail warm-up budget reached after %d/%d files", i - 1, total)
+                    logger.info(
+                        "[INDEX] %s thumbnail warm-up budget reached after %d/%d files",
+                        log_label,
+                        i - 1,
+                        total,
+                    )
                     break
                 if _warm_one(path):
                     warmed += 1
                 if progress_callback and (i <= 2 or i >= total or i % 20 == 0):
-                    progress_callback(i, total, "Warming thumbnails...")
+                    progress_callback(i, total, f"Warming thumbnails ({log_label})…")
         else:
             completed = 0
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
@@ -3388,7 +3642,8 @@ class SemanticImageIndex:
                         remaining_budget = max(0.0, max_seconds - (time.time() - t0))
                         if remaining_budget <= 0:
                             logger.info(
-                                "[INDEX] Thumbnail warm-up budget reached after %d/%d files",
+                                "[INDEX] %s thumbnail warm-up budget reached after %d/%d files",
+                                log_label,
                                 completed,
                                 total,
                             )
@@ -3400,7 +3655,8 @@ class SemanticImageIndex:
                     )
                     if not done:
                         logger.info(
-                            "[INDEX] Thumbnail warm-up timeout after %d/%d files",
+                            "[INDEX] %s thumbnail warm-up timeout after %d/%d files",
+                            log_label,
                             completed,
                             total,
                         )
@@ -3415,20 +3671,74 @@ class SemanticImageIndex:
                         if progress_callback and (
                             completed <= 2 or completed >= total or completed % 20 == 0
                         ):
-                            progress_callback(completed, total, "Warming thumbnails...")
+                            progress_callback(
+                                completed,
+                                total,
+                                f"Warming thumbnails ({log_label})…",
+                            )
                     futures = set(not_done)
                 for future in futures:
                     future.cancel()
 
         dur = time.time() - t0
         logger.info(
-            "[INDEX] Thumbnail warm-up done in %.2fs: %d/%d newly cached (%.0f ms/file)",
+            "[INDEX] %s thumbnail warm-up done in %.2fs: %d/%d newly cached (%.0f ms/file)",
+            log_label,
             dur,
             warmed,
             len(pending),
             (dur / len(pending)) * 1000.0 if pending else 0,
         )
         return warmed
+
+    def _warm_thumbnail_cache_for_face_scan(
+        self,
+        paths: List[str],
+        progress_callback: ProgressCallback = None,
+    ) -> int:
+        """
+        Pre-extract embedded thumbnails into ImageCache so face scan avoids per-file RAW decode.
+        Face detection only needs a downscaled RGB image (~1280px); cached thumbs are enough.
+        """
+        if not paths or not self._thumbnail_warm_before_face_scan():
+            return 0
+        return self._warm_thumbnail_cache_paths(
+            paths,
+            progress_callback,
+            max_files=self._face_scan_warm_max_files(),
+            max_seconds=self._face_scan_warm_max_seconds(),
+            workers=min(4, self._face_scan_worker_count()),
+            log_label="face-scan",
+        )
+
+    def _warm_thumbnail_cache_for_aircraft(
+        self,
+        paths: List[str],
+        progress_callback: ProgressCallback = None,
+    ) -> int:
+        if not paths or not self._aircraft_warm_thumbnails_enabled():
+            return 0
+        from image_cache import get_image_cache
+
+        cache = get_image_cache()
+        pending_count = sum(1 for p in paths if cache.get_thumbnail(p) is None)
+        max_files, max_seconds = self._aircraft_warm_limits(pending_count)
+        files_label = "all" if max_files <= 0 else str(max_files)
+        secs_label = "unlimited" if max_seconds <= 0 else f"{max_seconds:.0f}s"
+        logger.info(
+            "[INDEX] aircraft-classify warm limits: pending=%d max_files=%s max_seconds=%s",
+            pending_count,
+            files_label,
+            secs_label,
+        )
+        return self._warm_thumbnail_cache_paths(
+            paths,
+            progress_callback,
+            max_files=max_files,
+            max_seconds=max_seconds,
+            workers=min(4, self._face_scan_worker_count()),
+            log_label="aircraft-classify",
+        )
 
     def _face_pending_paths(
         self, conn: sqlite3.Connection, canonical_paths: Sequence[str]
@@ -3475,6 +3785,10 @@ class SemanticImageIndex:
         """Deferred face-only pass (after semantic index is ready for search)."""
         import sqlite3
 
+        from skyspotter_features import face_scan_enabled
+
+        if not face_scan_enabled():
+            return 0
         if not file_paths:
             return 0
         canonical_map = {self._canonical_path(p): p for p in file_paths if p}
@@ -3515,17 +3829,8 @@ class SemanticImageIndex:
         if total_face <= 0:
             return
 
-        warm_cb = None
-        if progress_callback:
-
-            def warm_cb(local_i, local_n, msg):
-                progress_callback(
-                    progress_indexed_base,
-                    progress_album_total or local_n,
-                    f"Warming thumbnails… {local_i}/{local_n}",
-                )
-
-        self._warm_thumbnail_cache_for_face_scan(face_pending, warm_cb)
+        # Thumbnail warm-up is internal (logs only); avoid confusing status-bar text.
+        self._warm_thumbnail_cache_for_face_scan(face_pending, None)
 
         workers = self._face_scan_worker_count()
         max_edge = self.face_detection_max_edge()
@@ -3614,6 +3919,197 @@ class SemanticImageIndex:
             dur,
             (dur / total_face) * 1000.0 if total_face else 0,
         )
+
+    def _run_parallel_aircraft_semantic_pass(
+        self,
+        pending_for_semantic: List[tuple],
+        conn: sqlite3.Connection,
+        *,
+        progress_callback: ProgressCallback = None,
+        stop_check: Optional[Callable[[], bool]] = None,
+        progress_indexed_base: int = 0,
+        progress_album_total: int = 0,
+        commit_every: int = 40,
+    ) -> tuple[int, int]:
+        """Parallel aircraft-only semantic pass (no CLIP embeddings)."""
+        total_sem = len(pending_for_semantic)
+        if total_sem <= 0:
+            return 0, 0
+
+        try:
+            index_max = _classifier_index_max_size()
+        except (TypeError, ValueError):
+            index_max = 1280
+
+        if progress_callback:
+            progress_callback(
+                progress_indexed_base,
+                progress_album_total or total_sem,
+                f"Classifying aircraft… 0/{total_sem}",
+            )
+
+        paths = [cp for cp, _st in pending_for_semantic]
+        if self._aircraft_warm_thumbnails_enabled():
+            topup_cb = None
+            if not self._warm_with_metadata_enabled() and progress_callback:
+
+                def topup_cb(local_i, local_n, _msg):
+                    progress_callback(
+                        progress_indexed_base,
+                        progress_album_total or total_sem,
+                        f"Classifying aircraft… {local_i}/{local_n}",
+                    )
+
+            self._warm_thumbnail_cache_for_aircraft(paths, topup_cb)
+
+        workers = self._aircraft_classify_worker_count()
+        rembg_gpu = rembg_uses_directml()
+        logger.info(
+            "[INDEX] Aircraft classify settings: workers=%d index_max=%d min_conf=%.2f "
+            "vram=%s rembg=%s",
+            workers,
+            index_max,
+            _classifier_min_confidence(),
+            f"{gpu_vram_gib():.1f}GiB" if gpu_vram_gib() is not None else "n/a",
+            "directml" if rembg_gpu else "cpu",
+        )
+        t0 = time.time()
+        indexed = 0
+        failed = 0
+        batch_writes = 0
+        lock = threading.Lock()
+        completed = 0
+
+        def _classify_one(item: tuple) -> tuple[str, object, str, Optional[float], Optional[str]]:
+            canonical_fp, st = item
+            try:
+                clf = _thread_local_aircraft_classifier()
+                blur_score_val = None
+                detected_aircraft = ""
+                _src, _rgba, subject_crop = clf.prepare_subject_pipeline(
+                    canonical_fp, index_max, progress_callback=None
+                )
+                try:
+                    from blur_score import blur_score_enabled, compute_blur_score_for_index
+
+                    if blur_score_enabled() and _src is not None and _rgba is not None:
+                        blur_score_val, _blur_region = compute_blur_score_for_index(
+                            canonical_fp,
+                            _src,
+                            rgba_for_bbox=_rgba,
+                        )
+                except Exception:
+                    pass
+                if subject_crop is not None:
+                    detected_aircraft = clf.classify_from_subject_crop(
+                        subject_crop,
+                        canonical_fp,
+                        progress_callback=None,
+                    )
+                return canonical_fp, st, detected_aircraft, blur_score_val, None
+            except Exception as exc:
+                return canonical_fp, st, "", None, str(exc)
+
+        def _store_result(result: tuple) -> None:
+            nonlocal indexed, failed, batch_writes
+            canonical_fp, st, detected_aircraft, blur_score_val, err = result
+            if err:
+                failed += 1
+                logger.error(
+                    "[AVIATION AI] Classification failed for %s: %s",
+                    os.path.basename(canonical_fp),
+                    err,
+                )
+                try:
+                    self._mark_semantic_skipped(canonical_fp, st, conn)
+                    self._store_face_count(canonical_fp, 0, conn=conn, commit=False)
+                    batch_writes += 1
+                except Exception as mark_exc:
+                    logger.debug(
+                        "[INDEX] Could not mark skipped for %s: %s",
+                        os.path.basename(canonical_fp),
+                        mark_exc,
+                    )
+                return
+            conn.execute(
+                """
+                UPDATE semantic_index
+                SET dim = ?, embedding = ?, semantic_ready = 1,
+                    detected_aircraft = ?, blur_score = ?, updated_at = ?
+                WHERE file_path = ? AND model_name = ? AND file_size = ? AND mtime_ns = ?
+                """,
+                (
+                    0,
+                    self._to_blob(np.zeros(0, dtype=np.float32)),
+                    detected_aircraft,
+                    blur_score_val,
+                    float(time.time()),
+                    canonical_fp,
+                    self.model_name,
+                    int(st.st_size),
+                    self._mtime_ns_from_stat(st),
+                ),
+            )
+            indexed += 1
+            batch_writes += 1
+
+        if not self._aircraft_classify_parallel_enabled() or total_sem < 4 or workers <= 1:
+            for i, item in enumerate(pending_for_semantic, start=1):
+                if stop_check and stop_check():
+                    break
+                if progress_callback and (i <= 2 or i >= total_sem or i % 12 == 0):
+                    progress_callback(
+                        progress_indexed_base + i,
+                        progress_album_total,
+                        f"Classifying aircraft… {i}/{total_sem}",
+                    )
+                with lock:
+                    _store_result(_classify_one(item))
+                    if batch_writes >= commit_every:
+                        conn.commit()
+                        batch_writes = 0
+        else:
+            logger.info(
+                "[INDEX] Parallel aircraft classify: %d files, %d workers",
+                total_sem,
+                workers,
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(_classify_one, item): item
+                    for item in pending_for_semantic
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    if stop_check and stop_check():
+                        break
+                    completed += 1
+                    if progress_callback and (
+                        completed <= 2 or completed >= total_sem or completed % 12 == 0
+                    ):
+                        progress_callback(
+                            progress_indexed_base + completed,
+                            progress_album_total,
+                            f"Classifying aircraft… {completed}/{total_sem}",
+                        )
+                    with lock:
+                        _store_result(future.result())
+                        if batch_writes >= commit_every:
+                            conn.commit()
+                            batch_writes = 0
+
+        if batch_writes:
+            with lock:
+                conn.commit()
+
+        dur = time.time() - t0
+        logger.info(
+            "[INDEX] Aircraft classify pass done in %.2fs (%d indexed, %d failed, %.0f ms/img)",
+            dur,
+            indexed,
+            failed,
+            (dur / total_sem) * 1000.0 if total_sem else 0,
+        )
+        return indexed, failed
 
     def build_index(
         self,
@@ -3771,9 +4267,14 @@ class SemanticImageIndex:
             commit_every = 40
 
             if total_extract > 0:
+                warm_inline = (
+                    self._aircraft_warm_thumbnails_enabled()
+                    and self._warm_with_metadata_enabled()
+                )
                 logger.info(
-                    "[INDEX] Starting parallel metadata extraction for %d files...",
+                    "[INDEX] Starting parallel metadata extraction for %d files%s...",
                     total_extract,
+                    " (+ thumbnail warm)" if warm_inline else "",
                 )
                 t_meta_start = time.time()
                 max_workers = min(8, os.cpu_count() or 4)
@@ -3781,6 +4282,8 @@ class SemanticImageIndex:
                     def extract_task(item):
                         cp, st = item
                         try:
+                            if warm_inline:
+                                self._warm_thumbnail_one(cp)
                             meta = self._extract_exif_brief(cp, include_face=False)
                             return cp, st, meta
                         except Exception:
@@ -3842,9 +4345,33 @@ class SemanticImageIndex:
                 )
 
             use_embeddings = semantic_embeddings_enabled() and self.semantic_backend_available()
+            aircraft_only = (
+                self.model_name.startswith("aviation-") and not use_embeddings
+            )
             if total_sem > 0:
                 if not use_embeddings and not self.model_name.startswith("aviation-"):
                     skipped += total_sem
+                elif aircraft_only:
+                    logger.info(
+                        "[INDEX] Starting aircraft classification for %d files...",
+                        total_sem,
+                    )
+                    t_sem_start = time.time()
+                    sem_indexed, sem_failed = self._run_parallel_aircraft_semantic_pass(
+                        pending_for_semantic,
+                        conn,
+                        progress_callback=progress_callback,
+                        stop_check=stop_check,
+                        progress_indexed_base=progress_indexed_base,
+                        progress_album_total=progress_album_total,
+                        commit_every=commit_every,
+                    )
+                    indexed += sem_indexed
+                    failed += sem_failed
+                    logger.info(
+                        "[INDEX] Completed aircraft classification in %.4fs.",
+                        time.time() - t_sem_start,
+                    )
                 else:
                     logger.info(
                         "[INDEX] Starting AI features pass for %d files...",
@@ -3880,9 +4407,7 @@ class SemanticImageIndex:
                                     ):
                                         self._aviation_classifier = MilitaryAircraftClassifier()
                                     try:
-                                        index_max = int(
-                                            os.environ.get("SkySpotter_INDEX_MAX_SIZE", "1280")
-                                        )
+                                        index_max = _classifier_index_max_size()
                                     except (TypeError, ValueError):
                                         index_max = 1280
                                     prog = (

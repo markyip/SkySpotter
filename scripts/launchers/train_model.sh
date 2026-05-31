@@ -7,10 +7,11 @@ cd "$ROOT"
 # Optional override:
 # export SkySpotter_TRAIN_DATA_PATH="/path/to/SkySpotter/training_data/classified_images"
 
-echo "[SkySpotter] Installing/updating pixi environment..."
+echo "[SkySpotter] Installing/updating pixi environments (default + dev-ml)..."
 pixi install
+pixi install -e dev-ml
 
 echo "[SkySpotter] Starting model training..."
-pixi run python scripts/train_processed_aircraft.py
+pixi run -e dev-ml train-model
 
 echo "[SkySpotter] Training completed successfully."

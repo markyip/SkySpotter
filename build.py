@@ -211,7 +211,6 @@ def install_dependencies():
     if system_name == "Windows":
         # Windows semantic backend will move to ONNX
         dependencies.append('onnxruntime-directml')
-        dependencies.append('mediapipe')
         dependencies.append('opencv-contrib-python')
         dependencies.append('huggingface-hub')
         dependencies.append('requests')

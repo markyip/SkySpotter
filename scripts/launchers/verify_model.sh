@@ -9,8 +9,12 @@ cd "$ROOT"
 # export SkySpotter_VERIFY_MODEL_DIR=".../customized_model"
 # export SkySpotter_VERIFY_OUTPUT_DIR=".../testing_data/test_output"
 
-echo "[SkySpotter] Installing/updating pixi environment..."
+echo "[SkySpotter] Installing/updating pixi environments (default + dev-ml)..."
 pixi install
+pixi install -e dev-ml
+
+echo "[SkySpotter] Repairing OpenCV (remove headless conflict)..."
+pixi run setup
 
 echo "[SkySpotter] Verifying trained model on testing_data/test_images..."
 echo "[SkySpotter] Checkpoint: customized_model/  (override with SkySpotter_VERIFY_MODEL_DIR)"
@@ -27,6 +31,6 @@ if [[ -n "${SkySpotter_VERIFY_OUTPUT_DIR:-}" ]]; then
   args+=(--output-dir "$SkySpotter_VERIFY_OUTPUT_DIR")
 fi
 
-pixi run python scripts/batch_test_classifier.py "${args[@]}"
+pixi run -e dev-ml batch-test-classifier "${args[@]}"
 
 echo "[SkySpotter] Verification completed. See testing_data/test_output/top3_detection_scores.csv"

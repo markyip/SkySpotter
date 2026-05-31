@@ -144,6 +144,35 @@ class InstallWorker(QObject):
                 self.finished.emit(False)
                 return
 
+            self.progress_signal.emit(58)
+
+            # OpenCV repair + PyTorch CUDA vs DirectML fallback
+            self.log_signal.emit("Configuring OpenCV and PyTorch (GPU when available)...")
+            process_setup = subprocess.Popen(
+                [pixi_exe, "run", "setup"],
+                cwd=target_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            for line in process_setup.stdout:
+                if self.cancelled:
+                    process_setup.terminate()
+                    self.log_signal.emit("Installation cancelled.")
+                    return
+                msg = line.strip()
+                if msg:
+                    self.log_signal.emit(msg)
+            process_setup.wait()
+
+            if process_setup.returncode != 0:
+                self.log_signal.emit(
+                    "WARNING: Environment setup failed; aircraft classification may use DirectML fallback."
+                )
+
             self.progress_signal.emit(75)
 
             # Download AI Models

@@ -6,7 +6,7 @@ Resolution order for each flag:
   2. JSON file (``SkySpotter_FEATURES_FILE`` or ``config/skyspotter_features.json``)
   3. Built-in default (off for experimental features)
 
-Use ``scripts/set_features.py`` or ``pixi run -e experimental start`` for dev.
+Use ``scripts/set_features.py``, ``SkySpotter_ENABLE_BLUR_SCORE=1``, or ``pixi run start-experimental`` for dev.
 Pass ``--enable-blur-score`` to ``build.py`` when packaging an installer.
 """
 
@@ -84,5 +84,19 @@ def blur_score_enabled() -> bool:
     return False
 
 
+def face_scan_enabled() -> bool:
+    """RAWviewer-style face-count indexing for ``people`` / ``portrait`` gallery filters."""
+    env = _flag_from_env("SkySpotter_ENABLE_FACE_SCAN")
+    if env is not None:
+        return env
+    file_val = _parse_bool(load_feature_config().get("face_scan"))
+    if file_val is not None:
+        return file_val
+    return False
+
+
 def feature_flags_summary() -> dict[str, bool]:
-    return {"blur_score": blur_score_enabled()}
+    return {
+        "blur_score": blur_score_enabled(),
+        "face_scan": face_scan_enabled(),
+    }

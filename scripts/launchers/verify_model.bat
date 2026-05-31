@@ -7,10 +7,18 @@ REM set SkySpotter_VERIFY_INPUT_DIR=...\testing_data\test_images
 REM set SkySpotter_VERIFY_MODEL_DIR=...\customized_model
 REM set SkySpotter_VERIFY_OUTPUT_DIR=...\testing_data\test_output
 
-echo [SkySpotter] Installing/updating pixi environment...
+echo [SkySpotter] Installing/updating pixi environments (default + dev-ml)...
 pixi install
+pixi install -e dev-ml
 if errorlevel 1 (
   echo [SkySpotter] pixi install failed.
+  exit /b 1
+)
+
+echo [SkySpotter] Configuring OpenCV + PyTorch/DirectML backend...
+pixi run setup
+if errorlevel 1 (
+  echo [SkySpotter] OpenCV setup failed.
   exit /b 1
 )
 
@@ -23,7 +31,7 @@ if defined SkySpotter_VERIFY_INPUT_DIR set "VERIFY_ARGS=%VERIFY_ARGS% --input-di
 if defined SkySpotter_VERIFY_MODEL_DIR set "VERIFY_ARGS=%VERIFY_ARGS% --model-dir "%SkySpotter_VERIFY_MODEL_DIR%""
 if defined SkySpotter_VERIFY_OUTPUT_DIR set "VERIFY_ARGS=%VERIFY_ARGS% --output-dir "%SkySpotter_VERIFY_OUTPUT_DIR%""
 
-pixi run python scripts/batch_test_classifier.py %VERIFY_ARGS%
+pixi run -e dev-ml batch-test-classifier %VERIFY_ARGS%
 if errorlevel 1 (
   echo [SkySpotter] Verification failed.
   exit /b 1

@@ -23,6 +23,7 @@ from common_image_loader import (
     is_tiff_file,
     load_pixmap_safe,
     use_libraw_consistent_preview_first,
+    use_progressive_raw_loading,
 )
 
 
@@ -57,6 +58,52 @@ class UnifiedImageProcessor:
     def _is_raw_file(self, file_path: str) -> bool:
         """檢查是否為 RAW 文件"""
         return is_raw_file(file_path)
+
+    def _try_fast_raw_embedded_preview(
+        self, file_path: str, max_size: int = 1920, min_size: int = 1600
+    ) -> Optional[np.ndarray]:
+        """Extract embedded JPEG preview for progressive first paint (no LibRaw demosaic)."""
+        try:
+            from enhanced_raw_processor import (
+                _thumbnail_via_qimage_reader,
+                extract_embedded_jpeg_by_scan,
+            )
+
+            preview = None
+            for extractor in (
+                lambda: extract_embedded_jpeg_by_scan(file_path, max_size),
+                lambda: self.thumbnail_extractor.extract_preview_from_raw(
+                    file_path, max_size=max_size
+                ),
+                lambda: _thumbnail_via_qimage_reader(file_path, max_size),
+            ):
+                try:
+                    candidate = extractor()
+                except Exception:
+                    candidate = None
+                if candidate is None:
+                    continue
+                if hasattr(candidate, "shape"):
+                    h, w = candidate.shape[:2]
+                    if max(h, w) >= min_size:
+                        preview = candidate
+                        break
+            if preview is None:
+                return None
+
+            exif_data = self.exif_extractor.extract_exif_data(file_path)
+            orientation = exif_data.get("orientation", 1) if exif_data else 1
+            if orientation != 1:
+                preview = self._apply_orientation_correction(
+                    preview, orientation, exif_data
+                )
+            try:
+                self.cache.put_preview(file_path, preview)
+            except Exception:
+                pass
+            return preview
+        except Exception:
+            return None
     
     def process_thumbnail(self, file_path: str, allow_heavy_fallback: bool = True,
                           target_size: Optional[QSize] = None) -> Optional[np.ndarray]:
@@ -99,11 +146,16 @@ class UnifiedImageProcessor:
         # 提取縮圖 (Max 512px for Gallery)
         is_raw = self._is_raw_file(file_path)
         if is_raw:
-            thumbnail = self.thumbnail_extractor.extract_thumbnail_from_raw(
-                file_path,
-                max_size=MAX_THUMB_DIM,
-                allow_scan_fallback=allow_heavy_fallback,
-            )
+            if use_progressive_raw_loading() and use_libraw_consistent_preview_first():
+                thumbnail = self._try_fast_raw_embedded_preview(file_path)
+            else:
+                thumbnail = None
+            if thumbnail is None:
+                thumbnail = self.thumbnail_extractor.extract_thumbnail_from_raw(
+                    file_path,
+                    max_size=MAX_THUMB_DIM,
+                    allow_scan_fallback=allow_heavy_fallback,
+                )
         else:
             thumbnail = self.thumbnail_extractor.extract_thumbnail_from_image(
                 file_path, 
@@ -320,10 +372,25 @@ class UnifiedImageProcessor:
             
             # 處理 RAW - 使用 Process Pool 繞過 GIL
             if executor:
-                # logger = logging.getLogger(__name__)
-                # logger.info(f"[PIL/PROCESS_POOL] Offloading RAW postprocess to pool for {file_path}")
-                future = executor.submit(decode_raw_file, file_path, params)
-                rgb_image = future.result()
+                try:
+                    future = executor.submit(decode_raw_file, file_path, params)
+                    rgb_image = future.result()
+                except Exception as pool_err:
+                    import logging
+
+                    logging.getLogger(__name__).debug(
+                        "Process pool RAW decode failed for %s: %s",
+                        os.path.basename(file_path),
+                        pool_err,
+                    )
+                    rgb_image = None
+                    try:
+                        import rawpy
+
+                        with rawpy.imread(file_path) as raw:
+                            rgb_image = raw.postprocess(**params)
+                    except Exception:
+                        rgb_image = None
             else:
                 import rawpy
                 with rawpy.imread(file_path) as raw:
@@ -344,19 +411,58 @@ class UnifiedImageProcessor:
             # 快取完整圖像
             if rgb_image is not None:
                 self.cache.put_full_image(file_path, rgb_image)
-            
-            return rgb_image
-                
-        except Exception as e:
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.error(f"Error processing RAW image {file_path}: {e}", exc_info=True)
-            # LibRaw failed entirely; try byte-scan for embedded JPEG (already used in thumbnail
-            # path, but preview may have been skipped or a different limit may help).
+                return rgb_image
+
+            # Pool + in-process LibRaw both failed (e.g. HDR composite DNG) — embedded JPEG fallback.
             try:
                 from enhanced_raw_processor import extract_embedded_jpeg_by_scan
                 lim = 8192 if use_full_resolution else 1920
                 scanned = extract_embedded_jpeg_by_scan(file_path, lim)
+                if scanned is None and file_path.lower().endswith(".dng"):
+                    scanned = extract_embedded_jpeg_by_scan(file_path, 8192)
+                if scanned is not None:
+                    if orientation != 1:
+                        scanned = self._apply_orientation_correction(
+                            scanned, orientation, exif_data
+                        )
+                    if not use_full_resolution:
+                        if libraw_first:
+                            self.cache.put_full_image(file_path, scanned)
+                        else:
+                            self.cache.put_preview(file_path, scanned)
+                    return scanned
+            except Exception:
+                pass
+            return None
+                
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            err_name = type(e).__name__
+            unsupported = (
+                err_name == "LibRawFileUnsupportedError"
+                or "Unsupported file format" in str(e)
+            )
+            if unsupported:
+                logger.warning(
+                    "RAW decode unsupported for %s: %s",
+                    os.path.basename(file_path),
+                    e,
+                )
+            else:
+                logger.error(
+                    "Error processing RAW image %s: %s",
+                    file_path,
+                    e,
+                    exc_info=True,
+                )
+            # LibRaw failed entirely; try byte-scan for embedded JPEG (HDR DNG, etc.).
+            try:
+                from enhanced_raw_processor import extract_embedded_jpeg_by_scan
+                lim = 8192 if use_full_resolution else 1920
+                scanned = extract_embedded_jpeg_by_scan(file_path, lim)
+                if scanned is None and file_path.lower().endswith(".dng"):
+                    scanned = extract_embedded_jpeg_by_scan(file_path, 8192)
                 if scanned is not None:
                     exif_data = self.exif_extractor.extract_exif_data(file_path)
                     orientation = exif_data.get("orientation", 1) if exif_data else 1
@@ -364,8 +470,11 @@ class UnifiedImageProcessor:
                         scanned = self._apply_orientation_correction(
                             scanned, orientation, exif_data
                         )
-                    if not use_full_resolution and not libraw_first:
-                        self.cache.put_preview(file_path, scanned)
+                    if not use_full_resolution:
+                        if libraw_first:
+                            self.cache.put_full_image(file_path, scanned)
+                        else:
+                            self.cache.put_preview(file_path, scanned)
                     return scanned
             except Exception:
                 pass
@@ -404,6 +513,13 @@ class UnifiedImageProcessor:
             exif = self.process_exif(file_path)
             thumb = self.process_thumbnail(file_path, allow_heavy_fallback, target_size)
             return exif, thumb
+
+        # Progressive: embedded preview + EXIF without opening rawpy for demosaic.
+        if use_progressive_raw_loading() and use_libraw_consistent_preview_first():
+            preview = self._try_fast_raw_embedded_preview(file_path)
+            if preview is not None:
+                exif = self.exif_extractor.extract_exif_data(file_path)
+                return exif, preview
 
         # RAW Path: Open once, extract both
         import rawpy

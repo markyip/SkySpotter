@@ -1,10 +1,13 @@
 import os
+import threading
 import urllib.request
 import logging
 import numpy as np
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+_bg_inference_lock = threading.Lock()
 
 
 def _skyspotter_cache_root() -> str:
@@ -42,10 +45,10 @@ class BackgroundRemover:
             try:
                 from onnxruntime_providers import (
                     create_onnxruntime_session,
-                    onnxruntime_providers_prefer_dml,
+                    onnxruntime_providers_for_rembg,
                 )
 
-                providers = onnxruntime_providers_prefer_dml()
+                providers = onnxruntime_providers_for_rembg()
                 self.session = create_onnxruntime_session(self.model_path, providers)
                 logger.info(
                     "[BG Removal] ONNX session initialized with providers: %s",
@@ -63,10 +66,10 @@ class BackgroundRemover:
                     self._ensure_model()
                     from onnxruntime_providers import (
                         create_onnxruntime_session,
-                        onnxruntime_providers_prefer_dml,
+                        onnxruntime_providers_for_rembg,
                     )
 
-                    providers = onnxruntime_providers_prefer_dml()
+                    providers = onnxruntime_providers_for_rembg()
                     self.session = create_onnxruntime_session(self.model_path, providers)
                     logger.info(
                         "[BG Removal] Re-downloaded model; providers: %s",
@@ -103,7 +106,8 @@ class BackgroundRemover:
 
         # Inference
         input_name = self.session.get_inputs()[0].name
-        outs = self.session.run(None, {input_name: img_array})
+        with _bg_inference_lock:
+            outs = self.session.run(None, {input_name: img_array})
         
         # First output is the primary mask (D0)
         mask = outs[0][0][0]

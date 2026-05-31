@@ -5,7 +5,6 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
 export PYTHONUTF8=1
-export SkySpotter_PREFER_DIRECTML=1
 export SkySpotter_FEATURES_FILE=config/skyspotter_features.json
 export RAWVIEWER_USE_PROCESS_POOL=0
 export RAWVIEWER_VERBOSE_INFO_LOGS=0
