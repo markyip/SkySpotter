@@ -23,13 +23,17 @@ import io
 warnings.filterwarnings('ignore', category=UserWarning, module='exifread')
 
 from image_cache import get_image_cache
-from common_image_loader import normalize_capture_time_string
+from common_image_loader import (
+    decode_embedded_jpeg_bytes,
+    normalize_capture_time_string,
+    orientation_from_embedded_jpeg_bytes,
+)
 import metadata_backend
 from raw_file_extensions import RAW_FILE_EXTENSIONS
 
 # Cached EXIF rows without this version used embedded-JPEG dimensions as "original" (e.g. 1920×1080).
 # Cached EXIF rows without this version used buggy orientation logic (e.g. LibRaw 5 mis-mapped, Sony MakerNote missing, or Silent Failures).
-RAW_EXIF_SENSOR_META_VER = 6
+RAW_EXIF_SENSOR_META_VER = 7
 
 
 def _qimage_to_rgb_array(image: QImage) -> Optional[np.ndarray]:
@@ -83,26 +87,38 @@ def _largest_jpeg_from_blob(blob: bytes, max_size: int) -> Optional[np.ndarray]:
 
         for segment in segments:
             try:
-                im = Image.open(io.BytesIO(segment))
-                im.load()
-                if im.mode != "RGB":
-                    im = im.convert("RGB")
-                w, h = im.size
+                arr = decode_embedded_jpeg_bytes(segment, max_size)
+                if arr is None:
+                    continue
+                h, w = arr.shape[:2]
                 if w < 32 or h < 32:
                     continue
                 area = w * h
                 if area <= best_area:
                     continue
                 best_area = area
-                work = im
-                if w > max_size or h > max_size:
-                    work = im.copy()
-                    work.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-                best_arr = np.array(work)
+                best_arr = arr
             except Exception:
                 continue
         start = idx + 3
     return best_arr
+
+
+def _orientation_from_embedded_preview(
+    file_path: str, raw_object: Optional[rawpy.RawPy] = None
+) -> int:
+    """Orientation from LibRaw embedded JPEG EXIF (container tags are often missing/wrong)."""
+    try:
+        if raw_object is not None:
+            thumb = raw_object.extract_thumb()
+        else:
+            with rawpy.imread(file_path) as raw:
+                thumb = raw.extract_thumb()
+        if thumb is None or thumb.format != rawpy.ThumbFormat.JPEG:
+            return 1
+        return orientation_from_embedded_jpeg_bytes(thumb.data)
+    except Exception:
+        return 1
 
 
 def _thumbnail_via_qimage_reader(file_path: str, max_size: int) -> Optional[np.ndarray]:
@@ -112,7 +128,7 @@ def _thumbnail_via_qimage_reader(file_path: str, max_size: int) -> Optional[np.n
 
         reader = QImageReader(file_path)
         size = reader.size()
-        if size.isValid():
+        if max_size > 0 and size.isValid():
             reader.setScaledSize(
                 size.scaled(max_size, max_size, Qt.AspectRatioMode.KeepAspectRatio)
             )
@@ -177,6 +193,18 @@ class ThumbnailExtractor(QObject):
                                    raw_object: Optional[rawpy.RawPy] = None) -> Optional[np.ndarray]:
         """Extract embedded thumbnail from RAW file and resize to max_size."""
         thumb = None
+        
+        # For slow storage (UNC network shares), reading the whole RAW file via LibRaw is very slow.
+        # Prioritize reading just the head/tail for the embedded JPEG via scan to get an instant preview.
+        from common_image_loader import is_slow_storage_path
+        is_slow = is_slow_storage_path(file_path)
+        
+        if is_slow and allow_scan_fallback and raw_object is None:
+            scan_max = max_size if max_size > 0 else 8192
+            thumb = extract_embedded_jpeg_by_scan(file_path, scan_max)
+            if thumb is not None:
+                return thumb
+
         try:
             if raw_object is not None:
                 thumb = self._extract_from_raw_obj(raw_object, file_path, max_size)
@@ -198,7 +226,7 @@ class ThumbnailExtractor(QObject):
             return thumb
 
         # If rawpy fails entirely (e.g. unsupported DNG) or returns None, use non-LibRaw fallbacks.
-        if thumb is None and allow_scan_fallback:
+        if thumb is None and allow_scan_fallback and not is_slow:
             thumb = extract_embedded_jpeg_by_scan(file_path, max_size)
         if thumb is None and allow_scan_fallback:
             thumb = _thumbnail_via_qimage_reader(file_path, max_size)
@@ -206,7 +234,6 @@ class ThumbnailExtractor(QObject):
                 try:
                     import subprocess
                     import tempfile
-                    import os
                     from PIL import Image
                     tmp_name = None
                     try:
@@ -264,18 +291,7 @@ class ThumbnailExtractor(QObject):
             thumb = raw.extract_thumb()
             
             if thumb.format == rawpy.ThumbFormat.JPEG:
-                from PIL import Image, ImageOps
-                jpeg_image = Image.open(io.BytesIO(thumb.data))
-                
-                
-                if jpeg_image.mode != 'RGB':
-                    jpeg_image = jpeg_image.convert('RGB')
-                    
-                w, h = jpeg_image.size
-                if w > max_size or h > max_size:
-                    jpeg_image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-                    
-                return np.array(jpeg_image)
+                return decode_embedded_jpeg_bytes(thumb.data, max_size)
                 
             elif thumb.format == rawpy.ThumbFormat.BITMAP:
                 thumb_array = thumb.data.copy()
@@ -283,10 +299,10 @@ class ThumbnailExtractor(QObject):
                     return None
                 
                 h, w = thumb_array.shape[:2]
-                if w > max_size or h > max_size:
+                if max_size > 0 and (w > max_size or h > max_size):
                      from PIL import Image
                      pil_thumb = Image.fromarray(thumb_array)
-                     pil_thumb.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+                     pil_thumb.thumbnail((max_size, max_size), Image.Resampling.HAMMING)
                      return np.array(pil_thumb)
                 return thumb_array
             
@@ -301,6 +317,16 @@ class ThumbnailExtractor(QObject):
         return self.extract_thumbnail_from_raw(
             file_path,
             max_size=max_size,
+            allow_scan_fallback=allow_scan_fallback,
+        )
+
+    def extract_embedded_native_preview(
+        self, file_path: str, allow_scan_fallback: bool = True
+    ) -> Optional[np.ndarray]:
+        """Extract embedded JPEG at native resolution (max_size=0 disables downscaling)."""
+        return self.extract_thumbnail_from_raw(
+            file_path,
+            max_size=0,
             allow_scan_fallback=allow_scan_fallback,
         )
 
@@ -351,9 +377,9 @@ class ThumbnailExtractor(QObject):
         try:
             with Image.open(file_path) as img:
                 if target_size is not None and isinstance(target_size, QSize):
-                    img.thumbnail((target_size.width(), target_size.height()), Image.Resampling.LANCZOS)
+                    img.thumbnail((target_size.width(), target_size.height()), Image.Resampling.HAMMING)
                 else:
-                    img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+                    img.thumbnail((max_size, max_size), Image.Resampling.HAMMING)
                 
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
@@ -371,6 +397,15 @@ class EXIFExtractor(QObject):
     def __init__(self):
         super().__init__()
         self.cache = get_image_cache()
+
+    def _persist_exif_result(self, file_path: str, result: Optional[Dict[str, Any]]) -> None:
+        """Write freshly extracted metadata to memory + persistent EXIF cache."""
+        if not file_path or not isinstance(result, dict) or not result:
+            return
+        try:
+            self.cache.put_exif(file_path, result)
+        except Exception:
+            pass
 
     def extract_exif_data(self, file_path: str, raw_object: Optional[rawpy.RawPy] = None) -> Optional[Dict[str, Any]]:
         """Extract EXIF data from image file with RAW-specific orientation fallbacks."""
@@ -390,15 +425,15 @@ class EXIFExtractor(QObject):
                 return cached
 
         try:
+            import metadata_backend
+
+            tags = metadata_backend.process_file_from_path(file_path, details=False)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"metadata_backend failed on {file_path}: {e}")
             tags = {}
-            # First pass: standard exifread (works for JPEGs and many RAW containers)
-            try:
-                with open(file_path, 'rb') as f:
-                    tags = exifread.process_file(f, details=False)
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(f"exifread failed on {file_path}: {e}")
-            
+
+        try:
             # Standard orientation tags
             orientation = 1
             orientation_tag_found = None
@@ -520,6 +555,12 @@ class EXIFExtractor(QObject):
                 except Exception:
                     pass
 
+            # When container EXIF lacks orientation, read it from the embedded JPEG preview (Sony ARW, etc.).
+            if common_image_loader.is_raw_file(file_path) and orientation <= 1:
+                embedded_o = _orientation_from_embedded_preview(file_path, raw_object)
+                if embedded_o not in (1, orientation):
+                    orientation = embedded_o
+
             # Third pass: If dimensions are still 0 (e.g. non-RAW missing tags), use QImageReader (fast header read)
             if original_width <= 0 or original_height <= 0:
                 try:
@@ -627,7 +668,8 @@ class EXIFExtractor(QObject):
             if os.environ.get("SkySpotter_VERBOSE_ORIENTATION_LOGS") == "1":
                 # print(f"[ORIENTATION] EXIFExtractor: Successfully returning metadata with orientation={orientation} for {os.path.basename(file_path)}")
                 pass
-            
+
+            self._persist_exif_result(file_path, result)
             return result
             
         except Exception as e:

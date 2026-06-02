@@ -8,14 +8,13 @@ MVP goals:
 """
 
 from __future__ import annotations
-import logging
-logger = logging.getLogger(__name__)
 
 import os
 import re
 import sqlite3
 import time
 import hashlib
+import json
 import sys
 import gzip
 import urllib.request
@@ -25,26 +24,14 @@ import concurrent.futures
 from io import BytesIO
 from functools import lru_cache
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 from PIL import Image, ImageOps
 
 import metadata_backend
-from exif_subject_area import pixmap_ltwh_focus_hint
 
 from raw_file_extensions import RAW_FILE_EXTENSIONS
-from onnxruntime_providers import (
-    create_onnxruntime_session,
-    dml_available,
-    onnxruntime_providers_prefer_dml,
-    onnxruntime_providers_for_rembg,
-    rembg_uses_directml,
-    suggested_aircraft_classify_workers,
-    prefer_directml_classifier,
-    torch_gpu_available,
-    gpu_vram_gib,
-)
 
 try:
     import pycountry
@@ -54,196 +41,464 @@ except Exception:
 
 ProgressCallback = Optional[Callable[[int, int, str], None]]
 
-# Per-thread ViT classifier; rembg uses one shared DirectML session + lock.
-_AIRCRAFT_CLASSIFY_TLS = threading.local()
-_WARM_THUMB_TLS = threading.local()
-_REMBG_LOCK = threading.Lock()
-_SHARED_REMBG_SESSION = None
-_SHARED_REMBG_SESSION_LOCK = threading.Lock()
-_TORCH_VIT_LOAD_LOCK = threading.Lock()
-_SHARED_TORCH_VIT: Dict[str, Any] = {
-    "checkpoint_dir": None,
-    "model": None,
-    "processor": None,
-    "device": None,
-    "labels": None,
-}
-_classifier_device_logged = False
 
-
-def _import_vit_hf_classes():
-    """
-    Import ViT HF classes reliably across transformers versions.
-
-    transformers 5.x uses lazy exports from ``transformers.__init__``; concurrent
-    first imports from worker threads can intermittently raise ImportError. Retry
-    briefly, then fall back to direct submodule imports.
-    """
-    last_err: Optional[BaseException] = None
-    for attempt in range(4):
-        try:
-            from transformers import ViTForImageClassification, ViTImageProcessor
-
-            return ViTForImageClassification, ViTImageProcessor
-        except ImportError as exc:
-            last_err = exc
-            if attempt < 3:
-                time.sleep(0.05 * (attempt + 1))
+def format_index_progress(stage: str, done: int, total: int) -> str:
+    """Concise progress for the search field, e.g. 'Semantic: 12/48'."""
     try:
-        from transformers.models.vit.modeling_vit import ViTForImageClassification
-        try:
-            from transformers.models.vit.image_processing_vit import ViTImageProcessor
-        except ImportError:
-            from transformers import ViTImageProcessor
-        return ViTForImageClassification, ViTImageProcessor
-    except ImportError:
-        if last_err is not None:
-            raise last_err
-        raise
-
-
-def _labels_from_vit_config(model) -> Optional[List[str]]:
-    try:
-        id2label = getattr(model.config, "id2label", {}) or {}
-        if not id2label:
-            return None
-        ordered = []
-        for k in sorted(id2label.keys(), key=lambda x: int(x)):
-            ordered.append(str(id2label[k]))
-        return ordered or None
-    except Exception:
-        return None
-
-
-def _load_shared_torch_vit(checkpoint_dir: str) -> Dict[str, Any]:
-    """Load the gallery ViT checkpoint once; reuse across classify worker threads."""
-    global _classifier_device_logged
-
-    norm_dir = os.path.normcase(os.path.normpath(os.path.abspath(checkpoint_dir)))
-    with _TORCH_VIT_LOAD_LOCK:
-        if (
-            _SHARED_TORCH_VIT["model"] is not None
-            and _SHARED_TORCH_VIT["checkpoint_dir"] == norm_dir
-        ):
-            return _SHARED_TORCH_VIT
-
-        import torch
-
-        ViTForImageClassification, ViTImageProcessor = _import_vit_hf_classes()
-        processor = ViTImageProcessor.from_pretrained(checkpoint_dir)
-        model = ViTForImageClassification.from_pretrained(checkpoint_dir)
-        device = _resolve_classifier_torch_device()
-        model.to(device)
-        model.eval()
-        if str(device) == "cpu":
-            try:
-                threads = int(os.environ.get("SkySpotter_TORCH_THREADS", "0"))
-                if threads > 0:
-                    torch.set_num_threads(threads)
-            except (TypeError, ValueError):
-                pass
-
-        labels = _labels_from_vit_config(model)
-        _SHARED_TORCH_VIT.update(
-            {
-                "checkpoint_dir": norm_dir,
-                "model": model,
-                "processor": processor,
-                "device": device,
-                "labels": labels,
-            }
-        )
-
-        if not _classifier_device_logged:
-            _classifier_device_logged = True
-            logger.warning(
-                "[MODEL] Aircraft classifier (PyTorch): checkpoint='%s' device='%s' "
-                "torch.cuda.is_available=%s dml_available=%s prefer_directml=%s strict_rembg=%s",
-                checkpoint_dir,
-                device,
-                torch.cuda.is_available(),
-                dml_available(),
-                prefer_directml_classifier(),
-                os.environ.get("SkySpotter_STRICT_REMBG", "").strip().lower()
-                in {"1", "true", "yes", "on"},
-            )
-
-        return _SHARED_TORCH_VIT
-
-
-def _thread_local_aircraft_classifier() -> "MilitaryAircraftClassifier":
-    clf = getattr(_AIRCRAFT_CLASSIFY_TLS, "classifier", None)
-    if clf is None:
-        clf = MilitaryAircraftClassifier()
-        _AIRCRAFT_CLASSIFY_TLS.classifier = clf
-    return clf
-
-# SkySpotter default: ViT aircraft labels + EXIF gallery filters only (no SigLIP download).
-AVIATION_INDEX_MODEL_ID = "aviation-classifier-vit"
+        total_i = max(0, int(total))
+        done_i = max(0, int(done))
+    except (TypeError, ValueError):
+        return stage
+    if total_i <= 0:
+        return stage
+    done_i = min(done_i, total_i)
+    return f"{stage}: {done_i}/{total_i}"
 
 
 def semantic_embeddings_enabled() -> bool:
-    """CLIP/SigLIP text-image embeddings (~800MB ONNX). Opt-in via SkySpotter_ENABLE_SEMANTIC_SEARCH=1."""
-    return os.environ.get("SkySpotter_ENABLE_SEMANTIC_SEARCH", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
+    """Check if semantic search embeddings are enabled via environment."""
+    flag = os.environ.get("RAWVIEWER_ENABLE_SEMANTIC_SEARCH", "0").strip().lower()
+    return flag in ("1", "true", "yes", "on")
+
+
+def metadata_auto_index_enabled() -> bool:
+    """Check if auto metadata indexing is enabled via environment."""
+    flag = os.environ.get("RAWVIEWER_AUTO_METADATA_INDEX", "1").strip().lower()
+    return flag in ("1", "true", "yes", "on")
+
+
+def semantic_gpu_throttle_seconds() -> float:
+    """Optional per-image pacing for semantic pass.
+
+    Set RAWVIEWER_SEMANTIC_GPU_THROTTLE_MS to a positive value when you want
+    to reduce indexing pressure (e.g., keep UI extra responsive).
+    Default is 0ms so indexing is not artificially slowed down.
+    """
+    raw = os.environ.get("RAWVIEWER_SEMANTIC_GPU_THROTTLE_MS", "0").strip()
+    try:
+        ms = float(raw)
+    except Exception:
+        ms = 0.0
+    ms = max(0.0, min(ms, 2000.0))
+    return ms / 1000.0
+
+
+def semantic_batch_max() -> int:
+    """Upper cap for semantic ONNX batch size (auto-tune and forced)."""
+    raw = os.environ.get("RAWVIEWER_SEMANTIC_BATCH_MAX", "128").strip()
+    try:
+        v = int(raw)
+    except Exception:
+        v = 128
+    return max(1, min(v, 256))
+
+
+def semantic_batch_size() -> int:
+    """Semantic ONNX batch size. Default 1 keeps legacy behavior."""
+    raw = os.environ.get("RAWVIEWER_SEMANTIC_BATCH_SIZE", "1").strip()
+    try:
+        v = int(raw)
+    except Exception:
+        v = 1
+    return max(1, min(v, semantic_batch_max()))
+
+
+def semantic_batch_size_forced() -> Optional[int]:
+    """Return forced batch size when explicitly set by env, else None."""
+    raw = os.environ.get("RAWVIEWER_SEMANTIC_BATCH_SIZE", "").strip()
+    if not raw:
+        return None
+    try:
+        v = int(raw)
+    except Exception:
+        return 1
+    return max(1, min(v, semantic_batch_max()))
+
+
+def semantic_batch_auto_enabled() -> bool:
+    """Auto tune semantic batch size when no forced batch is provided."""
+    raw = os.environ.get("RAWVIEWER_SEMANTIC_BATCH_AUTO", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def semantic_batch_tune_sample_count() -> int:
+    raw = os.environ.get("RAWVIEWER_SEMANTIC_BATCH_TUNE_SAMPLES", "32").strip()
+    try:
+        v = int(raw)
+    except Exception:
+        v = 32
+    return max(8, min(v, 128))
+
+
+def semantic_batch_tie_ratio() -> float:
+    """When throughput is within this ratio of the best, prefer a larger batch."""
+    raw = os.environ.get("RAWVIEWER_SEMANTIC_BATCH_TIE_RATIO", "0.92").strip()
+    try:
+        r = float(raw)
+    except Exception:
+        r = 0.92
+    return max(0.5, min(r, 1.0))
+
+
+def semantic_encode_prep_workers() -> int:
+    """Parallel CPU workers for resize/load before ONNX image batch."""
+    raw = os.environ.get("RAWVIEWER_SEMANTIC_PREP_WORKERS", "").strip()
+    if raw:
+        try:
+            return max(1, min(int(raw), 32))
+        except Exception:
+            pass
+    return max(1, min(8, os.cpu_count() or 4))
+
+
+def semantic_batch_candidates() -> List[int]:
+    raw = os.environ.get(
+        "RAWVIEWER_SEMANTIC_BATCH_CANDIDATES", "1,2,4,8,16,32,64"
+    ).strip()
+    cap = semantic_batch_max()
+    out: List[int] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            out.append(max(1, min(cap, int(item))))
+        except Exception:
+            continue
+    if not out:
+        out = [1, 2, 4, 8, 16, 32, 64]
+    # stable dedupe
+    seen = set()
+    uniq: List[int] = []
+    for v in out:
+        if v not in seen:
+            seen.add(v)
+            uniq.append(v)
+    return uniq
+
+
+# Bump when auto-tune defaults/logic change so ~/.rawviewer_cache picks are refreshed.
+SEMANTIC_BATCH_TUNE_CACHE_VERSION = "v3"
+
+
+def _prep_mobileclip_image_chw(file_path: str) -> np.ndarray:
+    """Load, resize to 256, and return NCHW float tensor slice for one image."""
+    im = _load_index_source_image(file_path, max_size=1024).resize(
+        (256, 256), Image.Resampling.BICUBIC
+    )
+    rgb = np.asarray(im.convert("RGB"), dtype=np.float32) / 255.0
+    return np.transpose(rgb, (2, 0, 1))
+
+
+def _semantic_batch_cache_path() -> str:
+    return os.path.join(
+        os.path.expanduser("~"), ".rawviewer_cache", "semantic_batch_tuning.json"
     )
 
 
-def _resolve_classifier_torch_device():
-    """
-    Pick ViT inference device. Override with SkySpotter_CLASSIFIER_DEVICE=cpu|cuda|mps.
+def _load_semantic_batch_cache() -> Dict[str, int]:
+    try:
+        p = _semantic_batch_cache_path()
+        if not os.path.exists(p):
+            return {}
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {str(k): int(v) for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
 
-    Note: pixi's default `torch` wheel is often CPU-only on Windows; CUDA requires a
-    GPU-enabled PyTorch install (see README).
-    """
-    import torch
 
-    override = os.environ.get("SkySpotter_CLASSIFIER_DEVICE", "").strip().lower()
+def _save_semantic_batch_cache(cache: Dict[str, int]) -> None:
+    try:
+        p = _semantic_batch_cache_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2, sort_keys=True)
+    except Exception:
+        pass
+
+
+
+def resolve_onnx_execution_providers(
+    available: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """Pick ONNX Runtime EPs for the current OS and GPU vendor.
+
+    Windows: CUDA / TensorRT first when installed (NVIDIA); DirectML next for
+    AMD / Intel or when CUDA is unavailable (default pixi build uses DirectML only).
+    macOS: Core ML EP when using ONNX fallback; otherwise app uses native Core ML.
+    Other Unix (no official Linux release): CUDA / ROCm / OpenVINO when present in a
+    custom onnxruntime build, else CPU — source-only, not tested as a product target.
+    Override with RAWVIEWER_ORT_PROVIDERS (comma-separated EP names).
+    """
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        return ["CPUExecutionProvider"]
+
+    if available is None:
+        available = list(ort.get_available_providers())
+
+    override = os.environ.get("RAWVIEWER_ORT_PROVIDERS", "").strip()
+    if override:
+        names = [p.strip() for p in override.split(",") if p.strip()]
+        selected = [p for p in names if p in available]
+        return selected or ["CPUExecutionProvider"]
+
+    if sys.platform == "win32":
+        preferred = [
+            "CUDAExecutionProvider",
+            "TensorrtExecutionProvider",
+            "DmlExecutionProvider",
+            "OpenVINOExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+    elif sys.platform == "darwin":
+        preferred = [
+            "CoreMLExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+    else:
+        preferred = [
+            "CUDAExecutionProvider",
+            "ROCMExecutionProvider",
+            "OpenVINOExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+
+    selected = [p for p in preferred if p in available]
+    return selected or ["CPUExecutionProvider"]
+
+
+def resolve_opencv_dnn_backend_target() -> tuple:
+    """OpenCV DNN backend/target for YuNet / SSD face models (Windows).
+
+    GPU-first policy: prefer CUDA, then CPU.
+    OpenCL is opt-in only via RAWVIEWER_FACE_DNN_TARGET=opencl because some
+    Windows OpenCV ocl4dnn stacks are unstable and can crash the process.
+    Override with RAWVIEWER_FACE_DNN_TARGET=cpu|opencl|cuda|openvino.
+    """
+    import cv2
+
+    override = os.environ.get("RAWVIEWER_FACE_DNN_TARGET", "").strip().lower()
+    backend_opencv = cv2.dnn.DNN_BACKEND_OPENCV
+    target_cpu = cv2.dnn.DNN_TARGET_CPU
+
     if override == "cpu":
-        return torch.device("cpu")
+        return backend_opencv, target_cpu
+    if override == "opencl":
+        _log_opencl_runtime_details_once(cv2)
+        return backend_opencv, cv2.dnn.DNN_TARGET_OPENCL
     if override == "cuda":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        logger.warning(
-            "[MODEL] SkySpotter_CLASSIFIER_DEVICE=cuda but torch.cuda.is_available() is False; using CPU"
+        return cv2.dnn.DNN_BACKEND_CUDA, cv2.dnn.DNN_TARGET_CUDA
+    if override == "openvino":
+        return cv2.dnn.DNN_BACKEND_INFERENCE_ENGINE, target_cpu
+
+    # Auto policy (GPU-first, stability): CUDA -> CPU.
+    # Keep OpenCL disabled unless explicitly requested.
+    try:
+        cv2.ocl.setUseOpenCL(False)
+    except Exception:
+        pass
+    try:
+        if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+            return cv2.dnn.DNN_BACKEND_CUDA, cv2.dnn.DNN_TARGET_CUDA
+    except Exception:
+        pass
+    return backend_opencv, target_cpu
+
+
+def _apply_opencv_dnn_acceleration(net) -> None:
+    """Set preferable backend/target on an OpenCV dnn.Net (best-effort)."""
+    import cv2
+
+    backend_id, target_id = resolve_opencv_dnn_backend_target()
+    _log_face_backend_once(backend_id, target_id, cv2)
+    try:
+        net.setPreferableBackend(backend_id)
+        net.setPreferableTarget(target_id)
+    except Exception:
+        try:
+            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        except Exception:
+            pass
+
+
+_OPENCL_RUNTIME_LOGGED = False
+_FACE_BACKEND_LOGGED = False
+
+
+def _log_opencl_runtime_details_once(cv2_module=None) -> None:
+    """Best-effort one-time OpenCL runtime/device details for diagnostics."""
+    global _OPENCL_RUNTIME_LOGGED
+    if _OPENCL_RUNTIME_LOGGED:
+        return
+    _OPENCL_RUNTIME_LOGGED = True
+
+    import logging
+
+    logger = logging.getLogger(__name__)
+    try:
+        cv2 = cv2_module
+        if cv2 is None:
+            import cv2 as _cv2
+            cv2 = _cv2
+
+        have = bool(cv2.ocl.haveOpenCL())
+        enabled = bool(cv2.ocl.useOpenCL())
+        if not have:
+            logger.info("[ACCEL] OpenCL runtime: unavailable")
+            return
+
+        try:
+            dev = cv2.ocl.Device_getDefault()
+        except Exception:
+            dev = None
+
+        if dev is None:
+            logger.info("[ACCEL] OpenCL runtime: available, enabled=%s (device details unavailable)", enabled)
+            return
+
+        def _safe(callable_or_attr, default="unknown"):
+            try:
+                v = callable_or_attr() if callable(callable_or_attr) else callable_or_attr
+                return str(v) if v not in (None, "") else default
+            except Exception:
+                return default
+
+        name = _safe(getattr(dev, "name", None))
+        vendor = _safe(getattr(dev, "vendorName", None))
+        version = _safe(getattr(dev, "version", None))
+        driver = _safe(getattr(dev, "driverVersion", None))
+        ocl_c = _safe(getattr(dev, "OpenCL_C_Version", None))
+        logger.info(
+            "[ACCEL] OpenCL runtime: enabled=%s; vendor=%s; device=%s; version=%s; OpenCL_C=%s; driver=%s",
+            enabled,
+            vendor,
+            name,
+            version,
+            ocl_c,
+            driver,
         )
-        return torch.device("cpu")
-    if override == "mps":
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return torch.device("mps")
-        logger.warning(
-            "[MODEL] SkySpotter_CLASSIFIER_DEVICE=mps but MPS is unavailable; using CPU"
+    except Exception as e:
+        logger.info("[ACCEL] OpenCL runtime details unavailable: %s", e)
+
+
+def _log_face_backend_once(backend_id: int, target_id: int, cv2_module=None) -> None:
+    """One-time log of the actual selected OpenCV face backend/target."""
+    global _FACE_BACKEND_LOGGED
+    if _FACE_BACKEND_LOGGED:
+        return
+    _FACE_BACKEND_LOGGED = True
+
+    import logging
+
+    logger = logging.getLogger(__name__)
+    try:
+        cv2 = cv2_module
+        if cv2 is None:
+            import cv2 as _cv2
+            cv2 = _cv2
+
+        backend_name = str(backend_id)
+        try:
+            backend_name = cv2.dnn.getBackendName(backend_id)
+        except Exception:
+            pass
+
+        target_name = "CPU"
+        if target_id == cv2.dnn.DNN_TARGET_OPENCL:
+            target_name = "OpenCL"
+        elif target_id == cv2.dnn.DNN_TARGET_CUDA:
+            target_name = "CUDA"
+        elif target_id == getattr(cv2.dnn, "DNN_TARGET_OPENCL_FP16", -1):
+            target_name = "OpenCL FP16"
+
+        logger.info(
+            "[ACCEL] Face DNN backend selected: backend=%s target=%s (id=%s)",
+            backend_name,
+            target_name,
+            target_id,
         )
-        return torch.device("cpu")
-
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+    except Exception as e:
+        logger.info("[ACCEL] Face DNN backend selected: backend_id=%s target_id=%s (%s)", backend_id, target_id, e)
 
 
-def _skyspotter_cache_root() -> str:
-    return os.path.expanduser(
-        os.environ.get("SkySpotter_CACHE_DIR", "~/.skyspotter_cache")
-    )
+def _coreml_compute_units():
+    """Core ML compute-unit preference for MobileCLIP on macOS."""
+    import CoreML
+
+    raw = os.environ.get("RAWVIEWER_COREML_COMPUTE_UNITS", "all").strip().lower()
+    mapping = {
+        "cpu": CoreML.MLComputeUnitsCPUOnly,
+        "gpu": CoreML.MLComputeUnitsCPUAndGPU,
+        "ane": CoreML.MLComputeUnitsCPUAndNeuralEngine,
+        "all": CoreML.MLComputeUnitsAll,
+    }
+    return mapping.get(raw, CoreML.MLComputeUnitsAll)
 
 
-def _checkpoint_dir_candidates(project_root: str) -> list[str]:
-    """Project folders checked for the gallery ViT checkpoint (first with model.safetensors wins)."""
-    from gallery_model_paths import checkpoint_dir_candidates
+_ACCEL_PROFILE_LOGGED = False
 
-    return checkpoint_dir_candidates(project_root)
+
+def log_inference_acceleration_profile(force: bool = False) -> None:
+    """Log once which inference accelerators are active (semantic + face)."""
+    global _ACCEL_PROFILE_LOGGED
+    if _ACCEL_PROFILE_LOGGED and not force:
+        return
+    _ACCEL_PROFILE_LOGGED = True
+
+    import logging
+
+    logger = logging.getLogger(__name__)
+    parts: List[str] = []
+
+    if sys.platform == "darwin":
+        parts.append("semantic=Core ML (Apple GPU/ANE when available)")
+    else:
+        try:
+            import onnxruntime as ort
+
+            available = list(ort.get_available_providers())
+            selected = resolve_onnx_execution_providers(available)
+            parts.append(f"semantic=ONNX [{', '.join(selected)}]")
+        except Exception:
+            parts.append("semantic=ONNX [CPUExecutionProvider]")
+
+    if sys.platform == "darwin":
+        parts.append("face=Apple Vision")
+    else:
+        try:
+            import cv2
+
+            b, t = resolve_opencv_dnn_backend_target()
+            try:
+                bname = cv2.dnn.getBackendName(b)
+            except Exception:
+                bname = str(b)
+            parts.append(f"face=OpenCV YuNet backend={bname} target={t}")
+        except Exception:
+            parts.append("face=OpenCV YuNet (CPU)")
+
+    gpu_view = os.environ.get("RAWVIEWER_GPU_VIEW", "").strip().lower()
+    if gpu_view in ("1", "true", "yes", "on"):
+        no_gl = os.environ.get("RAWVIEWER_GPU_VIEW_NO_GL", "").strip().lower()
+        if no_gl in ("1", "true", "yes", "on"):
+            parts.append("display=Qt raster viewport")
+        else:
+            parts.append("display=Qt OpenGL viewport (vendor-agnostic)")
+
+    logger.info("[ACCEL] Inference profile: %s", "; ".join(parts))
 
 
 def _load_index_source_image(file_path: str, max_size: int = 1024) -> Image.Image:
     """Load a small RGB image suitable for indexing/detection, preferring app caches."""
     import threading
     global _THREAD_LOCAL_DETECTORS
-    if "_THREAD_LOCAL_DETECTORS" not in globals():
+    if '_THREAD_LOCAL_DETECTORS' not in globals():
         _THREAD_LOCAL_DETECTORS = threading.local()
     _THREAD_LOCAL_DETECTORS.last_original_sizes = (0, 0)
 
@@ -325,42 +580,6 @@ def _load_index_source_image(file_path: str, max_size: int = 1024) -> Image.Imag
         except Exception:
             pass
 
-        try:
-            import rawpy  # type: ignore
-        except Exception as exc:
-            raise RuntimeError(
-                f"Cannot decode image for semantic index: {os.path.basename(file_path)}"
-            ) from exc
-
-        with rawpy.imread(file_path) as raw:
-            try:
-                thumb = raw.extract_thumb()
-                if thumb is not None:
-                    if thumb.format == rawpy.ThumbFormat.JPEG:
-                        im = Image.open(BytesIO(thumb.data))
-                        im = ImageOps.exif_transpose(im).convert("RGB")
-                        _THREAD_LOCAL_DETECTORS.last_original_sizes = (im.width, im.height)
-                        im.thumbnail((max_size, max_size), Image.Resampling.BICUBIC)
-                        return im.copy()
-                    if thumb.format == rawpy.ThumbFormat.BITMAP:
-                        im = Image.fromarray(thumb.data, mode="RGB")
-                        _THREAD_LOCAL_DETECTORS.last_original_sizes = (im.width, im.height)
-                        im.thumbnail((max_size, max_size), Image.Resampling.BICUBIC)
-                        return im
-            except Exception:
-                pass
-
-            rgb = raw.postprocess(
-                use_camera_wb=True,
-                no_auto_bright=True,
-                half_size=True,
-                output_bps=8,
-            )
-        im = Image.fromarray(rgb, mode="RGB")
-        _THREAD_LOCAL_DETECTORS.last_original_sizes = (im.width, im.height)
-        im.thumbnail((max_size, max_size), Image.Resampling.BICUBIC)
-        return im
-
     raise RuntimeError(
         f"Cannot decode image for semantic index: {os.path.basename(file_path)}"
     )
@@ -382,27 +601,26 @@ class SearchHit:
     country: str = ""
     country_code: str = ""
     face_count: int = 0
-    detected_aircraft: str = ""
 
 
 class MobileCLIPCoreMLBackend:
     """Optional macOS Core ML backend for MobileCLIP.
 
     Model assets are expected in:
-    - SkySpotter_MOBILECLIP_MODEL_DIR, or
-    - ~/.skyspotter_cache/mobileclip_coreml
+    - RAWVIEWER_MOBILECLIP_MODEL_DIR, or
+    - ~/.rawviewer_cache/mobileclip_coreml
 
     Recognized bundle pairs (first match wins under ``model_dir``):
 
     - **Apple Hub (S2):** ``mobileclip_s2_image.mlpackage`` / ``mobileclip_s2_text.mlpackage``
-    - **App export (legacy local exporter):**
+    - **App export (``export_mobileclip2_coreml.py --for-app``):**
       ``mobileclip2_s0_image.mlpackage`` / ``mobileclip2_s0_text.mlpackage``
 
     Note: text encoding also needs a tokenizer compatible with the Core ML text
     encoder. Until a tokenizer asset is present, the backend reports unavailable
     rather than silently falling back to metadata-only results.
 
-    Exported MobileCLIP2 models
+    Exported MobileCLIP2 models (see ``scripts/export_mobileclip2_coreml.py``)
     expose the image encoder as FLOAT32 MultiArray ``[1,3,256,256]`` in NCHW
     pixel scale ``[0,1]``. Apple-shipped MobileCLIP S2 bundles use MLFeatureTypeImage;
     ``encode_image`` supports both via model introspection.
@@ -460,10 +678,10 @@ class MobileCLIPCoreMLBackend:
     @staticmethod
     def _candidate_model_dirs() -> List[str]:
         dirs: List[str] = []
-        env_dir = os.environ.get("SkySpotter_MOBILECLIP_MODEL_DIR")
+        env_dir = os.environ.get("RAWVIEWER_MOBILECLIP_MODEL_DIR")
         if env_dir:
             dirs.append(env_dir)
-        dirs.append(os.path.join(_skyspotter_cache_root(), "mobileclip_coreml"))
+        dirs.append(os.path.expanduser("~/.rawviewer_cache/mobileclip_coreml"))
         if getattr(sys, "frozen", False):
             exe_dir = os.path.dirname(sys.executable)
             meipass = getattr(sys, "_MEIPASS", None)
@@ -552,7 +770,7 @@ class MobileCLIPCoreMLBackend:
         except Exception as exc:
             raise RuntimeError(
                 "MobileCLIP auto-download requires 'huggingface_hub'. "
-                "Install dependencies with: pixi install (see pixi.toml)"
+                "Install dependencies with: pip install -r requirements.txt"
             ) from exc
 
         snapshot_download(
@@ -589,7 +807,7 @@ class MobileCLIPCoreMLBackend:
             url = Foundation.NSURL.fileURLWithPath_(path)
             
             # Persistent cache for compiled models to avoid O(seconds) re-compilation
-            cache_dir = os.path.join(_skyspotter_cache_root(), "compiled_models")
+            cache_dir = os.path.expanduser("~/.rawviewer_cache/compiled_models")
             os.makedirs(cache_dir, exist_ok=True)
             
             try:
@@ -606,16 +824,25 @@ class MobileCLIPCoreMLBackend:
                 tmp_url, compile_error = CoreML.MLModel.compileModelAtURL_error_(url, None)
                 if compile_error is not None or tmp_url is None:
                     raise RuntimeError(f"Failed to compile Core ML model: {compile_error}")
-                
+
                 mgr = Foundation.NSFileManager.defaultManager()
                 if os.path.exists(compiled_path):
                     mgr.removeItemAtURL_error_(compiled_url, None)
-                
+
                 success, move_error = mgr.moveItemAtURL_toURL_error_(tmp_url, compiled_url, None)
                 if not success:
                     compiled_url = tmp_url
-            
-            model, load_error = CoreML.MLModel.modelWithContentsOfURL_error_(compiled_url, None)
+
+            config = CoreML.MLModelConfiguration.alloc().init()
+            try:
+                config.setComputeUnits_(_coreml_compute_units())
+            except Exception:
+                pass
+            model, load_error = CoreML.MLModel.modelWithContentsOfURL_configuration_error_(
+                compiled_url, config, None
+            )
+            if load_error is not None or model is None:
+                model, load_error = CoreML.MLModel.modelWithContentsOfURL_error_(compiled_url, None)
             if load_error is not None or model is None:
                 raise RuntimeError(f"Failed to load Core ML model: {load_error}")
             return model
@@ -706,7 +933,7 @@ class MobileCLIPCoreMLBackend:
         feature = None
         if in_type == CoreML.MLFeatureTypeMultiArray:
             rgb = np.asarray(im.convert("RGB"), dtype=np.float32) / 255.0
-            nchw = np.transpose(rgb, (2, 0, 1))[np.newaxis, ...].astype(np.float32)
+            nchw = np.transpose(rgb, (2, 0, 1))[np.newaxis, ...]
             multi = self._float32_multi_array_nchw(nchw)
             feature = CoreML.MLFeatureValue.featureValueWithMultiArray_(multi)
         elif in_type == CoreML.MLFeatureTypeImage:
@@ -781,7 +1008,7 @@ class MobileCLIPCoreMLBackend:
 
 
 class MobileCLIPONNXBackend:
-    """Windows/Linux ONNX backend for MobileCLIP2-S0.
+    """Windows ONNX backend for MobileCLIP2-S0 (official non-macOS release path).
     
     Requires 'onnxruntime' and 'numpy'.
     """
@@ -807,7 +1034,7 @@ class MobileCLIPONNXBackend:
     @staticmethod
     def _candidate_model_dirs() -> List[str]:
         dirs: List[str] = []
-        env_dir = os.environ.get("SkySpotter_MOBILECLIP_MODEL_DIR")
+        env_dir = os.environ.get("RAWVIEWER_MOBILECLIP_MODEL_DIR")
         if env_dir:
             dirs.append(env_dir)
             
@@ -821,7 +1048,7 @@ class MobileCLIPONNXBackend:
             if hasattr(sys, "_MEIPASS"):
                 dirs.append(os.path.join(sys._MEIPASS, "models", "mobileclip_onnx"))
             
-        dirs.append(os.path.join(_skyspotter_cache_root(), "mobileclip_onnx"))
+        dirs.append(os.path.expanduser("~/.rawviewer_cache/mobileclip_onnx"))
         
         module_dir = os.path.dirname(os.path.abspath(__file__))
         dirs.append(os.path.join(module_dir, "..", "models", "mobileclip_onnx"))
@@ -859,12 +1086,9 @@ class MobileCLIPONNXBackend:
         os.makedirs(self.model_dir, exist_ok=True)
         _progress("Downloading MobileCLIP ONNX models...")
         try:
-            from huggingface_hub import hf_hub_url
-            from huggingface_hub.utils import disable_progress_bars
-            import requests
-            disable_progress_bars()
+            from huggingface_hub import hf_hub_download
         except ImportError:
-            raise RuntimeError("MobileCLIP download requires 'huggingface_hub' and 'requests'")
+            raise RuntimeError("MobileCLIP download requires 'huggingface_hub' (pip install huggingface_hub)")
 
         # Mapping of remote path in HF repo to local filename expected by RAWviewer
         files_to_download = {
@@ -873,28 +1097,22 @@ class MobileCLIPONNXBackend:
         }
         
         for remote_path, local_name in files_to_download.items():
+            _progress(f"Fetching {local_name}...")
+            hf_hub_download(
+                repo_id=self.HUB_REPO_ID,
+                filename=remote_path,
+                local_dir=self.model_dir,
+                local_dir_use_symlinks=False
+            )
+            
+            # Handle nesting created by local_dir
+            downloaded_path = os.path.join(self.model_dir, remote_path)
             target_path = os.path.join(self.model_dir, local_name)
-            if os.path.exists(target_path):
-                continue
-
-            url = hf_hub_url(repo_id=self.HUB_REPO_ID, filename=remote_path)
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
             
-            total_size = int(response.headers.get('content-length', 0))
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            
-            downloaded = 0
-            with open(target_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=1024*1024):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total_size > 0:
-                            percent = (downloaded / total_size) * 100
-                            _progress(f"Downloading AI model component: {local_name} ({percent:.1f}%)")
-                        else:
-                            _progress(f"Downloading AI model component: {local_name}...")
+            if os.path.exists(downloaded_path):
+                if os.path.exists(target_path):
+                    os.remove(target_path)
+                os.rename(downloaded_path, target_path)
 
         # Clean up empty subdirectories
         onnx_dir = os.path.join(self.model_dir, "onnx")
@@ -913,41 +1131,24 @@ class MobileCLIPONNXBackend:
         if self._image_session is not None:
             return
         import onnxruntime as ort
+
+        available = list(ort.get_available_providers())
+        selected_providers = resolve_onnx_execution_providers(available)
+
         import logging
-        logger = logging.getLogger(__name__)
-        
-        so = ort.SessionOptions()
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        
-        # Prioritize high-performance providers
-        providers = [
-            "CoreMLExecutionProvider",
-            "CUDAExecutionProvider", 
-            "TensorrtExecutionProvider", 
-            "DmlExecutionProvider", 
-            "CPUExecutionProvider"
-        ]
-        
-        available_providers = ort.get_available_providers()
-        selected_providers = [p for p in providers if p in available_providers]
-        from main import safe_print
-        safe_print(f"[SemanticSearch] Initializing MobileCLIP ONNX session. Available providers: {available_providers}, using: {selected_providers}", flush=True)
-        
-        try:
-            self._image_session = ort.InferenceSession(self.image_model_path, sess_options=so, providers=selected_providers)
-            active_p = self._image_session.get_providers()
-            logger.warning(f"[SYSTEM] AI Image Session initialized with: {active_p[0] if active_p else 'Unknown'}")
-        except Exception as e:
-            logger.error(f"[SYSTEM] AI Image Session GPU init failed ({e}), falling back to CPU")
-            self._image_session = ort.InferenceSession(self.image_model_path, sess_options=so, providers=["CPUExecutionProvider"])
-            
-        try:
-            self._text_session = ort.InferenceSession(self.text_model_path, sess_options=so, providers=selected_providers)
-            active_p = self._text_session.get_providers()
-            logger.warning(f"[SYSTEM] AI Text Session initialized with: {active_p[0] if active_p else 'Unknown'}")
-        except Exception as e:
-            logger.error(f"[SYSTEM] AI Text Session GPU init failed ({e}), falling back to CPU")
-            self._text_session = ort.InferenceSession(self.text_model_path, sess_options=so, providers=["CPUExecutionProvider"])
+
+        logging.getLogger(__name__).info(
+            "[SemanticSearch] MobileCLIP ONNX providers available=%s using=%s",
+            available,
+            selected_providers,
+        )
+
+        self._image_session = ort.InferenceSession(
+            self.image_model_path, providers=selected_providers
+        )
+        self._text_session = ort.InferenceSession(
+            self.text_model_path, providers=selected_providers
+        )
 
     def _ensure_tokenizer(self):
         if self._tokenizer is None:
@@ -966,14 +1167,30 @@ class MobileCLIPONNXBackend:
 
     def encode_image(self, file_path: str) -> np.ndarray:
         self._ensure_sessions()
-        # MobileCLIP2-S0 typically uses 256x256
-        im = _load_index_source_image(file_path, max_size=1024).resize((256, 256), Image.Resampling.BICUBIC)
-        rgb = np.asarray(im.convert("RGB"), dtype=np.float32) / 255.0
-        nchw = np.transpose(rgb, (2, 0, 1))[np.newaxis, ...].astype(np.float32)
-        
+        nchw = _prep_mobileclip_image_chw(file_path)[np.newaxis, ...]
         inputs = {self._image_session.get_inputs()[0].name: nchw}
         outputs = self._image_session.run(None, inputs)
         return self._normalize(outputs[0])
+
+    def encode_images(self, file_paths: Sequence[str]) -> List[np.ndarray]:
+        """Best-effort batched image encoding for ONNX backend."""
+        self._ensure_sessions()
+        paths = [p for p in (file_paths or []) if p]
+        if not paths:
+            return []
+        workers = semantic_encode_prep_workers()
+        if len(paths) == 1 or workers <= 1:
+            tensors = [_prep_mobileclip_image_chw(p) for p in paths]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(workers, len(paths))
+            ) as executor:
+                tensors = list(executor.map(_prep_mobileclip_image_chw, paths))
+        nchw = np.stack(tensors, axis=0)
+        inputs = {self._image_session.get_inputs()[0].name: nchw}
+        outputs = self._image_session.run(None, inputs)
+        out = np.asarray(outputs[0], dtype=np.float32)
+        return [self._normalize(out[i]) for i in range(out.shape[0])]
 
     @staticmethod
     def _normalize(vec: np.ndarray) -> np.ndarray:
@@ -984,1168 +1201,25 @@ class MobileCLIPONNXBackend:
         return arr
 
 
-def _classifier_min_crop_fraction() -> float:
-    """Fraction of source width/height used as per-axis minimum crop size (default 20%)."""
-    try:
-        raw = os.environ.get("SkySpotter_CLASSIFIER_MIN_CROP_FRACTION", "0.20")
-        value = float(raw)
-        return min(1.0, max(0.01, value))
-    except (TypeError, ValueError):
-        return 0.20
-
-
-def _classifier_min_crop_thresholds(
-    source_width: int, source_height: int
-) -> tuple[int, int]:
-    """
-    Per-axis minimum crop sizes derived from the indexed source image dimensions.
-
-    Example: 2000×2000 at 20% → skip only if crop is below 400×400 (both axes).
-    Classify when either crop side meets its axis threshold.
-    """
-    w = max(1, int(source_width or 1))
-    h = max(1, int(source_height or 1))
-    pct = _classifier_min_crop_fraction()
-    min_w = max(1, int(round(w * pct)))
-    min_h = max(1, int(round(h * pct)))
-    floor_raw = os.environ.get("SkySpotter_CLASSIFIER_MIN_CROP_FLOOR", "").strip()
-    if not floor_raw:
-        floor_raw = os.environ.get("SkySpotter_CLASSIFIER_MIN_CROP_SIZE", "").strip()
-    if floor_raw:
-        try:
-            floor_px = max(1, int(floor_raw))
-            min_w = max(min_w, floor_px)
-            min_h = max(min_h, floor_px)
-        except (TypeError, ValueError):
-            pass
-    return min_w, min_h
-
-
-def _classifier_min_confidence() -> float:
-    """Minimum softmax confidence to store a ViT aircraft label (default 0.40)."""
-    try:
-        raw = os.environ.get("SkySpotter_CLASSIFIER_MIN_CONF", "0.40").strip()
-        return min(0.99, max(0.05, float(raw)))
-    except (TypeError, ValueError):
-        return 0.40
-
-
-def _classifier_index_max_size() -> int:
-    """
-    Longest edge when loading images for rembg + ViT during indexing.
-
-    Resolution order: ``SkySpotter_INDEX_MAX_SIZE`` → ``SkySpotter_CLASSIFY_MAX_SIZE``
-    → auto (1920 on CUDA ≥10 GiB, else 1280).
-    """
-    for env_name in ("SkySpotter_INDEX_MAX_SIZE", "SkySpotter_CLASSIFY_MAX_SIZE"):
-        raw = os.environ.get(env_name, "").strip()
-        if raw:
-            try:
-                return max(256, min(4096, int(raw)))
-            except (TypeError, ValueError):
-                pass
-    if torch_gpu_available():
-        vram = gpu_vram_gib()
-        if vram is not None and vram >= 10:
-            return 1920
-    return 1280
-
-
-class MilitaryAircraftClassifier:
-    """Specialist ViT classifier for precise military aircraft identification."""
-    HUB_REPO_ID = "dima806/military_aircraft_image_detection"
-    MODEL_ID = "military-aircraft-vit-224"
-    LABELS = [] # Will be loaded dynamically
-
-    def __init__(self, progress_callback=None):
-        module_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(module_dir)
-        local_models_dir = os.path.join(module_dir, "models")
-        self._local_checkpoint_dir = None
-        self._checkpoint_labels_path = None
-
-        def _pick_local_model_paths(base_dir: str) -> tuple[str, str] | None:
-            q = os.path.join(base_dir, "super_specialist_quantized.onnx")
-            f = os.path.join(base_dir, "super_specialist.onnx")
-            if os.path.exists(q):
-                return q, base_dir
-            if os.path.exists(f):
-                return f, base_dir
-            return None
-
-        # 1. Check for bundled model (PyInstaller standalone EXE)
-        if hasattr(sys, '_MEIPASS'):
-            bundled_path_q = os.path.join(sys._MEIPASS, "models", "super_specialist_quantized.onnx")
-            bundled_path = os.path.join(sys._MEIPASS, "models", "super_specialist.onnx")
-            if os.path.exists(bundled_path_q):
-                self.onnx_path = bundled_path_q
-                self.model_dir = os.path.dirname(bundled_path_q)
-            elif os.path.exists(bundled_path):
-                self.onnx_path = bundled_path
-                self.model_dir = os.path.dirname(bundled_path)
-            else:
-                self.model_dir = os.path.join(_skyspotter_cache_root(), "military_classifier")
-                self.onnx_path = os.path.join(self.model_dir, "model.onnx")
-        else:
-            # 2. Check project-local custom model (SkySpotter/src/models).
-            if _pick_local_model_paths(local_models_dir):
-                self.onnx_path, self.model_dir = _pick_local_model_paths(local_models_dir)
-            # 3. Optional project-root models directory.
-            elif _pick_local_model_paths(os.path.join(project_root, "models")):
-                self.onnx_path, self.model_dir = _pick_local_model_paths(os.path.join(project_root, "models"))
-            else:
-                # 4. Fallback to cache folder
-                self.model_dir = os.path.join(_skyspotter_cache_root(), "military_classifier")
-                self.onnx_path = os.path.join(self.model_dir, "model.onnx")
-
-        # Optional local training checkpoints to export from (preferred when present).
-        # This enables using models trained by scripts/train_processed_aircraft.py
-        # without requiring a manual conversion step.
-        checkpoint_candidates = _checkpoint_dir_candidates(project_root)
-        for cp_dir in checkpoint_candidates:
-            if not cp_dir:
-                continue
-            if os.path.exists(os.path.join(cp_dir, "model.safetensors")):
-                self._local_checkpoint_dir = cp_dir
-                lbl = os.path.join(cp_dir, "labels.txt")
-                if os.path.exists(lbl):
-                    self._checkpoint_labels_path = lbl
-                break
-
-        # In local/dev mode, prioritize checkpoint-based export (app_model/)
-        # over pre-existing ONNX blobs so tested training output is the source of truth.
-        if self._local_checkpoint_dir and not hasattr(sys, "_MEIPASS"):
-            self.model_dir = os.path.join(
-                _skyspotter_cache_root(), "military_classifier_from_checkpoint"
-            )
-            self.onnx_path = os.path.join(self.model_dir, "model.onnx")
-        logger.info(
-            "[AVIATION AI] Classifier init: checkpoint=%s onnx=%s",
-            self._local_checkpoint_dir or "none",
-            self.onnx_path,
-        )
-            
-        self._session = None
-        self._input_size = 384
-        self._torch_model = None
-        self._torch_processor = None
-        self._torch_device = None
-        self._rembg_session = None
-        self._onnx_export_disabled = False
-        strict_rembg = os.environ.get("SkySpotter_STRICT_REMBG", "").strip().lower()
-        self._strict_rembg = strict_rembg in {"1", "true", "yes", "on"}
-        self._load_labels()
-        # Ensure classifier labels come from the selected checkpoint when available.
-        self._sync_labels_from_checkpoint()
-        if prefer_directml_classifier() and self._local_checkpoint_dir:
-            if not self._ensure_onnx_classifier_session():
-                logger.warning(
-                    "[MODEL] DirectML ONNX classifier not ready. "
-                    "Export once with: pixi run -e dev-ml export-classifier-onnx "
-                    "(or set SkySpotter_PREFER_DIRECTML=0 and use PyTorch). "
-                    "Classification is skipped until model.onnx exists."
-                )
-        elif self._local_checkpoint_dir:
-            from onnxruntime_providers import classifier_backend_name
-
-            logger.info(
-                "[MODEL] Aircraft classifier backend: %s",
-                classifier_backend_name(),
-            )
-
-    def export_onnx_for_directml(self, progress_callback=None) -> bool:
-        """Export checkpoint to ONNX for the lean default runtime (dev-ml env only)."""
-        if not self._local_checkpoint_dir:
-            logger.error("[MODEL] No local checkpoint found for ONNX export.")
-            return False
-        self._sync_labels_from_checkpoint()
-        self._onnx_export_disabled = False
-        return self._export_checkpoint_to_onnx(progress_callback)
-
-    def _load_labels(self):
-        # Try to find labels.txt in the same directory as the model
-        labels_path = os.path.join(self.model_dir, "labels.txt")
-        if os.path.exists(labels_path):
-            try:
-                with open(labels_path, "r") as f:
-                    self.LABELS = [line.strip() for line in f if line.strip()]
-                import logging
-                logging.getLogger(__name__).info(f"[AVIATION AI] Loaded {len(self.LABELS)} labels from {labels_path}")
-                return
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).error(f"[AVIATION AI] Failed to load labels.txt: {e}")
-        
-        # Fallback to hardcoded list if file is missing
-        self.LABELS = [
-            "A10", "A400M", "AG600", "AH64", "AKINCI", "ATR 42", "ATR 72", "AV8B", "Airbus A220", "Airbus A318",
-            "Airbus A319", "Airbus A320", "Airbus A330", "Airbus A350", "Airbus A380", "Airbus a321", "An124", "An22", "An225", "An72",
-            "Avro Lancaster", "B1", "B2", "B21", "B52", "Bayraktar_TB2_drone", "Be200", "Bell P-63 Kingcobra", "Boeing 737 NG", "Boeing 737 max",
-            "Boeing 747", "Boeing 767", "Boeing 777", "Boeing 777X", "Boeing 787", "Boeing B-17 Flying Fortress", "Boeing B-29 Superfortress", "Boeing P-26 Peashooter", "Brewster F2A Buffalo", "C1",
-            "C130", "C17", "C2", "C390", "C5", "CH47", "CH53", "CL415", "Cessna_172_training_aircraft", "Consolidated PBY Catalina",
-            "Curtiss P-40 Warhawk", "Diamond_DA20_trainer", "Douglas A-20 Havoc", "Douglas C-47 Skytrain", "Douglas SBD Dauntless", "Douglas TBD Devastator", "E2", "E7", "EF2000", "EMB314",
-            "F117", "F14", "F15", "F16", "F18", "F2", "F22", "F35", "F4", "FCK1",
-            "Focke-Wulf Fw 190", "Global_Hawk_UAV", "Grumman F6F Hellcat", "Grumman F7F Tigercat", "Grumman TBF Avenger", "H6", "Hawker Hurricane", "Il76", "J10", "J20",
-            "J35", "J36", "J50", "JAS39", "JF17", "JH7", "Junkers Ju 87", "KAAN", "KC135", "KF21",
-            "KIZILELMA", "KJ600", "Ka27", "Ka52", "Lockheed P-38 Lightning", "MQ-9_Reaper_drone", "MQ20", "MQ25", "MQ28", "Messerschmitt Bf 109",
-            "Mi24", "Mi26", "Mi28", "Mi8", "Mig29", "Mig31", "Mirage2000", "Mitsubishi A6M Zero", "NH90", "North American P51 Mustang",
-            "Northrop P-61 Black Widow", "P3", "Piper_PA-28_Cherokee", "Predator_drone_aircraft", "RQ4", "Rafale", "Republic P-43 Lancer", "Republic P-47 Thunderbolt", "SR71", "Seversky P-35",
-            "Su24", "Su25", "Su34", "Su47", "Su57", "Supermarine Spitfire", "T50", "TB001", "TB2", "Tejas",
-            "Tornado", "Tu160", "Tu22M", "Tu95", "U2", "UH60", "US2", "V22", "V280", "Vought F4U Corsair",
-            "Vulcan", "WZ10", "WZ7", "WZ9", "Waco CG-4", "X29", "X32", "XB70", "XQ58", "Y20",
-            "YF23", "Z10", "Z19", "de Havilland Mosquito"
-        ]
-
-    def _sync_labels_from_checkpoint(self) -> None:
-        """Keep classifier label mapping aligned with active local checkpoint."""
-        if not self._checkpoint_labels_path:
-            return
-        try:
-            import shutil
-            os.makedirs(self.model_dir, exist_ok=True)
-            dst = os.path.join(self.model_dir, "labels.txt")
-            need_copy = (not os.path.exists(dst))
-            if not need_copy:
-                try:
-                    need_copy = os.path.getmtime(dst) < os.path.getmtime(self._checkpoint_labels_path)
-                except OSError:
-                    need_copy = True
-            if need_copy:
-                shutil.copy(self._checkpoint_labels_path, dst)
-            # Always reload to avoid stale in-memory labels.
-            self._load_labels()
-            logger.info(
-                "[MODEL] Classifier labels loaded from checkpoint labels: %s",
-                self._checkpoint_labels_path,
-            )
-        except Exception as e:
-            logger.warning("[MODEL] Failed to sync checkpoint labels: %s", e)
-
-    def _ensure_torch_checkpoint_model(self) -> bool:
-        """Load checkpoint model directly (legacy PoC path) when available."""
-        if self._local_checkpoint_dir is None:
-            return False
-        if self._torch_model is not None and self._torch_processor is not None:
-            return True
-        try:
-            state = _load_shared_torch_vit(self._local_checkpoint_dir)
-            self._torch_processor = state["processor"]
-            self._torch_model = state["model"]
-            self._torch_device = state["device"]
-            labels = state.get("labels")
-            if labels:
-                self.LABELS = labels
-            return True
-        except ImportError as e:
-            logger.warning("[MODEL] transformers ViT classes unavailable: %s", e)
-            return False
-        except Exception as e:
-            logger.warning("[MODEL] PyTorch checkpoint load failed: %s", e)
-            return False
-
-    def _legacy_bg_remove(self, image: Image.Image) -> Image.Image:
-        """Legacy PoC background removal: rembg isnet-general-use first."""
-        global _SHARED_REMBG_SESSION
-        try:
-            from rembg import new_session, remove
-
-            if _SHARED_REMBG_SESSION is None:
-                with _SHARED_REMBG_SESSION_LOCK:
-                    if _SHARED_REMBG_SESSION is None:
-                        providers = onnxruntime_providers_for_rembg()
-                        _SHARED_REMBG_SESSION = new_session(
-                            "isnet-general-use", providers=providers
-                        )
-                        logger.info(
-                            "[AVIATION AI] rembg session initialized (shared): "
-                            "isnet-general-use providers=%s",
-                            providers,
-                        )
-            with _REMBG_LOCK:
-                return remove(
-                    image, session=_SHARED_REMBG_SESSION, alpha_matting=False
-                )
-        except Exception as e:
-            if self._strict_rembg:
-                logger.warning("[AVIATION AI] strict rembg mode: rembg failed (%s), skip classification", e)
-                raise
-            # Fallback to current app background remover.
-            try:
-                from background_removal import get_background_remover
-
-                logger.warning("[AVIATION AI] rembg unavailable, fallback to background_removal pipeline: %s", e)
-                bg = get_background_remover().remove_background(image.convert("RGB"))
-                rgba = bg.convert("RGBA")
-                rgba.putalpha(Image.new("L", rgba.size, 255))
-                return rgba
-            except Exception:
-                return image.convert("RGBA")
-
-    def _crop_below_classify_minimum(
-        self,
-        cropped_rgb: Image.Image,
-        source_size: tuple[int, int],
-        file_path: str,
-    ) -> bool:
-        src_w, src_h = source_size
-        min_w, min_h = _classifier_min_crop_thresholds(src_w, src_h)
-        w, h = cropped_rgb.size
-        if w >= min_w or h >= min_h:
-            return False
-        logger.info(
-            "[AVIATION AI] Skip classify (crop %dx%d < %dx%d min from source %dx%d, %.0f%%): %s",
-            w,
-            h,
-            min_w,
-            min_h,
-            src_w,
-            src_h,
-            _classifier_min_crop_fraction() * 100.0,
-            os.path.basename(file_path),
-        )
-        return True
-
-    def _legacy_focus_blob_crop(self, file_path: str, image_rgba: Image.Image) -> tuple[Image.Image, str]:
-        """Match legacy PoC blob-selection logic (focus-overlap first, else largest blob)."""
-        try:
-            from skimage.measure import label, regionprops
-        except Exception:
-            return image_rgba.convert("RGB"), "legacy_no_skimage"
-
-        alpha = np.array(image_rgba.split()[-1])
-        binary_mask = alpha > 20
-        labeled_mask = label(binary_mask)
-        props = regionprops(labeled_mask)
-        if not props:
-            return image_rgba.convert("RGB"), "legacy_empty_mask"
-
-        target_blob_label = None
-        focus_hint = pixmap_ltwh_focus_hint(file_path, image_rgba.width, image_rgba.height)
-        if focus_hint:
-            ltwh, _ = focus_hint
-            cx = ltwh[0] + ltwh[2] / 2.0
-            cy = ltwh[1] + ltwh[3] / 2.0
-            for p in props:
-                minr, minc, maxr, maxc = p.bbox
-                if minc <= cx <= maxc and minr <= cy <= maxr:
-                    target_blob_label = p.label
-                    break
-
-        if target_blob_label is None:
-            target_blob_label = max(props, key=lambda p: p.area).label
-            mode = "largest_blob"
-        else:
-            mode = "focused_blob"
-
-        blob_mask = labeled_mask == target_blob_label
-        new_alpha = np.where(blob_mask, alpha, 0).astype(np.uint8)
-        final_img = image_rgba.copy()
-        final_img.putalpha(Image.fromarray(new_alpha))
-        bbox = Image.fromarray(new_alpha).getbbox()
-        if not bbox:
-            return image_rgba.convert("RGB"), "legacy_empty_blob"
-        cropped = final_img.crop(bbox)
-        bg = Image.new("RGB", cropped.size, (255, 255, 255))
-        bg.paste(cropped, mask=cropped.split()[-1])
-        return bg, mode
-
-    def _predict_with_torch(self, im_rgb: Image.Image) -> tuple[str, float]:
-        import torch
-
-        inputs = self._torch_processor(images=im_rgb, return_tensors="pt").to(self._torch_device)
-        with torch.no_grad():
-            outputs = self._torch_model(**inputs)
-        probs = torch.nn.functional.softmax(outputs.logits, dim=-1)[0]
-        idx = int(torch.argmax(probs).item())
-        conf = float(probs[idx].item())
-        label = self.LABELS[idx] if idx < len(self.LABELS) else ""
-        return label, conf
-
-    def _export_checkpoint_to_onnx(self, progress_callback=None) -> bool:
-        if not self._local_checkpoint_dir:
-            return False
-        checkpoint_model = os.path.join(self._local_checkpoint_dir, "model.safetensors")
-        if not os.path.exists(checkpoint_model):
-            return False
-        needs_export = not os.path.exists(self.onnx_path)
-        if not needs_export:
-            try:
-                needs_export = os.path.getmtime(self.onnx_path) < os.path.getmtime(
-                    checkpoint_model
-                )
-            except OSError:
-                needs_export = False
-        if not needs_export:
-            return True
-        if self._onnx_export_disabled:
-            if os.path.exists(self.onnx_path) and os.path.getsize(self.onnx_path) > 0:
-                return True
-            return False
-        if progress_callback:
-            progress_callback("Exporting aircraft model for DirectML (one-time)...")
-        try:
-            import shutil
-            import warnings
-
-            import torch
-            from transformers.utils import logging as hf_transformers_logging
-
-            ViTForImageClassification, _ViTImageProcessor = _import_vit_hf_classes()
-
-            export_kw = dict(
-                input_names=["pixel_values"],
-                output_names=["logits"],
-                dynamic_axes={
-                    "pixel_values": {0: "batch_size"},
-                    "logits": {0: "batch_size"},
-                },
-                opset_version=17,
-            )
-            prev_hf_verbosity = hf_transformers_logging.get_verbosity()
-            prev_env = {
-                k: os.environ.get(k)
-                for k in ("TRANSFORMERS_VERBOSITY", "HF_HUB_DISABLE_PROGRESS_BARS")
-            }
-            hf_transformers_logging.set_verbosity_error()
-            os.environ["TRANSFORMERS_VERBOSITY"] = "error"
-            os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-            try:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
-                    os.makedirs(self.model_dir, exist_ok=True)
-                    model = ViTForImageClassification.from_pretrained(
-                        self._local_checkpoint_dir
-                    )
-                    model.eval()
-                    dummy_input = torch.randn(1, 3, 384, 384)
-                    try:
-                        torch.onnx.export(
-                            model,
-                            dummy_input,
-                            self.onnx_path,
-                            dynamo=False,
-                            **export_kw,
-                        )
-                    except TypeError:
-                        torch.onnx.export(
-                            model, dummy_input, self.onnx_path, **export_kw
-                        )
-            finally:
-                hf_transformers_logging.set_verbosity(prev_hf_verbosity)
-                for key, val in prev_env.items():
-                    if val is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = val
-            labels_src = os.path.join(self._local_checkpoint_dir, "labels.txt")
-            labels_dst = os.path.join(self.model_dir, "labels.txt")
-            if os.path.exists(labels_src):
-                shutil.copy(labels_src, labels_dst)
-                self._load_labels()
-            self._sync_labels_from_checkpoint()
-            logger.info("[AVIATION AI] Exported ONNX classifier to %s", self.onnx_path)
-            return True
-        except ImportError as e:
-            self._onnx_export_disabled = True
-            if os.path.exists(self.onnx_path) and os.path.getsize(self.onnx_path) > 0:
-                logger.info(
-                    "[AVIATION AI] PyTorch not installed; using existing ONNX at %s",
-                    self.onnx_path,
-                )
-                return True
-            logger.warning(
-                "[AVIATION AI] ONNX export requires PyTorch (pixi env dev-ml). "
-                "Run: pixi run -e dev-ml export-classifier-onnx — %s",
-                e,
-            )
-            return False
-        except Exception as e:
-            self._onnx_export_disabled = True
-            logger.warning("[AVIATION AI] ONNX export for DirectML failed: %s", e)
-            return False
-
-    def _ensure_onnx_classifier_session(self, progress_callback=None) -> bool:
-        if not prefer_directml_classifier():
-            return False
-        if not self._local_checkpoint_dir:
-            return False
-        self._sync_labels_from_checkpoint()
-        if not self._export_checkpoint_to_onnx(progress_callback):
-            return False
-        if self._session is not None:
-            return True
-        try:
-            providers = onnxruntime_providers_prefer_dml()
-            self._session = create_onnxruntime_session(self.onnx_path, providers)
-            active = self._session.get_providers()
-            logger.warning(
-                "[MODEL] Aircraft classifier (ONNX): path='%s' active_provider=%s",
-                self.onnx_path,
-                active[0] if active else "unknown",
-            )
-            try:
-                shape = list(self._session.get_inputs()[0].shape)
-                h_dim = shape[2] if len(shape) > 2 else None
-                if isinstance(h_dim, int) and h_dim > 0:
-                    self._input_size = int(h_dim)
-            except Exception:
-                self._input_size = 384
-            return True
-        except Exception as e:
-            logger.warning("[AVIATION AI] ONNX DirectML session init failed: %s", e)
-            self._session = None
-            return False
-
-    def prepare_subject_pipeline(
-        self, file_path: str, max_source_size: int, progress_callback=None
-    ) -> tuple[Optional[Image.Image], Optional[Image.Image], Optional[Image.Image]]:
-        """
-        Load source RGB, rembg RGBA, and classifier crop in one pass (avoids duplicate rembg).
-
-        Returns (src_rgb, rgba, cropped_rgb). ``cropped_rgb`` is None if crop is too small.
-        """
-        try:
-            src = _load_index_source_image(
-                file_path, max_size=max(256, int(max_source_size))
-            ).convert("RGB")
-            rgba = self._legacy_bg_remove(src)
-            cropped_rgb, _mode = self._legacy_focus_blob_crop(file_path, rgba)
-            if self._crop_below_classify_minimum(cropped_rgb, src.size, file_path):
-                return src, rgba, None
-            return src, rgba, cropped_rgb
-        except Exception as e:
-            logger.debug(
-                "[AVIATION AI] Subject pipeline failed for %s: %s",
-                os.path.basename(file_path),
-                e,
-            )
-            return None, None, None
-
-    def prepare_subject_crop(
-        self, file_path: str, max_source_size: int, progress_callback=None
-    ) -> Optional[Image.Image]:
-        """
-        Background-removed, focus/largest-blob crop for ViT classification only.
-        Returns None when rembg fails (strict mode), mask is empty, or crop is too small.
-        """
-        _src, _rgba, cropped = self.prepare_subject_pipeline(
-            file_path, max_source_size, progress_callback
-        )
-        return cropped
-
-    def classify_from_subject_crop(
-        self,
-        cropped_rgb: Image.Image,
-        file_path: str,
-        progress_callback=None,
-    ) -> str:
-        """Run ViT classifier on an already prepared subject crop."""
-        if cropped_rgb is None:
-            return ""
-        self._ensure_model(progress_callback)
-        if prefer_directml_classifier():
-            if self._ensure_onnx_classifier_session(progress_callback):
-                label, conf, _ = self._predict_im(cropped_rgb)
-                logger.info(
-                    "[AVIATION AI] ONNX crop classify label=%s conf=%.3f file=%s",
-                    label,
-                    conf,
-                    os.path.basename(file_path),
-                )
-                if label and conf >= _classifier_min_confidence():
-                    return label
-                return ""
-            if self._session is not None:
-                return ""
-        if self._ensure_torch_checkpoint_model():
-            label, conf = self._predict_with_torch(cropped_rgb)
-            logger.info(
-                "[AVIATION AI] PyTorch crop classify label=%s conf=%.3f file=%s",
-                label,
-                conf,
-                os.path.basename(file_path),
-            )
-            if label and conf >= _classifier_min_confidence():
-                return label
-        return ""
-
-    def _classify_onnx_pipeline(
-        self, file_path: str, max_source_size: int, progress_callback=None
-    ) -> str:
-        if not self._ensure_onnx_classifier_session(progress_callback):
-            return ""
-        cropped_rgb = self.prepare_subject_crop(
-            file_path, int(max_source_size), progress_callback
-        )
-        if cropped_rgb is None:
-            return ""
-        return self.classify_from_subject_crop(
-            cropped_rgb, file_path, progress_callback
-        )
-
-    def _ensure_model(self, progress_callback=None):
-        # Checkpoint-only mode: do not download/export/use ONNX fallback models.
-        checkpoint_model = None
-        if self._local_checkpoint_dir:
-            checkpoint_model = os.path.join(self._local_checkpoint_dir, "model.safetensors")
-        if not checkpoint_model or not os.path.exists(checkpoint_model):
-            logger.warning(
-                "[MODEL] Checkpoint-only mode: missing model.safetensors under '%s'; classifier disabled.",
-                self._local_checkpoint_dir or "none",
-            )
-            return
-        self._sync_labels_from_checkpoint()
-        return
-
-        needs_local_export = False
-        if checkpoint_model and os.path.exists(checkpoint_model):
-            if not os.path.exists(self.onnx_path):
-                needs_local_export = True
-            else:
-                try:
-                    needs_local_export = os.path.getmtime(self.onnx_path) < os.path.getmtime(checkpoint_model)
-                except OSError:
-                    needs_local_export = False
-
-        if os.path.exists(self.onnx_path) and not needs_local_export:
-            self._sync_labels_from_checkpoint()
-            return
-
-        # First choice: export ONNX from a local training checkpoint if available.
-        if self._local_checkpoint_dir:
-            if progress_callback:
-                progress_callback("Exporting Specialist AI from local training checkpoint...")
-            try:
-                import shutil
-                import torch
-
-                ViTForImageClassification, _ViTImageProcessor = _import_vit_hf_classes()
-
-                os.makedirs(self.model_dir, exist_ok=True)
-
-                logger.info(
-                    "[AVIATION AI] Exporting ONNX from local checkpoint: %s",
-                    self._local_checkpoint_dir,
-                )
-                model = ViTForImageClassification.from_pretrained(self._local_checkpoint_dir)
-                model.eval()
-
-                dummy_input = torch.randn(1, 3, 384, 384)
-                torch.onnx.export(
-                    model,
-                    dummy_input,
-                    self.onnx_path,
-                    opset_version=18,
-                    input_names=["pixel_values"],
-                    output_names=["logits"],
-                    dynamic_axes={"pixel_values": {0: "batch_size"}, "logits": {0: "batch_size"}},
-                )
-
-                # Keep label mapping aligned with this exact checkpoint.
-                labels_src = os.path.join(self._local_checkpoint_dir, "labels.txt")
-                labels_dst = os.path.join(self.model_dir, "labels.txt")
-                if os.path.exists(labels_src):
-                    shutil.copy(labels_src, labels_dst)
-                    self._load_labels()
-                self._sync_labels_from_checkpoint()
-                logger.info("[AVIATION AI] Local checkpoint export succeeded: %s", self.onnx_path)
-                return
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "[AVIATION AI] Local checkpoint export failed (%s); trying remote fallback.",
-                    e,
-                )
-
-        # Strategy: Download from GitHub repository if missing.
-        # This keeps the installer small and allows on-demand acquisition.
-        model_url = "https://github.com/markyip/RAWviewer/raw/feature/aviation-specialist/src/models/super_specialist.onnx"
-        
-        try:
-            import requests
-            from huggingface_hub import hf_hub_download
-
-            os.makedirs(self.model_dir, exist_ok=True)
-            
-            logger.info(f"[AVIATION AI] Model missing at {self.onnx_path}. Downloading from {model_url}...")
-            if progress_callback:
-                progress_callback("Connecting to model repository...")
-                
-            response = requests.get(model_url, stream=True, timeout=30)
-            response.raise_for_status()
-            
-            total_size = int(response.headers.get('content-length', 0))
-            downloaded = 0
-            
-            with open(self.onnx_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=1024*1024): # 1MB chunks
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total_size > 0:
-                            percent = (downloaded / total_size) * 100
-                            if progress_callback:
-                                progress_callback(f"Downloading SkySpotter AI: {percent:.1f}%")
-                        else:
-                            if progress_callback:
-                                progress_callback(f"Downloading SkySpotter AI...")
-            
-            logger.info(f"[AVIATION AI] Successfully downloaded model to {self.onnx_path}")
-            return
-            
-        except Exception as e:
-            logger.warning(f"[AVIATION AI] GitHub download failed ({e}), trying HuggingFace fallback...")
-            try:
-                from huggingface_hub import hf_hub_download
-                if progress_callback:
-                    progress_callback("Downloading Specialist AI (HuggingFace)...")
-                
-                hf_hub_download(
-                    repo_id=self.HUB_REPO_ID,
-                    filename="model.onnx",
-                    local_dir=self.model_dir
-                )
-                if os.path.exists(self.onnx_path):
-                    return
-            except Exception as hfe:
-                logger.error(f"[AVIATION AI] All downloads failed: {hfe}")
-
-        if progress_callback:
-            progress_callback("Exporting Military Specialist AI (Local)...")
-
-        try:
-            import torch
-
-            ViTForImageClassification, _ViTImageProcessor = _import_vit_hf_classes()
-            
-            model = ViTForImageClassification.from_pretrained(self.HUB_REPO_ID)
-            model.eval()
-            
-            dummy_input = torch.randn(1, 3, 224, 224)
-            torch.onnx.export(
-                model, dummy_input, self.onnx_path,
-                opset_version=18, input_names=["pixel_values"], output_names=["logits"],
-                dynamic_axes={"pixel_values": {0: "batch_size"}, "logits": {0: "batch_size"}}
-            )
-        except Exception as e:
-            raise RuntimeError(
-                f"Military Specialist model (ONNX) is missing and cannot be acquired: {e}"
-            )
-
-
-    def _predict_im(self, im: Image.Image) -> tuple[str, float, np.ndarray]:
-        """Perform a single inference pass on a PIL image."""
-        target = int(getattr(self, "_input_size", 384) or 384)
-        w, h = im.size
-        scale = target / max(w, h)
-        new_w, new_h = int(w * scale), int(h * scale)
-        resized = im.resize((new_w, new_h), Image.Resampling.BILINEAR)
-        
-        # Create black canvas and paste centered
-        canvas = Image.new("RGB", (target, target), (0, 0, 0))
-        canvas.paste(resized, ((target - new_w) // 2, (target - new_h) // 2))
-        rgb = np.asarray(canvas.convert("RGB"), dtype=np.float32)
-        # Optimized normalization: (x / 255.0 - 0.5) / 0.5  =>  x / 127.5 - 1.0
-        rgb = (rgb / 127.5) - 1.0
-        
-        nchw = np.transpose(rgb, (2, 0, 1))[np.newaxis, ...].astype(np.float32)
-        
-        # Run inference
-        inputs = {self._session.get_inputs()[0].name: nchw}
-        logits = self._session.run(None, inputs)[0][0]
-        
-        # Apply Softmax to get probabilities
-        exp_logits = np.exp(logits - np.max(logits))
-        probs = exp_logits / np.sum(exp_logits)
-        
-        idx = int(np.argmax(probs))
-        conf = float(probs[idx])
-        label = self.LABELS[idx] if idx < len(self.LABELS) else ""
-        return label, conf, probs
-
-    def classify(
-        self, file_path: str, progress_callback=None, *, max_source_size: Optional[int] = None
-    ) -> str:
-        try:
-            self._ensure_model(progress_callback)
-            if max_source_size is None:
-                try:
-                    max_source_size = int(
-                        os.environ.get("SkySpotter_CLASSIFY_MAX_SIZE", "2048")
-                    )
-                except (TypeError, ValueError):
-                    max_source_size = 2048
-            max_sz = int(max_source_size)
-            if prefer_directml_classifier():
-                label = self._classify_onnx_pipeline(
-                    file_path, max_sz, progress_callback
-                )
-                if label:
-                    return label
-                if self._session is not None:
-                    return ""
-                logger.warning(
-                    "[AVIATION AI] DirectML ONNX unavailable; falling back to PyTorch."
-                )
-
-            cropped_rgb = self.prepare_subject_crop(
-                file_path, max_sz, progress_callback
-            )
-            if cropped_rgb is None:
-                return ""
-            return self.classify_from_subject_crop(
-                cropped_rgb, file_path, progress_callback
-            )
-
-            import onnxruntime as ort
-            if self._session is None:
-                so = ort.SessionOptions()
-                so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                # Prioritize high-performance providers and keep only available
-                # runtime providers to avoid noisy ORT warnings on Windows.
-                providers = [
-                    "CoreMLExecutionProvider",
-                    "CUDAExecutionProvider", 
-                    "TensorrtExecutionProvider", 
-                    "DmlExecutionProvider", 
-                    "AzureExecutionProvider", 
-                    "CPUExecutionProvider"
-                ]
-                available = ort.get_available_providers()
-                selected = [p for p in providers if p in available]
-                if not selected:
-                    selected = ["CPUExecutionProvider"]
-                try:
-                    self._session = ort.InferenceSession(
-                        self.onnx_path, sess_options=so, providers=selected
-                    )
-                    active_p = self._session.get_providers()
-                    import logging
-                    logging.getLogger(__name__).warning(f"[AVIATION AI] Specialist Session initialized with: {active_p[0] if active_p else 'Unknown'}")
-                except Exception as e:
-                    import logging
-                    logging.getLogger(__name__).error(f"[AVIATION AI] Specialist GPU init failed ({e}), falling back to CPU")
-                    self._session = ort.InferenceSession(self.onnx_path, sess_options=so, providers=["CPUExecutionProvider"])
-                try:
-                    shape = list(self._session.get_inputs()[0].shape)
-                    h_dim = shape[2] if len(shape) > 2 else None
-                    w_dim = shape[3] if len(shape) > 3 else None
-                    if isinstance(h_dim, int) and isinstance(w_dim, int) and h_dim == w_dim:
-                        self._input_size = int(h_dim)
-                    else:
-                        self._input_size = 384
-                except Exception:
-                    self._input_size = 384
-                try:
-                    import logging
-                    active_p = self._session.get_providers()
-                    logging.getLogger(__name__).warning(
-                        "[MODEL] Classifier ONNX='%s' checkpoint='%s' input_size=%s provider=%s",
-                        self.onnx_path,
-                        self._local_checkpoint_dir or "none",
-                        self._input_size,
-                        active_p[0] if active_p else "Unknown",
-                    )
-                except Exception:
-                    pass
-            
-            # Preprocess: Letterbox (Maintain Aspect Ratio) + Padding to 384x384
-            # Attempt to get focus hint first to decide load resolution
-            # Note: We don't know dimensions yet, so we'll load a 2048px preview if possible to be safe for cropping
-            orig_im = _load_index_source_image(file_path, max_size=2048).convert("RGB")
-            
-            # --- BACKGROUND REMOVAL ---
-            try:
-                from background_removal import get_background_remover
-                remover = get_background_remover()
-                orig_im = remover.remove_background(orig_im)
-                import logging
-                logging.getLogger(__name__).info(f"[AVIATION AI] Background removed for {os.path.basename(file_path)}")
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(f"[AVIATION AI] Background removal failed/skipped for {os.path.basename(file_path)}: {e}")
-            
-            # Pass 1: Global inference
-            label, conf, _ = self._predict_im(orig_im)
-            
-            # Pass 2: Attention Adjusted Crop (if hint available)
-            try:
-                focus_hint = pixmap_ltwh_focus_hint(file_path, orig_im.width, orig_im.height)
-                if focus_hint:
-                    ltwh, source = focus_hint
-                    # center point of the focus area
-                    cx = ltwh[0] + ltwh[2] // 2
-                    cy = ltwh[1] + ltwh[3] // 2
-                    
-                    # Context window: increase to 70% of shorter dimension
-                    # This ensures the whole aircraft is captured even if AF point was just on cockpit/tail
-                    crop_size = int(min(orig_im.width, orig_im.height) * 0.7)
-                    crop_size = max(int(getattr(self, "_input_size", 384) or 384), crop_size)
-                    
-                    left = max(0, cx - crop_size // 2)
-                    top = max(0, cy - crop_size // 2)
-                    right = min(orig_im.width, left + crop_size)
-                    bottom = min(orig_im.height, top + crop_size)
-                    
-                    # Re-center if we hit edges
-                    if right - left < crop_size: left = max(0, right - crop_size)
-                    if bottom - top < crop_size: top = max(0, bottom - crop_size)
-                    
-                    crop_im = orig_im.crop((left, top, right, bottom))
-                    label_crop, conf_crop, _ = self._predict_im(crop_im)
-                    
-                    # Merge logic: Prefer crop if it's more confident or if global is ambiguous
-                    if (conf_crop > conf) or (conf < 0.45 and conf_crop > 0.35):
-                        logger.info(f"[AVIATION AI] {os.path.basename(file_path)}: Attention-adjusted crop ({label_crop} @ {conf_crop:.2f} via {source}) preferred over global ({label} @ {conf:.2f})")
-                        label, conf = label_crop, conf_crop
-            except Exception as ce:
-                # Silently continue if focus hint or crop fails; global result is already available
-                pass
-
-            if label:
-                # Confidence thresholding (Combine knowledge logic)
-                # If confidence is too low, we return empty so the caller can fallback to SigLIP Zero-Shot
-                min_conf = _classifier_min_confidence()
-                if conf < min_conf:
-                    logger.warning(f"[AVIATION AI] {os.path.basename(file_path)}: Ambiguous classification ({label} @ {conf:.2f}). Leaving unidentified.")
-                    return ""
-                    
-                logger.info(f"[AVIATION AI] {os.path.basename(file_path)} identified as {label} (Conf: {conf:.2f})")
-                return label
-        except Exception as e:
-            import traceback
-            logger.error(f"[AVIATION AI] Error classifying {file_path}: {e}")
-            logger.error(traceback.format_exc())
-            pass
-        return ""
-
-
-class AviationSigLIPONNXBackend(MobileCLIPONNXBackend):
-    """
-    State-of-the-art SigLIP-Base (Patch 16) with 512x512 resolution.
-    Significantly higher accuracy for fine-grained aircraft identification.
-    """
-    MODEL_ID = "aviation-specialist-siglip-p16-512"
-    HUB_REPO_ID = "Xenova/siglip-base-patch16-512"
-    SUPPORTS_HUB_DOWNLOAD = True
-    
-    # SigLIP specific ONNX paths in Xenova repo
-    IMAGE_MODEL_FILE = "vision_model.onnx"
-    TEXT_MODEL_FILE = "text_model.onnx"
-
-    def __init__(self):
-        super().__init__()
-        self._tokenizer = None
-
-    @staticmethod
-    def _candidate_model_dirs() -> List[str]:
-        dirs: List[str] = []
-        dirs.append(os.path.join(_skyspotter_cache_root(), "aviation-specialist-siglip-p16-512"))
-        return dirs
-
-    def download_assets(self, progress_callback: Optional[Callable[[str], None]] = None):
-        def _progress(message: str) -> None:
-            if progress_callback:
-                progress_callback(message)
-
-        os.makedirs(self.model_dir, exist_ok=True)
-        
-        # Files needed for ONNX and Tokenizer
-        files_to_download = {
-            "onnx/vision_model.onnx": self.IMAGE_MODEL_FILE,
-            "onnx/text_model.onnx": self.TEXT_MODEL_FILE,
-            "tokenizer.json": "tokenizer.json",
-            "tokenizer_config.json": "tokenizer_config.json",
-            "spiece.model": "spiece.model",
-            "special_tokens_map.json": "special_tokens_map.json",
-            "config.json": "config.json"
-        }
-        
-        from huggingface_hub import hf_hub_url
-        from huggingface_hub.utils import disable_progress_bars
-        import requests
-        disable_progress_bars()
-        import logging
-        logger = logging.getLogger(__name__)
-        
-        try:
-            for remote_path, local_name in files_to_download.items():
-                target_path = os.path.normpath(os.path.join(self.model_dir, local_name))
-                
-                # Check if already exists
-                if os.path.exists(target_path):
-                    logger.info(f"[AVIATION AI] {local_name} already exists, skipping download.")
-                    continue
-
-                logger.info(f"[AVIATION AI] Downloading {remote_path} to {local_name}")
-                
-                url = hf_hub_url(repo_id=self.HUB_REPO_ID, filename=remote_path)
-                response = requests.get(url, stream=True, timeout=30)
-                response.raise_for_status()
-                
-                total_size = int(response.headers.get('content-length', 0))
-                
-                os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                
-                downloaded = 0
-                with open(target_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=1024*1024): # 1MB chunks
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            if total_size > 0:
-                                percent = (downloaded / total_size) * 100
-                                _progress(f"Downloading AI model component: {local_name} ({percent:.1f}%)")
-                            else:
-                                _progress(f"Downloading AI model component: {local_name}...")
-                
-                logger.info(f"[AVIATION AI] Successfully downloaded {local_name}")
-
-            # Cleanup if Xenova's onnx/ structure was partially created
-            onnx_dir = os.path.join(self.model_dir, "onnx")
-            if os.path.exists(onnx_dir):
-                import shutil
-                shutil.rmtree(onnx_dir, ignore_errors=True)
-                
-            return self.model_dir
-        except Exception as e:
-            logger.error(f"[AVIATION AI] Download failed: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            raise RuntimeError(f"Aviation model download failed: {str(e)}")
-
-    def _ensure_sessions(self):
-        if self._image_session is not None:
-            return
-
-        import onnxruntime as ort
-        
-        img_path = os.path.join(self.model_dir, self.IMAGE_MODEL_FILE)
-        txt_path = os.path.join(self.model_dir, self.TEXT_MODEL_FILE)
-        
-        if not os.path.exists(img_path) or not os.path.exists(txt_path):
-            self.download_assets()
-
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info(f"[AVIATION AI] Loading SigLIP sessions from: {self.model_dir}")
-        logger.info(
-            "[MODEL] Semantic backend='%s' image_model='%s' text_model='%s'",
-            self.MODEL_ID,
-            img_path,
-            txt_path,
-        )
-        try:
-            self._image_session = ort.InferenceSession(img_path, providers=['CPUExecutionProvider'])
-            self._text_session = ort.InferenceSession(txt_path, providers=['CPUExecutionProvider'])
-        except Exception as exc:
-            msg = str(exc)
-            low = msg.lower()
-            corrupted = (
-                "invalid_protobuf" in low
-                or "protobuf parsing failed" in low
-                or "load model from" in low
-            )
-            if corrupted:
-                logger.warning(
-                    "[AVIATION AI] Corrupted ONNX detected in %s. Purging cached SigLIP assets.",
-                    self.model_dir,
-                )
-                for p in (img_path, txt_path):
-                    try:
-                        if os.path.exists(p):
-                            os.remove(p)
-                    except OSError:
-                        pass
-                self._image_session = None
-                self._text_session = None
-                raise RuntimeError(
-                    "Corrupted semantic ONNX cache detected. Removed invalid files from "
-                    f"'{self.model_dir}'. Re-run semantic model download from the app."
-                ) from exc
-            raise
-        
-        # SigLIP uses a different tokenizer. We use the lightweight 'tokenizers' library
-        # instead of the full 'transformers' package to keep the EXE small.
-        from tokenizers import Tokenizer
-        tok_path = os.path.join(self.model_dir, "tokenizer.json")
-        logger.info(f"[AVIATION AI] Loading SigLIP tokenizer from: {tok_path}")
-        self._tokenizer = Tokenizer.from_file(tok_path)
-        
-        # Configure padding and truncation to match SigLIP requirements
-        # SigLIP-Base uses max_length 64
-        self._tokenizer.enable_padding(pad_id=1, length=64) # pad_id=1 is standard for SigLIP
-        self._tokenizer.enable_truncation(max_length=64)
-        
-        if self._tokenizer:
-            logger.info("[AVIATION AI] SigLIP tokenizer loaded successfully.")
-        else:
-            logger.error("[AVIATION AI] SigLIP tokenizer FAILED to load.")
-
-    def availability_error(self) -> str:
-        try:
-            import onnxruntime  # noqa: F401
-        except ImportError:
-            return "Missing 'onnxruntime' dependency"
-        if not os.path.exists(self.image_model_path):
-            return f"Missing image model: {self.IMAGE_MODEL_FILE}"
-        if not os.path.exists(self.text_model_path):
-            return f"Missing text model: {self.TEXT_MODEL_FILE}"
-        try:
-            # Validate ONNX files eagerly so corrupted protobuf is reported as
-            # "backend unavailable" instead of crashing during first query.
-            self._ensure_sessions()
-            return ""
-        except Exception as exc:
-            return str(exc)
-
-    def encode_image(self, file_path: str) -> np.ndarray:
-        self._ensure_sessions()
-        # SigLIP-512 uses 512x512
-        im = _load_index_source_image(file_path, max_size=1024).resize((512, 512), Image.Resampling.BICUBIC)
-        rgb = np.asarray(im.convert("RGB"), dtype=np.float32) / 255.0
-        
-        # SigLIP normalization: (x - 0.5) / 0.5
-        mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-        std = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-        rgb = (rgb - mean) / std
-        
-        nchw = np.transpose(rgb, (2, 0, 1))[np.newaxis, ...].astype(np.float32)
-        
-        inputs = {self._image_session.get_inputs()[0].name: nchw}
-        outputs = self._image_session.run(["pooler_output"], inputs)
-        return self._normalize(outputs[0])
-
-    def encode_text(self, text: str) -> np.ndarray:
-        self._ensure_sessions()
-        
-        if self._tokenizer is None:
-            raise RuntimeError(f"Tokenizer for {self.MODEL_ID} failed to initialize. Check if all required files exist in {self.model_dir}")
-
-        # SigLIP tokenization using lightweight tokenizers library
-        encoded = self._tokenizer.encode(text)
-        
-        inputs = {
-            "input_ids": np.array([encoded.ids], dtype=np.int64)
-        }
-        
-        outputs = self._text_session.run(["pooler_output"], inputs)
-        # SigLIP text model in ONNX returns pre-pooled embedding in pooler_output
-        return self._normalize(outputs[0][0]) # [0][0] because outputs is [batch, dim]
-
-
 def resolve_mobileclip_backend() -> Any:
-    """Detects and returns the appropriate ONNX semantic backend."""
-    import logging
-    logger = logging.getLogger(__name__)
-    
-    logger.info("[SYSTEM] Detecting best semantic backend...")
-    logger.info("[SYSTEM] SkySpotter mode: forcing aviation-specialist backend.")
-
-    # SkySpotter requirement: always use the aviation-specialist semantic backend.
-    # No fallback to generic MobileCLIP, otherwise index model_name drifts to
-    # `mobileclip-onnx-2-s0` and classification/search behavior diverges.
-    return AviationSigLIPONNXBackend()
+    """Prefer platform-native; then ONNX; then Core ML fallback."""
+    if sys.platform == "darwin":
+        # Prefer Core ML on macOS (single shipped class: MobileCLIPCoreMLBackend / S2)
+        for cls in (MobileCLIPCoreMLBackend,):
+            inst = cls()
+            if inst.available():
+                return inst
+        # Try ONNX on macOS too if Core ML fails
+        inst = MobileCLIPONNXBackend()
+        if inst.available():
+            return inst
+        return MobileCLIPCoreMLBackend()
+    else:
+        # Windows prefer ONNX (official release); macOS uses Core ML above.
+        inst = MobileCLIPONNXBackend()
+        if inst.available():
+            return inst
+        return inst # Return anyway for download_assets availability
 
 
 def _bytes_to_unicode() -> Dict[int, str]:
@@ -2242,6 +1316,130 @@ class _ClipBPETokenizer:
         return tokens + [0] * (context_length - len(tokens))
 
 
+_semantic_sort_read_local = threading.local()
+
+
+def _semantic_sort_read_conn(db_path: str) -> sqlite3.Connection:
+    """Per-thread read connection for capture_time lookups during background folder sort."""
+    conn = getattr(_semantic_sort_read_local, "conn", None)
+    if conn is None or getattr(_semantic_sort_read_local, "db_path", None) != db_path:
+        conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=60000")
+        try:
+            conn.execute("PRAGMA query_only=ON")
+        except sqlite3.OperationalError:
+            pass
+        _semantic_sort_read_local.conn = conn
+        _semantic_sort_read_local.db_path = db_path
+    return conn
+
+
+def get_semantic_capture_times_for_paths(
+    paths: Sequence[str],
+    db_path: Optional[str] = None,
+) -> Dict[str, str]:
+    """
+    Thread-safe bulk read of capture_time from semantic_index.db.
+
+    Used by folder-load / refinement workers (not only the UI thread) so navigation
+    order matches the semantic index instead of degrading to mtime when EXIF cache is cold.
+    """
+    if not paths:
+        return {}
+    if db_path is None:
+        cache_dir = os.path.expanduser("~/.rawviewer_cache")
+        db_path = os.path.join(cache_dir, "semantic_index.db")
+    if not os.path.isfile(db_path):
+        return {}
+
+    canonical_to_original: Dict[str, str] = {}
+    unique_canonical: List[str] = []
+    for p in paths:
+        if not p:
+            continue
+        cp = SemanticImageIndex._canonical_path(p)
+        if cp not in canonical_to_original:
+            canonical_to_original[cp] = p
+            unique_canonical.append(cp)
+    if not unique_canonical:
+        return {}
+
+    conn = _semantic_sort_read_conn(db_path)
+    result_map: Dict[str, str] = {}
+    chunk_size = 500
+    for i in range(0, len(unique_canonical), chunk_size):
+        chunk = unique_canonical[i : i + chunk_size]
+        placeholders = ",".join(["?"] * len(chunk))
+        rows = conn.execute(
+            f"""
+            SELECT file_path, capture_time
+            FROM semantic_index
+            WHERE lower(file_path) IN ({placeholders})
+              AND capture_time IS NOT NULL AND capture_time != ''
+            ORDER BY rowid DESC
+            """,
+            chunk,
+        ).fetchall()
+        for fp, ct in rows:
+            if fp in result_map:
+                continue
+            orig = canonical_to_original.get(fp)
+            if orig and ct:
+                result_map[orig] = str(ct)
+    return result_map
+
+
+def get_semantic_capture_times_for_folder(
+    folder_path: str,
+    db_path: Optional[str] = None,
+) -> Dict[str, str]:
+    """Bulk read capture_time for all indexed files under folder_path (any thread)."""
+    if not folder_path:
+        return {}
+    if db_path is None:
+        cache_dir = os.path.expanduser("~/.rawviewer_cache")
+        db_path = os.path.join(cache_dir, "semantic_index.db")
+    if not os.path.isfile(db_path):
+        return {}
+    try:
+        root = SemanticImageIndex._canonical_path(
+            os.path.abspath(folder_path)
+        )
+    except OSError:
+        return {}
+    if not root:
+        return {}
+    root_lower = root.rstrip("\\/").lower()
+    if os.sep == "\\":
+        prefix = root_lower + "\\%"
+    else:
+        prefix = root_lower.replace("\\", "/") + "/%"
+    path_expr = (
+        "lower(replace(file_path, '/', '\\\\'))"
+        if os.sep == "\\"
+        else "lower(replace(file_path, '\\\\', '/'))"
+    )
+    conn = _semantic_sort_read_conn(db_path)
+    result_map: Dict[str, str] = {}
+    rows = conn.execute(
+        f"""
+        SELECT file_path, capture_time
+        FROM semantic_index
+        WHERE {path_expr} LIKE ?
+          AND capture_time IS NOT NULL AND capture_time != ''
+        ORDER BY rowid DESC
+        """,
+        (prefix,),
+    ).fetchall()
+    for fp, ct in rows:
+        if fp in result_map:
+            continue
+        if ct:
+            result_map[fp] = str(ct)
+    return result_map
+
+
 class SemanticImageIndex:
     """SQLite-backed CLIP embedding index for local semantic search."""
 
@@ -2275,12 +1473,12 @@ class SemanticImageIndex:
         {
             "has:face",
             "has:faces",
-            "face",
-            "faces",
             "has:people",
             "has:person",
-            "people",
+            "face",
+            "faces",
             "person",
+            "people",
             "human",
             "humans",
             "portrait",
@@ -2299,7 +1497,7 @@ class SemanticImageIndex:
 
     def __init__(self, db_path: Optional[str] = None, model_name: Optional[str] = None):
         if db_path is None:
-            cache_dir = _skyspotter_cache_root()
+            cache_dir = os.path.expanduser("~/.rawviewer_cache")
             os.makedirs(cache_dir, exist_ok=True)
             db_path = os.path.join(cache_dir, "semantic_index.db")
         self.db_path = db_path
@@ -2307,16 +1505,52 @@ class SemanticImageIndex:
         self._model_name = model_name
         self._index_conn = None
         self._rg_lock = threading.Lock()
-        self._logged_classifier_source = False
-        self.classifier_fingerprint_changed = False
+        self._paused = False
+        self._pause_lock = threading.Lock()
         self._init_db_if_needed()
-        self._sync_classifier_fingerprint()
-        self._stop_requested = False
+
+    def pause_indexing(self, pause: bool) -> None:
+        """Pause or resume the background indexing loops."""
+        with self._pause_lock:
+            self._paused = pause
+
+    def _wait_if_paused(self) -> None:
+        """Helper to sleep/wait while the indexing process is paused."""
+        flag = os.environ.get("RAWVIEWER_INDEX_PAUSE_IN_GALLERY", "1").strip().lower()
+        if flag not in ("1", "true", "yes", "on"):
+            return
+        while True:
+            with self._pause_lock:
+                if not self._paused:
+                    break
+            time.sleep(0.5)
+
+    def _mark_metadata_ready_without_embedding(
+        self,
+        canonical_fp: str,
+        st: os.stat_result,
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Mark file as metadata ready but without semantic embeddings (dim = 0)."""
+        conn.execute(
+            """
+            UPDATE semantic_index
+            SET semantic_ready = 1, dim = 0, embedding = ?, updated_at = ?
+            WHERE file_path = ? AND model_name = ? AND file_size = ? AND mtime_ns = ?
+            """,
+            (
+                b"",
+                float(time.time()),
+                canonical_fp,
+                self.model_name,
+                int(st.st_size),
+                self._mtime_ns_from_stat(st),
+            ),
+        )
+
 
     @property
     def backend(self):
-        if not semantic_embeddings_enabled():
-            return None
         if self._mobileclip_backend is None:
             self._mobileclip_backend = resolve_mobileclip_backend()
         return self._mobileclip_backend
@@ -2324,21 +1558,15 @@ class SemanticImageIndex:
     @property
     def model_name(self):
         if self._model_name is None:
-            if semantic_embeddings_enabled():
-                backend = self.backend
-                if backend is not None and hasattr(backend, "MODEL_ID"):
-                    self._model_name = backend.MODEL_ID
-                else:
-                    self._model_name = "unknown"
+            if hasattr(self.backend, "MODEL_ID"):
+                self._model_name = self.backend.MODEL_ID
             else:
-                self._model_name = AVIATION_INDEX_MODEL_ID
+                self._model_name = "unknown"
         return self._model_name
 
     def _init_db_if_needed(self):
         self._model = None
         self._reverse_geocoder = None
-        start = time.time()
-        logger.info(f"[INDEX] Initializing database at {self.db_path}...")
         self._conn = sqlite3.connect(
             self.db_path, check_same_thread=False, timeout=60.0
         )
@@ -2346,7 +1574,6 @@ class SemanticImageIndex:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA busy_timeout=60000")
         self._init_db()
-        logger.info(f"[INDEX] Database initialized in {time.time() - start:.3f}s")
 
     def _init_db(self) -> None:
         self._conn.execute(
@@ -2376,6 +1603,7 @@ class SemanticImageIndex:
                 country TEXT,
                 country_code TEXT,
                 face_count INTEGER,
+                orientation INTEGER,
                 updated_at REAL NOT NULL
             )
             """
@@ -2407,18 +1635,6 @@ class SemanticImageIndex:
             self._conn.execute(
                 "UPDATE semantic_index SET semantic_ready = 1 WHERE semantic_ready IS NULL"
             )
-        if "capture_time" not in cols:
-            self._conn.execute("ALTER TABLE semantic_index ADD COLUMN capture_time TEXT")
-        if "camera_model" not in cols:
-            self._conn.execute("ALTER TABLE semantic_index ADD COLUMN camera_model TEXT")
-        if "lens_model" not in cols:
-            self._conn.execute("ALTER TABLE semantic_index ADD COLUMN lens_model TEXT")
-        if "iso" not in cols:
-            self._conn.execute("ALTER TABLE semantic_index ADD COLUMN iso INTEGER")
-        if "width" not in cols:
-            self._conn.execute("ALTER TABLE semantic_index ADD COLUMN width INTEGER")
-        if "height" not in cols:
-            self._conn.execute("ALTER TABLE semantic_index ADD COLUMN height INTEGER")
         if "gps_lat" not in cols:
             self._conn.execute("ALTER TABLE semantic_index ADD COLUMN gps_lat REAL")
         if "gps_lon" not in cols:
@@ -2435,90 +1651,17 @@ class SemanticImageIndex:
             self._conn.execute("ALTER TABLE semantic_index ADD COLUMN country_code TEXT")
         if "face_count" not in cols:
             self._conn.execute("ALTER TABLE semantic_index ADD COLUMN face_count INTEGER")
-        if "detected_aircraft" not in cols:
-            self._conn.execute("ALTER TABLE semantic_index ADD COLUMN detected_aircraft TEXT")
-        if "blur_score" not in cols:
-            self._conn.execute("ALTER TABLE semantic_index ADD COLUMN blur_score REAL")
+        if "orientation" not in cols:
+            self._conn.execute("ALTER TABLE semantic_index ADD COLUMN orientation INTEGER")
+        self._conn.commit()
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_semantic_signature_model ON semantic_index(file_signature, model_name)"
         )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_semantic_ready_model ON semantic_index(semantic_ready, model_name)"
         )
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS app_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
         self._conn.commit()
-        # Backfill in a background thread to prevent UI freeze on large databases
-        threading.Thread(target=self._backfill_file_signatures, daemon=True).start()
-
-    _APP_META_CLASSIFIER_FP = "classifier_fingerprint"
-
-    def _get_app_meta(self, key: str) -> str | None:
-        row = self._conn.execute(
-            "SELECT value FROM app_meta WHERE key = ?", (key,)
-        ).fetchone()
-        return str(row[0]) if row else None
-
-    def _set_app_meta(self, key: str, value: str) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO app_meta (key, value) VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """,
-            (key, value),
-        )
-
-    def _invalidate_aircraft_classification_index(self) -> int:
-        cur = self._conn.execute(
-            """
-            UPDATE semantic_index
-            SET detected_aircraft = ''
-            WHERE COALESCE(detected_aircraft, '') != ''
-            """
-        )
-        return int(cur.rowcount or 0)
-
-    def _sync_classifier_fingerprint(self) -> bool:
-        """
-        Detect gallery ViT checkpoint changes and clear stale aircraft labels.
-
-        Returns True when the fingerprint changed since the last app session.
-        """
-        from gallery_classifier_version import (
-            compute_checkpoint_fingerprint,
-            project_root_from_module,
-            resolve_active_checkpoint_dir,
-        )
-
-        project_root = project_root_from_module()
-        checkpoint_dir = resolve_active_checkpoint_dir(project_root)
-        if checkpoint_dir is None:
-            return False
-
-        fingerprint = compute_checkpoint_fingerprint(checkpoint_dir)
-        if not fingerprint:
-            return False
-
-        previous = self._get_app_meta(self._APP_META_CLASSIFIER_FP)
-        changed = bool(previous and previous != fingerprint)
-        if changed:
-            cleared = self._invalidate_aircraft_classification_index()
-            logger.info(
-                "[INDEX] Gallery classifier changed (%s); cleared aircraft labels on %d row(s).",
-                checkpoint_dir.name,
-                cleared,
-            )
-            self.classifier_fingerprint_changed = True
-
-        self._set_app_meta(self._APP_META_CLASSIFIER_FP, fingerprint)
-        self._conn.commit()
-        return changed
+        self._backfill_file_signatures()
 
     def _ensure_model(self):
         if self._model is not None:
@@ -2528,17 +1671,15 @@ class SemanticImageIndex:
         except ImportError as exc:
             raise RuntimeError(
                 "Semantic search requires 'sentence-transformers'. "
-                "Install dependencies with: pixi install (see pixi.toml)"
+                "Install dependencies with: pip install -r requirements.txt"
             ) from exc
         self._model = SentenceTransformer(self.model_name)
         return self._model
 
-    def semantic_backend_available(self) -> bool:
-        if not semantic_embeddings_enabled():
-            return False
-        if self.model_name.startswith("mobileclip-") or self.model_name.startswith("aviation-"):
-            backend = self._mobileclip_backend or resolve_mobileclip_backend()
-            return backend.available()
+    @staticmethod
+    def semantic_backend_available() -> bool:
+        if resolve_mobileclip_backend().available():
+            return True
         try:
             import sentence_transformers  # noqa: F401
             return True
@@ -2546,9 +1687,7 @@ class SemanticImageIndex:
             return False
 
     def semantic_backend_error(self) -> str:
-        if not semantic_embeddings_enabled():
-            return "Semantic embeddings disabled (SkySpotter aircraft + EXIF mode)"
-        if self.model_name.startswith("mobileclip-") or self.model_name.startswith("aviation-"):
+        if self.model_name.startswith("mobileclip-"):
             backend = self._mobileclip_backend or resolve_mobileclip_backend()
             return backend.availability_error()
         try:
@@ -2558,18 +1697,16 @@ class SemanticImageIndex:
             return str(exc)
 
     def mobileclip_supports_hub_download(self) -> bool:
-        if not semantic_embeddings_enabled():
-            return False
         return bool(
-            (self.model_name.startswith("mobileclip-") or self.model_name.startswith("aviation-"))
-            and self.backend is not None
-            and getattr(self.backend, "SUPPORTS_HUB_DOWNLOAD", False)
+            self.model_name.startswith("mobileclip-")
+            and self._mobileclip_backend is not None
+            and getattr(self._mobileclip_backend, "SUPPORTS_HUB_DOWNLOAD", False)
         )
 
     def download_semantic_backend_assets(
         self, progress_callback: Optional[Callable[[str], None]] = None
     ) -> str:
-        if self.model_name.startswith("mobileclip-") or self.model_name.startswith("aviation-"):
+        if self.model_name.startswith("mobileclip-"):
             backend = self._mobileclip_backend or resolve_mobileclip_backend()
             path = backend.download_assets(progress_callback=progress_callback)
             self._mobileclip_backend = backend
@@ -2584,7 +1721,17 @@ class SemanticImageIndex:
                 return self._reverse_geocoder
             try:
                 import reverse_geocoder as rg  # type: ignore
-            except ImportError:
+                # reverse_geocoder lazy-loads its CSV on the first .search() call.
+                # Its lazy loader is NOT thread-safe, which causes massive I/O stalls
+                # if multiple worker threads call .search() concurrently.
+                # We initialize it here once inside the lock.
+                # CRITICAL: We MUST use mode=1, otherwise it defaults to mode=2
+                # which creates a multiprocessing.Pool. On Windows, this causes a fork bomb
+                # that exhausts system memory because it spawns new Python interpreters!
+                import logging
+                logging.getLogger(__name__).info("[VISION] Initializing reverse geocoder KD-tree...")
+                rg.search((0.0, 0.0), mode=1)
+            except Exception:
                 self._reverse_geocoder = False
                 return False
             self._reverse_geocoder = rg
@@ -2680,15 +1827,38 @@ class SemanticImageIndex:
 
     @staticmethod
     def _pil_dimensions(file_path: str) -> tuple[int, int]:
+        """Fallback dimensions when EXIF tags omit width/height.
+
+        For RAW, prefer rawpy header read only (PIL often fails on ARW). On network
+        drives this can still take seconds per file under parallel indexing.
+        """
+        # Check thread-local cache first
+        global _THREAD_LOCAL_DETECTORS
+        if '_THREAD_LOCAL_DETECTORS' in globals() and hasattr(_THREAD_LOCAL_DETECTORS, 'last_original_sizes'):
+            w, h = _THREAD_LOCAL_DETECTORS.last_original_sizes
+            if w > 0 and h > 0:
+                return w, h
+
+        ext = os.path.splitext(file_path)[1].lower().lstrip(".")
+        if ext in RAW_FILE_EXTENSIONS:
+            try:
+                import rawpy  # type: ignore
+
+                with rawpy.imread(file_path) as raw:
+                    w = int(raw.sizes.width)
+                    h = int(raw.sizes.height)
+                    flip = int(getattr(raw.sizes, "flip", 0) or 0)
+                    if flip in (5, 6, 7, 8):
+                        w, h = h, w
+                    if w > 0 and h > 0:
+                        return w, h
+            except Exception:
+                pass
+            return 0, 0
+
         try:
             with Image.open(file_path) as im:
                 return int(im.width), int(im.height)
-        except Exception:
-            pass
-        try:
-            import rawpy  # type: ignore
-            with rawpy.imread(file_path) as raw:
-                return int(raw.sizes.width), int(raw.sizes.height)
         except Exception:
             pass
         return 0, 0
@@ -2729,9 +1899,15 @@ class SemanticImageIndex:
             # OPTIMIZATION: If already absolute, skip abspath() which can hit disk/slow down on Windows.
             # Pure string normalization is much faster for thousands of paths on the UI thread.
             if os.path.isabs(file_path):
-                return os.path.normpath(file_path)
-            return os.path.normpath(os.path.abspath(file_path))
+                ret = os.path.normpath(file_path)
+            else:
+                ret = os.path.normpath(os.path.abspath(file_path))
+            if sys.platform.startswith("win"):
+                ret = ret.lower()
+            return ret
         except Exception:
+            if sys.platform.startswith("win"):
+                return file_path.lower()
             return file_path
 
     @staticmethod
@@ -2760,8 +1936,8 @@ class SemanticImageIndex:
                 semantic_ready,
                 model_name, dim, embedding,
                 capture_time, camera_model, lens_model, iso, width, height,
-                gps_lat, gps_lon, gps_raw, city, admin1, country, country_code, face_count, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                gps_lat, gps_lon, gps_raw, city, admin1, country, country_code, face_count, orientation, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(file_path) DO UPDATE SET
                 file_name=excluded.file_name,
                 file_signature=excluded.file_signature,
@@ -2786,6 +1962,7 @@ class SemanticImageIndex:
                 country=excluded.country,
                 country_code=excluded.country_code,
                 face_count=excluded.face_count,
+                orientation=excluded.orientation,
                 updated_at=excluded.updated_at
             """,
             (
@@ -2813,6 +1990,7 @@ class SemanticImageIndex:
                 str(meta.get("country") or ""),
                 str(meta.get("country_code") or ""),
                 int(meta["face_count"]) if meta.get("face_count") is not None else None,
+                int(meta["orientation"]) if meta.get("orientation") is not None else None,
                 float(time.time()),
             ),
         )
@@ -2921,7 +2099,12 @@ class SemanticImageIndex:
         except Exception:
             return None
 
-    def _extract_exif_brief(self, file_path: str, include_face: bool = False) -> Dict[str, object]:
+    def _extract_exif_brief(
+        self,
+        file_path: str,
+        include_face: bool = False,
+        file_stat: Optional[os.stat_result] = None,
+    ) -> Dict[str, object]:
         result = {
             "capture_time": "",
             "camera_model": "",
@@ -2937,11 +2120,27 @@ class SemanticImageIndex:
             "country": "",
             "country_code": "",
             "face_count": None,
+            "orientation": 1,
         }
         try:
+            im = None
+            if include_face:
+                try:
+                    im = _load_index_source_image(file_path, max_size=1280)
+                except Exception:
+                    pass
+
+            t_exif = time.time()
+            # Stop after GPS block when possible; RAW uses exifread (header-only) in auto mode.
             tags = metadata_backend.process_file_from_path(
-                file_path, details=False
+                file_path,
+                details=False,
+                stop_tag="GPS GPSLongitudeRef",
             )
+            dur_exif = time.time() - t_exif
+            dur_dims = 0.0
+            dur_geo = 0.0
+            dur_cache = 0.0
             result["capture_time"] = self._tag_text(
                 tags,
                 "EXIF DateTimeOriginal",
@@ -2972,22 +2171,35 @@ class SemanticImageIndex:
             result["width"] = self._tag_int(
                 tags,
                 "EXIF ExifImageWidth",
+                "EXIF ImageWidth",
                 "Image ImageWidth",
                 "Image Width",
                 "EXIF PixelXDimension",
+                "MakerNote ImageWidth",
             )
             result["height"] = self._tag_int(
                 tags,
                 "EXIF ExifImageLength",
+                "EXIF ImageLength",
                 "Image ImageLength",
                 "Image Height",
                 "Image Length",
                 "EXIF PixelYDimension",
+                "MakerNote ImageHeight",
             )
             if not result["width"] or not result["height"]:
+                t_dims = time.time()
                 w, h = self._pil_dimensions(file_path)
+                dur_dims = time.time() - t_dims
                 result["width"] = int(result["width"] or w)
                 result["height"] = int(result["height"] or h)
+                
+            result["orientation"] = self._tag_int(
+                tags,
+                "EXIF Orientation",
+                "Image Orientation"
+            ) or 1
+            
             # GPS Extraction
             lat = tags.get("GPS GPSLatitude") or tags.get("EXIF GPSLatitude") or tags.get("GPSLatitude")
             lon = tags.get("GPS GPSLongitude") or tags.get("EXIF GPSLongitude") or tags.get("GPSLongitude")
@@ -3007,11 +2219,14 @@ class SemanticImageIndex:
                     geo = self._ensure_reverse_geocoder()
                     if geo:
                         try:
-                            # Use a small timeout or limit to avoid blocking too long if multiple calls
-                            recs = geo.search(
-                                [(float(result["gps_lat"]), float(result["gps_lon"]))],
-                                mode=1,
-                            )
+                            t_geo = time.time()
+                            # reverse_geocoder is not thread-safe; serialize lookups.
+                            with self._rg_lock:
+                                recs = geo.search(
+                                    [(float(result["gps_lat"]), float(result["gps_lon"]))],
+                                    mode=1,
+                                )
+                            dur_geo = time.time() - t_geo
                             if recs:
                                 rec = recs[0] or {}
                                 result["city"] = str(rec.get("name", "") or "")
@@ -3022,7 +2237,71 @@ class SemanticImageIndex:
                         except Exception:
                             pass
             if include_face:
-                result["face_count"] = self._detect_face_count(file_path)
+                result["face_count"] = self._detect_face_count(file_path, preloaded_im=im)
+            
+            # Automatically backfill and populate the main gallery's PersistentEXIFCache/ImageCache!
+            try:
+                orientation = 1
+                for key in ("Exif.Image.Orientation", "Exif.Photo.Orientation", "Image Orientation", "EXIF Orientation"):
+                    val = tags.get(key)
+                    if val is not None:
+                        try:
+                            s = str(val).strip()
+                            first = s.split()[0]
+                            o = int(first)
+                            if 1 <= o <= 8:
+                                orientation = o
+                                break
+                        except Exception:
+                            pass
+
+                from image_cache import get_image_cache
+
+                t_cache = time.time()
+                cache = get_image_cache()
+                cache_dict = {
+                    "orientation": int(orientation),
+                    "camera_make": str(tags.get("Image Make") or ""),
+                    "camera_model": str(result["camera_model"]),
+                    "capture_time": str(result["capture_time"]),
+                    "original_width": int(result["width"] or 0),
+                    "original_height": int(result["height"] or 0),
+                    "exif_data": {
+                        "original_width": int(result["width"] or 0),
+                        "original_height": int(result["height"] or 0),
+                        "orientation": int(orientation),
+                        "capture_time": str(result["capture_time"]),
+                        "camera_make": str(tags.get("Image Make") or ""),
+                        "camera_model": str(result["camera_model"]),
+                        "lens_model": str(result["lens_model"]),
+                        "iso": int(result["iso"] or 0),
+                    }
+                }
+                if file_stat is not None:
+                    cache.put_exif(
+                        file_path,
+                        cache_dict,
+                        file_size=int(file_stat.st_size),
+                        file_mtime=float(file_stat.st_mtime),
+                    )
+                else:
+                    cache.put_exif(file_path, cache_dict)
+                dur_cache = time.time() - t_cache
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"[INDEX] Could not populate ImageCache for {file_path}: {e}")
+            total_dur = dur_exif + dur_dims + dur_geo + dur_cache
+            if total_dur > 2.0:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "[INDEX] Slow metadata phases for %s: total=%.3fs exif=%.3fs dims=%.3fs geo=%.3fs cache_put=%.3fs",
+                    os.path.basename(file_path),
+                    total_dur,
+                    dur_exif,
+                    dur_dims,
+                    dur_geo,
+                    dur_cache,
+                )
         except Exception:
             pass
         return result
@@ -3056,116 +2335,138 @@ class SemanticImageIndex:
                 im = _load_index_source_image(
                     file_path, max_size=SemanticImageIndex.face_detection_max_edge()
                 )
-
+            
             if sys.platform != "darwin":
+                # 1. Try OpenCV YuNet (Ultra-Lightweight, extremely fast, highly accurate)
                 try:
                     import cv2
+                    import numpy as np
+                    import os
                     import urllib.request
-
+                    import threading
+                    
                     global _THREAD_LOCAL_DETECTORS
-                    if "_THREAD_LOCAL_DETECTORS" not in globals():
+                    if '_THREAD_LOCAL_DETECTORS' not in globals():
                         _THREAD_LOCAL_DETECTORS = threading.local()
-
-                    cache_dir = os.path.join(_skyspotter_cache_root(), "models")
+                    
+                    # Ensure the model file is present
+                    cache_dir = os.path.expanduser("~/.rawviewer_cache/models")
                     os.makedirs(cache_dir, exist_ok=True)
                     model_path = os.path.join(cache_dir, "face_detection_yunet_2023mar.onnx")
-
+                    
                     if not os.path.exists(model_path):
-                        logger.info("[VISION] Downloading YuNet ONNX face detection model (353 KB)...")
+                        import logging
+                        logging.getLogger(__name__).info("[VISION] Downloading YuNet ONNX face detection model (353 KB)...")
                         url = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
                         urllib.request.urlretrieve(url, model_path)
-                        logger.info("[VISION] YuNet ONNX model downloaded successfully.")
-
+                        logging.getLogger(__name__).info("[VISION] YuNet ONNX model downloaded successfully.")
+                    
+                    # YuNet requires BGR input
                     img_bgr = cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
                     h, w = img_bgr.shape[:2]
-
-                    if not hasattr(_THREAD_LOCAL_DETECTORS, "yunet"):
-                        logger.info("[VISION] Initializing OpenCV YuNet thread-local instance...")
-                        _THREAD_LOCAL_DETECTORS.yunet = cv2.FaceDetectorYN.create(
-                            model=model_path,
-                            config="",
-                            input_size=(w, h),
-                            score_threshold=0.75,
-                            nms_threshold=0.3,
-                            top_k=5000,
-                            backend_id=cv2.dnn.DNN_BACKEND_OPENCV,
-                            target_id=cv2.dnn.DNN_TARGET_CPU,
+                    
+                    if not hasattr(_THREAD_LOCAL_DETECTORS, 'yunet'):
+                        import logging
+                        logging.getLogger(__name__).info("[VISION] Initializing OpenCV YuNet thread-local instance...")
+                        backend_id, target_id = resolve_opencv_dnn_backend_target()
+                        try:
+                            _THREAD_LOCAL_DETECTORS.yunet = cv2.FaceDetectorYN.create(
+                                model=model_path,
+                                config="",
+                                input_size=(w, h),
+                                score_threshold=0.85,
+                                nms_threshold=0.3,
+                                top_k=5000,
+                                backend_id=backend_id,
+                                target_id=target_id,
+                            )
+                        except Exception:
+                            _THREAD_LOCAL_DETECTORS.yunet = cv2.FaceDetectorYN.create(
+                                model=model_path,
+                                config="",
+                                input_size=(w, h),
+                                score_threshold=0.85,
+                                nms_threshold=0.3,
+                                top_k=5000,
+                                backend_id=cv2.dnn.DNN_BACKEND_OPENCV,
+                                target_id=cv2.dnn.DNN_TARGET_CPU,
+                            )
+                        logging.getLogger(__name__).info(
+                            "[VISION] OpenCV YuNet initialized (backend=%s target=%s).",
+                            backend_id,
+                            target_id,
                         )
-                        logger.info("[VISION] OpenCV YuNet thread-local instance initialized successfully.")
-
+                    
                     detector = _THREAD_LOCAL_DETECTORS.yunet
+                    # Crucial: input size must match the actual image size for YuNet
                     detector.setInputSize((w, h))
-                    _retval, faces = detector.detect(img_bgr)
+                    retval, faces = detector.detect(img_bgr)
+                    
                     return len(faces) if faces is not None else 0
                 except Exception as yn_err:
-                    logger.debug(
-                        "[VISION] OpenCV YuNet failed on %s, trying OpenCV DNN: %s",
-                        file_path,
-                        yn_err,
-                    )
+                    import logging
+                    logging.getLogger(__name__).debug(f"[VISION] OpenCV YuNet failed on {file_path}, trying OpenCV DNN: {yn_err}")
 
+                # 2. Windows fallback using OpenCV DNN Face Detector
                 try:
                     import cv2
+                    import numpy as np
+                    import os
                     import urllib.request
-
+                    import threading
+                    
                     global _FACE_DETECTOR_NET
                     global _FACE_DETECTOR_LOCK
-                    if "_FACE_DETECTOR_NET" not in globals():
+                    if '_FACE_DETECTOR_NET' not in globals():
                         _FACE_DETECTOR_NET = None
                         _FACE_DETECTOR_LOCK = threading.Lock()
 
                     if _FACE_DETECTOR_NET is None:
                         with _FACE_DETECTOR_LOCK:
                             if _FACE_DETECTOR_NET is None:
-                                models_dir = os.path.join(_skyspotter_cache_root(), "models")
+                                models_dir = os.path.expanduser("~/.rawviewer_cache/models")
                                 os.makedirs(models_dir, exist_ok=True)
-
+                                
                                 prototxt_path = os.path.join(models_dir, "deploy.prototxt")
-                                caffemodel_path = os.path.join(
-                                    models_dir, "res10_300x300_ssd_iter_140000.caffemodel"
-                                )
-
+                                caffemodel_path = os.path.join(models_dir, "res10_300x300_ssd_iter_140000.caffemodel")
+                                
                                 if not os.path.exists(prototxt_path):
-                                    logger.info("[VISION] Downloading DNN face detector prototxt...")
+                                    import logging
+                                    logging.getLogger(__name__).info("[VISION] Downloading DNN face detector prototxt...")
                                     urllib.request.urlretrieve(
                                         "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt",
-                                        prototxt_path,
+                                        prototxt_path
                                     )
                                 if not os.path.exists(caffemodel_path):
-                                    logger.info("[VISION] Downloading DNN face detector weights...")
+                                    import logging
+                                    logging.getLogger(__name__).info("[VISION] Downloading DNN face detector weights...")
                                     urllib.request.urlretrieve(
                                         "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel",
-                                        caffemodel_path,
+                                        caffemodel_path
                                     )
-                                _FACE_DETECTOR_NET = cv2.dnn.readNetFromCaffe(
-                                    prototxt_path, caffemodel_path
-                                )
-
-                    img_bgr = np.array(im.convert("RGB"))[:, :, ::-1].copy()
-                    blob = cv2.dnn.blobFromImage(
-                        cv2.resize(img_bgr, (600, 600)),
-                        1.0,
-                        (600, 600),
-                        (104.0, 177.0, 123.0),
-                    )
-
+                                _FACE_DETECTOR_NET = cv2.dnn.readNetFromCaffe(prototxt_path, caffemodel_path)
+                                _apply_opencv_dnn_acceleration(_FACE_DETECTOR_NET)
+                    
+                    # Convert PIL image to BGR for OpenCV DNN
+                    img_bgr = np.array(im.convert('RGB'))[:, :, ::-1].copy()
+                    
+                    # Prepare input blob and perform forward pass
+                    blob = cv2.dnn.blobFromImage(cv2.resize(img_bgr, (600, 600)), 1.0, (600, 600), (104.0, 177.0, 123.0))
+                    
                     with _FACE_DETECTOR_LOCK:
                         _FACE_DETECTOR_NET.setInput(blob)
                         detections = _FACE_DETECTOR_NET.forward()
-
+                    
                     face_count = 0
                     for i in range(detections.shape[2]):
                         confidence = detections[0, 0, i, 2]
-                        if confidence > 0.75:
+                        if confidence > 0.85:  # 85% confidence threshold
                             face_count += 1
-
+                            
                     return face_count
                 except Exception as e:
-                    logger.warning(
-                        "[VISION] OpenCV DNN face detection fallback error on %s: %s",
-                        file_path,
-                        e,
-                    )
+                    import logging
+                    logging.getLogger(__name__).warning(f"[VISION] OpenCV DNN face detection fallback error on {file_path}: {e}")
                     return 0
 
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
@@ -3263,12 +2564,11 @@ class SemanticImageIndex:
         )
 
     def _encode_image(self, file_path: str) -> np.ndarray:
-        if self.model_name.startswith("mobileclip-") or self.model_name.startswith("aviation-"):
+        if self.model_name.startswith("mobileclip-"):
             backend = self._mobileclip_backend or resolve_mobileclip_backend()
-            self._mobileclip_backend = backend
             err = backend.availability_error()
             if err:
-                raise RuntimeError(f"{backend.__class__.__name__} backend unavailable: {err}")
+                raise RuntimeError(f"MobileCLIP backend unavailable: {err}")
             return backend.encode_image(file_path)
         model = self._ensure_model()
         try:
@@ -3280,120 +2580,140 @@ class SemanticImageIndex:
                 f"Cannot decode image for semantic index: {os.path.basename(file_path)}"
             ) from exc
 
-    def _encode_text(self, text: str) -> np.ndarray:
-        if self.model_name.startswith("mobileclip-") or self.model_name.startswith("aviation-"):
+    def _encode_images_best_effort(self, file_paths: Sequence[str]) -> List[np.ndarray]:
+        """
+        Encode multiple images. Falls back to per-image encoding when batch path
+        is unavailable or unsupported by the model graph.
+        """
+        paths = [p for p in (file_paths or []) if p]
+        if not paths:
+            return []
+        if self.model_name.startswith("mobileclip-"):
             backend = self._mobileclip_backend or resolve_mobileclip_backend()
             err = backend.availability_error()
             if err:
-                raise RuntimeError(f"{backend.__class__.__name__} backend unavailable: {err}")
+                raise RuntimeError(f"MobileCLIP backend unavailable: {err}")
+            if hasattr(backend, "encode_images"):
+                try:
+                    return list(backend.encode_images(paths))
+                except Exception:
+                    pass
+        return [self._encode_image(p) for p in paths]
+
+    def _semantic_batch_cache_key(self, accel_detail: str = "") -> str:
+        ep = ""
+        try:
+            if self.model_name.startswith("mobileclip-"):
+                backend = self._mobileclip_backend or resolve_mobileclip_backend()
+                self._mobileclip_backend = backend
+                if isinstance(backend, MobileCLIPONNXBackend):
+                    import onnxruntime as ort
+
+                    selected = resolve_onnx_execution_providers(
+                        list(ort.get_available_providers())
+                    )
+                    ep = ",".join(selected)
+                else:
+                    ep = backend.__class__.__name__
+        except Exception:
+            ep = accel_detail or "unknown"
+        return (
+            f"{sys.platform}|{self.model_name}|{ep}|{accel_detail or ''}"
+            f"|{SEMANTIC_BATCH_TUNE_CACHE_VERSION}"
+        )
+
+    def _auto_select_semantic_batch_size(
+        self, pending_for_semantic: Sequence[tuple[str, os.stat_result]], accel_detail: str = ""
+    ) -> int:
+        import logging
+
+        logger = logging.getLogger(__name__)
+        total = len(pending_for_semantic or [])
+        if total <= 1:
+            return 1
+        forced = semantic_batch_size_forced()
+        if forced is not None:
+            return forced
+        if not semantic_batch_auto_enabled():
+            return semantic_batch_size()
+
+        candidates = semantic_batch_candidates()
+        if self.model_name.startswith("mobileclip-"):
+            backend = self._mobileclip_backend or resolve_mobileclip_backend()
+            self._mobileclip_backend = backend
+            if not isinstance(backend, MobileCLIPONNXBackend):
+                return 1
+
+        cache_key = self._semantic_batch_cache_key(accel_detail)
+        cache = _load_semantic_batch_cache()
+        cached = cache.get(cache_key)
+        if cached in candidates:
+            logger.info("[INDEX][SPEED] Semantic batch auto cached: %d", int(cached))
+            return int(cached)
+
+        max_cand = max(candidates)
+        sample_n = min(
+            total,
+            max(semantic_batch_tune_sample_count(), max_cand),
+        )
+        sample_paths = [cp for cp, _ in list(pending_for_semantic)[:sample_n]]
+        best_batch = 1
+        best_tput = 0.0
+        tie_ratio = semantic_batch_tie_ratio()
+        logger.info(
+            "[INDEX][SPEED] Auto-tuning semantic batch size on %d samples; "
+            "candidates=%s (tie_ratio=%.2f)",
+            sample_n,
+            candidates,
+            tie_ratio,
+        )
+        for cand in candidates:
+            t0 = time.time()
+            ok = True
+            try:
+                for i in range(0, sample_n, cand):
+                    chunk = sample_paths[i : i + cand]
+                    self._encode_images_best_effort(chunk)
+            except Exception as e:
+                ok = False
+                logger.info(
+                    "[INDEX][SPEED] Batch candidate %d failed during auto-tune: %s",
+                    cand,
+                    e,
+                )
+            elapsed = max(1e-9, time.time() - t0)
+            tput = (sample_n / elapsed) if ok else 0.0
+            logger.info(
+                "[INDEX][SPEED] Batch candidate %d -> %.2f img/s (%s)",
+                cand,
+                tput,
+                "ok" if ok else "failed",
+            )
+            if ok:
+                if tput > best_tput:
+                    best_tput = tput
+                    best_batch = cand
+                elif tput >= best_tput * tie_ratio and cand > best_batch:
+                    best_batch = cand
+
+        cache[cache_key] = int(best_batch)
+        _save_semantic_batch_cache(cache)
+        logger.info(
+            "[INDEX][SPEED] Auto-selected semantic batch size: %d (%.2f img/s on samples)",
+            best_batch,
+            best_tput,
+        )
+        return int(best_batch)
+
+    def _encode_text(self, text: str) -> np.ndarray:
+        if self.model_name.startswith("mobileclip-"):
+            backend = self._mobileclip_backend or resolve_mobileclip_backend()
+            err = backend.availability_error()
+            if err:
+                raise RuntimeError(f"MobileCLIP backend unavailable: {err}")
             return backend.encode_text(text)
         model = self._ensure_model()
         return np.asarray(model.encode(text, normalize_embeddings=True), dtype=np.float32)
-
-    # --- Aviation Specialist Features ---
-
-    _AVIATION_AIRLINES = [
-        "Lufthansa", "Emirates", "Qatar Airways", "Singapore Airlines", "Cathay Pacific", "Air France", 
-        "British Airways", "KLM", "Delta Air Lines", "United Airlines", "American Airlines", "Southwest Airlines", 
-        "JetBlue", "Alaska Airlines", "Air Canada", "Turkish Airlines", "Swiss International Air Lines", 
-        "Austrian Airlines", "Finnair", "SAS", "Iberia", "TAP Air Portugal", "Alitalia", "ITA Airways", 
-        "LOT Polish Airlines", "Aeroflot", "S7 Airlines", "Air China", "China Eastern", "China Southern", 
-        "Hainan Airlines", "ANA", "JAL", "Korean Air", "Asiana Airlines", "EVA Air", "China Airlines", 
-        "Thai Airways", "Malaysia Airlines", "Vietnam Airlines", "Garuda Indonesia", "Philippine Airlines", 
-        "Qantas", "Air New Zealand", "Virgin Australia", "LATAM", "Avianca", "Copa Airlines", "Aeromexico", 
-        "Ethiopian Airlines", "Kenya Airways", "South African Airways", "EgyptAir", "Royal Air Maroc", 
-        "Saudia", "Etihad Airways", "Gulf Air", "Kuwait Airways", "Oman Air", "Royal Jordanian", "Air India", 
-        "IndiGo", "Vistara", "SpiceJet", "AirAsia", "Lion Air", "Cebu Pacific", "Ryanair", "EasyJet", 
-        "Wizz Air", "Vueling", "Norwegian", "Jetstar", "Peach", "Scoot", "WestJet", "Condor", "TUI", "SunExpress",
-        "Air Baltic", "Icelandair", "Brussels Airlines", "Luxair", "Pegasus Airlines", "Flydubai", "Air Arabia",
-        "Royal Brunei", "SilkAir", "Bamboo Airways", "Jetstar Asia", "VietJet Air", "Spring Airlines", "Juneyao Airlines"
-    ]
-
-    _AVIATION_LABELS = (
-        "F-16 Fighting Falcon", "F-22 Raptor", "F-35 Lightning II", "F-15 Eagle",
-        "A-10 Thunderbolt II", "Boeing 747", "Boeing 737-800", "Boeing 737 MAX",
-        "Boeing 777", "Boeing 787 Dreamliner", "Airbus A320neo", "Airbus A321",
-        "Airbus A330", "Airbus A350", "Airbus A380", "Concorde", "Sukhoi Su-57",
-        "Eurofighter Typhoon", "Dassault Rafale", "Lockheed SR-71 Blackbird",
-        "Northrop Grumman B-2 Spirit", "Spitfire", "P-51 Mustang", "Messerschmitt Bf 109",
-        "Cessna 172 Skyhawk", "Piper Cub", "Apache Helicopter", "Chinook", "V-22 Osprey",
-        "B-52 Stratofortress", "B-1 Lancer", "F/A-18 Hornet", "E-2 Hawkeye",
-        "C-130 Hercules", "C-17 Globemaster III", "Embraer E190", "Bombardier CRJ"
-    )
-
-    _AVIATION_NEGATIVES = (
-        "nature", "building", "person", "crowd", "trees", "car", "water", 
-        "inside of a plane", "airport terminal", "cockpit", "airplane seats",
-        "ground crew", "sky with clouds", "macro photo"
-    )
-
-    @lru_cache(maxsize=1)
-    def _get_aviation_label_embeddings_cached(self, labels: tuple):
-        backend = self._mobileclip_backend or resolve_mobileclip_backend()
-        prompts = [
-            "a photo of a {} aircraft",
-            "an aircraft model: {}",
-            "the {} airplane",
-            "a picture of a {}"
-        ]
-        results = []
-        for label in labels:
-            embs = [backend.encode_text(p.format(label)) for p in prompts]
-            avg_emb = np.mean(embs, axis=0)
-            avg_emb /= np.linalg.norm(avg_emb)
-            results.append((label, avg_emb, False))
-
-        for neg in self._AVIATION_NEGATIVES:
-            emb = backend.encode_text(f"a photo of {neg}")
-            results.append((neg, emb, True))
-
-        return results
-
-    def _identify_airline_zero_shot(self, image_vec: np.ndarray, threshold: float = 0.12) -> str:
-        label_embs = self._get_aviation_label_embeddings_cached(tuple(self._AVIATION_AIRLINES))
-        scores = []
-        for label, label_vec, _ in label_embs:
-            score = float(np.dot(image_vec, label_vec))
-            scores.append((label, score))
-        scores.sort(key=lambda x: x[1], reverse=True)
-        top_label, top_score = scores[0]
-        if top_score > threshold:
-            logger.info(
-                "[AVIATION AI] Airline identified: %s (Score: %.3f)",
-                top_label,
-                top_score,
-            )
-            return top_label
-        return ""
-
-    def _get_aviation_label_embeddings(self):
-        return self._get_aviation_label_embeddings_cached(self._AVIATION_LABELS)
-
-    def _detect_aircraft_zero_shot(self, image_vec: np.ndarray, threshold: float = 0.15) -> str:
-        labels_to_use = self._AVIATION_LABELS
-        if (
-            hasattr(self, "_aviation_classifier")
-            and self._aviation_classifier
-            and self._aviation_classifier.LABELS
-        ):
-            labels_to_use = self._aviation_classifier.LABELS
-        label_embs = self._get_aviation_label_embeddings_cached(tuple(labels_to_use))
-        scores = []
-        for label, label_vec, is_negative in label_embs:
-            score = float(np.dot(image_vec, label_vec))
-            scores.append((label, score, is_negative))
-        scores.sort(key=lambda x: x[1], reverse=True)
-        top_label, top_score, is_negative = scores[0]
-        logger.info(
-            "[AVIATION AI] Zero-shot ensemble suggested: %s (Score: %.3f)",
-            top_label,
-            top_score,
-        )
-        if is_negative:
-            return ""
-        if top_score > threshold:
-            return top_label
-        return ""
 
     @staticmethod
     def _face_scan_worker_count() -> int:
@@ -3415,14 +2735,9 @@ class SemanticImageIndex:
     @staticmethod
     def _defer_face_scan_during_build() -> bool:
         """
-        When true, build_index skips inline face scan (second background pass may still run).
-
-        SkySpotter defaults face_scan off via skyspotter_features.json; when disabled we always defer.
+        When true, build_index finishes after metadata + semantic embeddings.
+        Face backfill runs in a second background pass so search becomes usable sooner.
         """
-        from skyspotter_features import face_scan_enabled
-
-        if not face_scan_enabled():
-            return True
         v = os.environ.get("RAWVIEWER_INDEX_DEFER_FACE_SCAN", "1").strip().lower()
         return v not in ("0", "false", "no", "off")
 
@@ -3458,111 +2773,6 @@ class SemanticImageIndex:
         return 25.0
 
     @staticmethod
-    def _aircraft_warm_thumbnails_enabled() -> bool:
-        v = os.environ.get("SkySpotter_AIRCRAFT_WARM_THUMBS", "1").strip().lower()
-        return v not in ("0", "false", "no", "off")
-
-    @staticmethod
-    def _warm_with_metadata_enabled() -> bool:
-        """When true, thumbnail warm runs inside the metadata parallel pass (default)."""
-        v = os.environ.get("SkySpotter_AIRCRAFT_WARM_WITH_METADATA", "1").strip().lower()
-        return v not in ("0", "false", "no", "off")
-
-    @staticmethod
-    def _warm_thumbnail_one(path: str) -> bool:
-        """Cache one embedded thumbnail if missing. Thread-safe; cheap on cache hit."""
-        from image_cache import get_image_cache
-
-        cache = get_image_cache()
-        if cache.get_thumbnail(path) is not None:
-            return True
-        try:
-            from enhanced_raw_processor import (
-                _thumbnail_via_qimage_reader,
-                extract_embedded_jpeg_by_scan,
-            )
-
-            arr = extract_embedded_jpeg_by_scan(path, 1024)
-            if arr is None:
-                arr = _thumbnail_via_qimage_reader(path, 1024)
-            if arr is not None:
-                cache.put_thumbnail(path, arr, None)
-                return True
-            proc = getattr(_WARM_THUMB_TLS, "processor", None)
-            if proc is None:
-                from unified_image_processor import UnifiedImageProcessor
-
-                proc = UnifiedImageProcessor()
-                _WARM_THUMB_TLS.processor = proc
-            thumb = proc.process_thumbnail(path, allow_heavy_fallback=False)
-            return thumb is not None
-        except Exception:
-            return False
-
-    @staticmethod
-    def _aircraft_warm_limits(pending_count: int) -> tuple[int, float]:
-        """
-        Auto thumbnail warm caps from GPU VRAM and uncached file count.
-
-        Returns ``(max_files, max_seconds)``. ``max_files <= 0`` or ``max_seconds <= 0``
-        means no cap on that dimension. Override with ``SkySpotter_AIRCRAFT_WARM_MAX_*``.
-        """
-        raw_files = os.environ.get("SkySpotter_AIRCRAFT_WARM_MAX_FILES", "").strip()
-        raw_secs = os.environ.get("SkySpotter_AIRCRAFT_WARM_MAX_SECONDS", "").strip()
-        if raw_files or raw_secs:
-            max_files = 512
-            if raw_files:
-                try:
-                    max_files = int(raw_files)
-                except ValueError:
-                    pass
-            max_seconds = 60.0
-            if raw_secs:
-                try:
-                    max_seconds = max(0.0, float(raw_secs))
-                except ValueError:
-                    pass
-            return max_files, max_seconds
-
-        pending = max(0, int(pending_count))
-        workers = max(1, min(4, suggested_aircraft_classify_workers()))
-        vram = gpu_vram_gib()
-
-        if torch_gpu_available() and vram is not None and vram >= 11:
-            return -1, 0.0
-
-        if torch_gpu_available() and vram is not None and vram >= 8:
-            if pending <= 2000:
-                return -1, 0.0
-            return 1500, 180.0
-
-        if torch_gpu_available() and vram is not None and vram >= 6:
-            cap_files = min(pending, 1024) if pending > 0 else 1024
-            est_secs = max(30.0, (cap_files / workers) * 0.25)
-            return cap_files, min(120.0, est_secs)
-
-        cap_files = min(pending, 384) if pending > 0 else 384
-        est_secs = max(20.0, (cap_files / workers) * 0.3)
-        return cap_files, min(45.0, est_secs)
-
-    @staticmethod
-    def _aircraft_classify_parallel_enabled() -> bool:
-        v = os.environ.get("SkySpotter_AIRCRAFT_CLASSIFY_PARALLEL", "1").strip().lower()
-        return v not in ("0", "false", "no", "off")
-
-    @staticmethod
-    def _aircraft_classify_worker_count() -> int:
-        raw = os.environ.get("SkySpotter_AIRCRAFT_CLASSIFY_WORKERS", "").strip()
-        if raw:
-            try:
-                return max(1, min(8, int(raw)))
-            except ValueError:
-                pass
-        if torch_gpu_available():
-            return suggested_aircraft_classify_workers()
-        return min(4, max(2, (os.cpu_count() or 4) - 1))
-
-    @staticmethod
     def face_detection_max_edge() -> int:
         """Longest edge passed to YuNet/Vision (see _load_index_source_image in _detect_face_count)."""
         raw = os.environ.get("RAWVIEWER_FACE_DETECT_MAX_EDGE", "").strip()
@@ -3573,45 +2783,63 @@ class SemanticImageIndex:
                 pass
         return 1280
 
-    def _warm_thumbnail_cache_paths(
+    def _warm_thumbnail_cache_for_face_scan(
         self,
         paths: List[str],
         progress_callback: ProgressCallback = None,
-        *,
-        max_files: int,
-        max_seconds: float,
-        workers: int,
-        log_label: str,
     ) -> int:
         """
-        Pre-extract embedded thumbnails into ImageCache so indexing avoids per-file RAW decode.
+        Pre-extract embedded thumbnails into ImageCache so face scan avoids per-file RAW decode.
+        Face detection only needs a downscaled RGB image (~1280px); cached thumbs are enough.
         """
+        import logging
         from image_cache import get_image_cache
+        from unified_image_processor import UnifiedImageProcessor
 
-        if not paths:
+        logger = logging.getLogger(__name__)
+        if not paths or not self._thumbnail_warm_before_face_scan():
             return 0
 
         cache = get_image_cache()
         pending = [p for p in paths if cache.get_thumbnail(p) is None]
         if not pending:
-            logger.info("[INDEX] %s thumbnail warm-up: all %d paths already cached", log_label, len(paths))
+            logger.info("[INDEX] Thumbnail warm-up: all %d face-scan paths already cached", len(paths))
             return 0
+        max_files = self._face_scan_warm_max_files()
         if max_files == 0:
-            logger.info("[INDEX] %s thumbnail warm-up disabled (max_files=0)", log_label)
+            logger.info("[INDEX] Thumbnail warm-up disabled by RAWVIEWER_FACE_SCAN_WARM_MAX_FILES=0")
             return 0
         if max_files > 0 and len(pending) > max_files:
             pending = pending[:max_files]
+        max_seconds = self._face_scan_warm_max_seconds()
 
-        workers = max(1, min(workers, 8))
+        workers = min(4, self._face_scan_worker_count())
+        processor = UnifiedImageProcessor()
         t0 = time.time()
         warmed = 0
 
         def _warm_one(path: str) -> bool:
-            return SemanticImageIndex._warm_thumbnail_one(path)
+            if cache.get_thumbnail(path) is not None:
+                return True
+            try:
+                from enhanced_raw_processor import (
+                    _thumbnail_via_qimage_reader,
+                    extract_embedded_jpeg_by_scan,
+                )
+
+                arr = extract_embedded_jpeg_by_scan(path, 1024)
+                if arr is None:
+                    arr = _thumbnail_via_qimage_reader(path, 1024)
+                if arr is not None:
+                    cache.put_thumbnail(path, arr, None)
+                    return True
+                thumb = processor.process_thumbnail(path, allow_heavy_fallback=False)
+                return thumb is not None
+            except Exception:
+                return False
 
         logger.info(
-            "[INDEX] %s thumbnail warm-up: %d/%d files (%d workers, %.1fs budget)",
-            log_label,
+            "[INDEX] Warming thumbnail cache for face scan: %d/%d files (%d workers, %.1fs budget)",
             len(pending),
             len(paths),
             workers,
@@ -3621,17 +2849,16 @@ class SemanticImageIndex:
         if workers <= 1 or total < 8:
             for i, path in enumerate(pending, start=1):
                 if max_seconds > 0 and (time.time() - t0) >= max_seconds:
-                    logger.info(
-                        "[INDEX] %s thumbnail warm-up budget reached after %d/%d files",
-                        log_label,
-                        i - 1,
-                        total,
-                    )
+                    logger.info("[INDEX] Thumbnail warm-up budget reached after %d/%d files", i - 1, total)
                     break
                 if _warm_one(path):
                     warmed += 1
                 if progress_callback and (i <= 2 or i >= total or i % 20 == 0):
-                    progress_callback(i, total, f"Warming thumbnails ({log_label})…")
+                    progress_callback(
+                        i,
+                        total,
+                        format_index_progress("Preparing thumbnails", i, total),
+                    )
         else:
             completed = 0
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
@@ -3642,8 +2869,7 @@ class SemanticImageIndex:
                         remaining_budget = max(0.0, max_seconds - (time.time() - t0))
                         if remaining_budget <= 0:
                             logger.info(
-                                "[INDEX] %s thumbnail warm-up budget reached after %d/%d files",
-                                log_label,
+                                "[INDEX] Thumbnail warm-up budget reached after %d/%d files",
                                 completed,
                                 total,
                             )
@@ -3655,8 +2881,7 @@ class SemanticImageIndex:
                     )
                     if not done:
                         logger.info(
-                            "[INDEX] %s thumbnail warm-up timeout after %d/%d files",
-                            log_label,
+                            "[INDEX] Thumbnail warm-up timeout after %d/%d files",
                             completed,
                             total,
                         )
@@ -3674,7 +2899,9 @@ class SemanticImageIndex:
                             progress_callback(
                                 completed,
                                 total,
-                                f"Warming thumbnails ({log_label})…",
+                                format_index_progress(
+                                    "Preparing thumbnails", completed, total
+                                ),
                             )
                     futures = set(not_done)
                 for future in futures:
@@ -3682,63 +2909,13 @@ class SemanticImageIndex:
 
         dur = time.time() - t0
         logger.info(
-            "[INDEX] %s thumbnail warm-up done in %.2fs: %d/%d newly cached (%.0f ms/file)",
-            log_label,
+            "[INDEX] Thumbnail warm-up done in %.2fs: %d/%d newly cached (%.0f ms/file)",
             dur,
             warmed,
             len(pending),
             (dur / len(pending)) * 1000.0 if pending else 0,
         )
         return warmed
-
-    def _warm_thumbnail_cache_for_face_scan(
-        self,
-        paths: List[str],
-        progress_callback: ProgressCallback = None,
-    ) -> int:
-        """
-        Pre-extract embedded thumbnails into ImageCache so face scan avoids per-file RAW decode.
-        Face detection only needs a downscaled RGB image (~1280px); cached thumbs are enough.
-        """
-        if not paths or not self._thumbnail_warm_before_face_scan():
-            return 0
-        return self._warm_thumbnail_cache_paths(
-            paths,
-            progress_callback,
-            max_files=self._face_scan_warm_max_files(),
-            max_seconds=self._face_scan_warm_max_seconds(),
-            workers=min(4, self._face_scan_worker_count()),
-            log_label="face-scan",
-        )
-
-    def _warm_thumbnail_cache_for_aircraft(
-        self,
-        paths: List[str],
-        progress_callback: ProgressCallback = None,
-    ) -> int:
-        if not paths or not self._aircraft_warm_thumbnails_enabled():
-            return 0
-        from image_cache import get_image_cache
-
-        cache = get_image_cache()
-        pending_count = sum(1 for p in paths if cache.get_thumbnail(p) is None)
-        max_files, max_seconds = self._aircraft_warm_limits(pending_count)
-        files_label = "all" if max_files <= 0 else str(max_files)
-        secs_label = "unlimited" if max_seconds <= 0 else f"{max_seconds:.0f}s"
-        logger.info(
-            "[INDEX] aircraft-classify warm limits: pending=%d max_files=%s max_seconds=%s",
-            pending_count,
-            files_label,
-            secs_label,
-        )
-        return self._warm_thumbnail_cache_paths(
-            paths,
-            progress_callback,
-            max_files=max_files,
-            max_seconds=max_seconds,
-            workers=min(4, self._face_scan_worker_count()),
-            log_label="aircraft-classify",
-        )
 
     def _face_pending_paths(
         self, conn: sqlite3.Connection, canonical_paths: Sequence[str]
@@ -3753,8 +2930,8 @@ class SemanticImageIndex:
             chunk = unique[i : i + chunk_size]
             qs = ",".join(["?"] * len(chunk))
             cursor = conn.execute(
-                f"SELECT file_path FROM semantic_index WHERE file_path IN ({qs}) AND face_count IS NULL",
-                chunk,
+                f"SELECT file_path FROM semantic_index WHERE file_path IN ({qs}) AND face_count IS NULL AND model_name = ?",
+                [*chunk, self.model_name],
             )
             pending.extend(row[0] for row in cursor.fetchall())
         return pending
@@ -3762,7 +2939,8 @@ class SemanticImageIndex:
     def get_face_pending_count(self, file_paths: Sequence[str]) -> int:
         if not file_paths:
             return 0
-        canonical = [self._canonical_path(p) for p in file_paths if p]
+        indexable_paths, _ = self._filter_duplicate_raw_companions(file_paths)
+        canonical = [self._canonical_path(p) for p in indexable_paths if p]
         if not canonical:
             return 0
         try:
@@ -3785,10 +2963,6 @@ class SemanticImageIndex:
         """Deferred face-only pass (after semantic index is ready for search)."""
         import sqlite3
 
-        from skyspotter_features import face_scan_enabled
-
-        if not face_scan_enabled():
-            return 0
         if not file_paths:
             return 0
         canonical_map = {self._canonical_path(p): p for p in file_paths if p}
@@ -3799,6 +2973,12 @@ class SemanticImageIndex:
         try:
             face_pending = self._face_pending_paths(conn, unique_canonical)
             if face_pending:
+                if progress_callback:
+                    progress_callback(
+                        album_indexed_base,
+                        album_total or len(file_paths),
+                        format_index_progress("Face", 0, len(face_pending)),
+                    )
                 self._run_parallel_face_scan(
                     face_pending,
                     conn,
@@ -3829,8 +3009,8 @@ class SemanticImageIndex:
         if total_face <= 0:
             return
 
-        # Thumbnail warm-up is internal (logs only); avoid confusing status-bar text.
-        self._warm_thumbnail_cache_for_face_scan(face_pending, None)
+        warm_cb = None
+        self._warm_thumbnail_cache_for_face_scan(face_pending, warm_cb)
 
         workers = self._face_scan_worker_count()
         max_edge = self.face_detection_max_edge()
@@ -3858,7 +3038,7 @@ class SemanticImageIndex:
                     progress_callback(
                         progress_indexed_base,
                         progress_album_total,
-                        f"Scanning faces… {idx}/{total_face}",
+                        format_index_progress("Face", idx, total_face),
                     )
                 cp, face_count = _scan_one(cp)
                 with lock:
@@ -3904,7 +3084,7 @@ class SemanticImageIndex:
                     progress_callback(
                         progress_indexed_base,
                         progress_album_total,
-                        f"Scanning faces… {completed}/{total_face}",
+                        format_index_progress("Face", completed, total_face),
                     )
 
         if batch_writes > 0:
@@ -3920,307 +3100,129 @@ class SemanticImageIndex:
             (dur / total_face) * 1000.0 if total_face else 0,
         )
 
-    def _run_parallel_aircraft_semantic_pass(
-        self,
-        pending_for_semantic: List[tuple],
-        conn: sqlite3.Connection,
-        *,
-        progress_callback: ProgressCallback = None,
-        stop_check: Optional[Callable[[], bool]] = None,
-        progress_indexed_base: int = 0,
-        progress_album_total: int = 0,
-        commit_every: int = 40,
-    ) -> tuple[int, int]:
-        """Parallel aircraft-only semantic pass (no CLIP embeddings)."""
-        total_sem = len(pending_for_semantic)
-        if total_sem <= 0:
-            return 0, 0
+    @staticmethod
+    def _raw_companion_key(fp: str) -> str:
+        base = os.path.basename(fp)
+        parts = base.split(".")
+        if len(parts) > 1:
+            for idx, part in enumerate(parts):
+                if part.startswith("RAW-"):
+                    return ".".join(parts[:idx]).lower()
+            return ".".join(parts[:-1]).lower()
+        return base.lower()
 
-        try:
-            index_max = _classifier_index_max_size()
-        except (TypeError, ValueError):
-            index_max = 1280
-
-        if progress_callback:
-            progress_callback(
-                progress_indexed_base,
-                progress_album_total or total_sem,
-                f"Classifying aircraft… 0/{total_sem}",
-            )
-
-        paths = [cp for cp, _st in pending_for_semantic]
-        if self._aircraft_warm_thumbnails_enabled():
-            topup_cb = None
-            if not self._warm_with_metadata_enabled() and progress_callback:
-
-                def topup_cb(local_i, local_n, _msg):
-                    progress_callback(
-                        progress_indexed_base,
-                        progress_album_total or total_sem,
-                        f"Classifying aircraft… {local_i}/{local_n}",
-                    )
-
-            self._warm_thumbnail_cache_for_aircraft(paths, topup_cb)
-
-        workers = self._aircraft_classify_worker_count()
-        rembg_gpu = rembg_uses_directml()
-        logger.info(
-            "[INDEX] Aircraft classify settings: workers=%d index_max=%d min_conf=%.2f "
-            "vram=%s rembg=%s",
-            workers,
-            index_max,
-            _classifier_min_confidence(),
-            f"{gpu_vram_gib():.1f}GiB" if gpu_vram_gib() is not None else "n/a",
-            "directml" if rembg_gpu else "cpu",
-        )
-        t0 = time.time()
-        indexed = 0
-        failed = 0
-        batch_writes = 0
-        lock = threading.Lock()
-        completed = 0
-
-        def _classify_one(item: tuple) -> tuple[str, object, str, Optional[float], Optional[str]]:
-            canonical_fp, st = item
-            try:
-                clf = _thread_local_aircraft_classifier()
-                blur_score_val = None
-                detected_aircraft = ""
-                _src, _rgba, subject_crop = clf.prepare_subject_pipeline(
-                    canonical_fp, index_max, progress_callback=None
-                )
-                try:
-                    from blur_score import blur_score_enabled, compute_blur_score_for_index
-
-                    if blur_score_enabled() and _src is not None and _rgba is not None:
-                        blur_score_val, _blur_region = compute_blur_score_for_index(
-                            canonical_fp,
-                            _src,
-                            rgba_for_bbox=_rgba,
-                        )
-                except Exception:
-                    pass
-                if subject_crop is not None:
-                    detected_aircraft = clf.classify_from_subject_crop(
-                        subject_crop,
-                        canonical_fp,
-                        progress_callback=None,
-                    )
-                return canonical_fp, st, detected_aircraft, blur_score_val, None
-            except Exception as exc:
-                return canonical_fp, st, "", None, str(exc)
-
-        def _store_result(result: tuple) -> None:
-            nonlocal indexed, failed, batch_writes
-            canonical_fp, st, detected_aircraft, blur_score_val, err = result
-            if err:
-                failed += 1
-                logger.error(
-                    "[AVIATION AI] Classification failed for %s: %s",
-                    os.path.basename(canonical_fp),
-                    err,
-                )
-                try:
-                    self._mark_semantic_skipped(canonical_fp, st, conn)
-                    self._store_face_count(canonical_fp, 0, conn=conn, commit=False)
-                    batch_writes += 1
-                except Exception as mark_exc:
-                    logger.debug(
-                        "[INDEX] Could not mark skipped for %s: %s",
-                        os.path.basename(canonical_fp),
-                        mark_exc,
-                    )
-                return
-            conn.execute(
-                """
-                UPDATE semantic_index
-                SET dim = ?, embedding = ?, semantic_ready = 1,
-                    detected_aircraft = ?, blur_score = ?, updated_at = ?
-                WHERE file_path = ? AND model_name = ? AND file_size = ? AND mtime_ns = ?
-                """,
-                (
-                    0,
-                    self._to_blob(np.zeros(0, dtype=np.float32)),
-                    detected_aircraft,
-                    blur_score_val,
-                    float(time.time()),
-                    canonical_fp,
-                    self.model_name,
-                    int(st.st_size),
-                    self._mtime_ns_from_stat(st),
-                ),
-            )
-            indexed += 1
-            batch_writes += 1
-
-        if not self._aircraft_classify_parallel_enabled() or total_sem < 4 or workers <= 1:
-            for i, item in enumerate(pending_for_semantic, start=1):
-                if stop_check and stop_check():
-                    break
-                if progress_callback and (i <= 2 or i >= total_sem or i % 12 == 0):
-                    progress_callback(
-                        progress_indexed_base + i,
-                        progress_album_total,
-                        f"Classifying aircraft… {i}/{total_sem}",
-                    )
-                with lock:
-                    _store_result(_classify_one(item))
-                    if batch_writes >= commit_every:
-                        conn.commit()
-                        batch_writes = 0
-        else:
-            logger.info(
-                "[INDEX] Parallel aircraft classify: %d files, %d workers",
-                total_sem,
-                workers,
-            )
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {
-                    executor.submit(_classify_one, item): item
-                    for item in pending_for_semantic
-                }
-                for future in concurrent.futures.as_completed(futures):
-                    if stop_check and stop_check():
-                        break
-                    completed += 1
-                    if progress_callback and (
-                        completed <= 2 or completed >= total_sem or completed % 12 == 0
-                    ):
-                        progress_callback(
-                            progress_indexed_base + completed,
-                            progress_album_total,
-                            f"Classifying aircraft… {completed}/{total_sem}",
-                        )
-                    with lock:
-                        _store_result(future.result())
-                        if batch_writes >= commit_every:
-                            conn.commit()
-                            batch_writes = 0
-
-        if batch_writes:
-            with lock:
-                conn.commit()
-
-        dur = time.time() - t0
-        logger.info(
-            "[INDEX] Aircraft classify pass done in %.2fs (%d indexed, %d failed, %.0f ms/img)",
-            dur,
-            indexed,
-            failed,
-            (dur / total_sem) * 1000.0 if total_sem else 0,
-        )
-        return indexed, failed
-
-    def build_index(
-        self,
-        file_paths: Sequence[str],
-        progress_callback: ProgressCallback = None,
-        stop_check: Optional[Callable[[], bool]] = None,
-        *,
-        album_total: Optional[int] = None,
-        album_indexed_base: int = 0,
-        run_face_scan: Optional[bool] = None,
-        **_kwargs,
-    ) -> Dict[str, int]:
-        import sqlite3
-
-        t_start = time.time()
-        logger.info("[INDEX] Starting indexing of %d file paths.", len(file_paths))
-        if sys.platform != "darwin":
-            logger.info("[VISION] Using OpenCV offline face scanner for Windows.")
-
+    @classmethod
+    def _filter_duplicate_raw_companions(
+        cls, file_paths: Sequence[str]
+    ) -> tuple[List[str], List[str]]:
+        """Return (indexable paths, skipped RAW paths with a non-raw companion)."""
         filtered_paths: List[str] = []
-        skipped_companions = 0
-
-        def get_companion_key(fp: str) -> str:
-            base = os.path.basename(fp)
-            parts = base.split(".")
-            if len(parts) > 1:
-                for idx, part in enumerate(parts):
-                    if part.startswith("RAW-"):
-                        return ".".join(parts[:idx]).lower()
-                return ".".join(parts[:-1]).lower()
-            return base.lower()
-
-        non_raw_keys = set()
+        skipped_raw: List[str] = []
+        non_raw_keys: set = set()
         for fp in file_paths:
             if not fp:
                 continue
             ext = os.path.splitext(fp)[1].lower().lstrip(".")
             if ext and ext not in RAW_FILE_EXTENSIONS:
-                non_raw_keys.add((os.path.dirname(fp), get_companion_key(fp)))
-
+                non_raw_keys.add((os.path.dirname(fp), cls._raw_companion_key(fp)))
         for fp in file_paths:
             if not fp:
                 continue
             ext = os.path.splitext(fp)[1].lower().lstrip(".")
             if ext in RAW_FILE_EXTENSIONS:
-                dirname = os.path.dirname(fp)
-                if (dirname, get_companion_key(fp)) in non_raw_keys:
-                    skipped_companions += 1
-                    logger.info(
-                        "[INDEX] Skipping RAW companion file to avoid duplicate results: %s",
-                        os.path.basename(fp),
-                    )
+                if (os.path.dirname(fp), cls._raw_companion_key(fp)) in non_raw_keys:
+                    skipped_raw.append(fp)
                     continue
             filtered_paths.append(fp)
+        return filtered_paths, skipped_raw
 
+    def build_index(
+        self,
+        file_paths: Sequence[str],
+        progress_callback: ProgressCallback = None,
+        *,
+        album_total: int = 0,
+        album_indexed_base: int = 0,
+        run_face_scan: Optional[bool] = None,
+        run_semantic_embeddings: Optional[bool] = None,
+    ) -> Dict[str, int]:
+        import logging
+        import sys
+        import sqlite3
+        logger = logging.getLogger(__name__)
+        t_start = time.time()
+        log_inference_acceleration_profile()
+        if run_semantic_embeddings is None:
+            run_semantic_embeddings = semantic_embeddings_enabled()
+        logger.info(f"[INDEX] Starting indexing of {len(file_paths)} file paths.")
+        if sys.platform != "darwin":
+            logger.info("[VISION] Using OpenCV offline face scanner on Windows.")
+
+        filtered_paths, skipped_raw_paths = self._filter_duplicate_raw_companions(file_paths)
+        skipped_companions = len(skipped_raw_paths)
+        for fp in skipped_raw_paths:
+            logger.info(
+                "[INDEX] Skipping RAW companion file to avoid duplicate results: %s",
+                os.path.basename(fp),
+            )
         logger.info(
             "[INDEX] Filtered out %d RAW companion files. Actual files to evaluate: %d",
             skipped_companions,
             len(filtered_paths),
         )
-
+            
         total = len(file_paths)
         indexed = 0
         skipped = skipped_companions
         failed = 0
         pending_for_semantic: List[tuple[str, os.stat_result]] = []
-        progress_album_total = album_total if album_total and album_total > 0 else total
+        progress_album_total = album_total if album_total > 0 else total
         progress_indexed_base = max(0, album_indexed_base)
-
+        
+        # Create a thread-local, dedicated connection for this background worker thread!
         conn = sqlite3.connect(self.db_path, timeout=60.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=60000")
 
+        if skipped_raw_paths:
+            for fp in skipped_raw_paths:
+                try:
+                    cp = self._canonical_path(fp)
+                    st = os.stat(cp)
+                    self._mark_semantic_skipped(cp, st, conn)
+                except OSError:
+                    pass
+            conn.commit()
+
         total_face = 0
         run_face_inline = False
         try:
-            existing_meta: Dict[str, dict] = {}
+            # 1.1 Pre-fetch existing metadata in bulk to avoid thousands of small SQL queries
+            existing_meta = {} # {canonical_path: (mtime, size, semantic_ready)}
             canonical_map = {self._canonical_path(fp): fp for fp in filtered_paths if fp}
             unique_canonical = list(canonical_map.keys())
-
-            logger.info(
-                "[INDEX] Pre-fetching existing metadata database entries for %d canonical paths...",
-                len(unique_canonical),
-            )
+            
+            logger.info(f"[INDEX] Pre-fetching existing metadata database entries for {len(unique_canonical)} canonical paths...")
             t0 = time.time()
             chunk_size = 900
             for i in range(0, len(unique_canonical), chunk_size):
-                if stop_check and stop_check():
-                    break
-                chunk = unique_canonical[i : i + chunk_size]
+                chunk = unique_canonical[i:i+chunk_size]
                 qs = ",".join(["?"] * len(chunk))
-                conn.row_factory = sqlite3.Row
                 cursor = conn.execute(
-                    f"SELECT * FROM semantic_index WHERE file_path IN ({qs})",
-                    chunk,
+                    f"SELECT file_path, file_mtime, file_size, semantic_ready, dim, gps_lat, city FROM semantic_index WHERE file_path IN ({qs})",
+                    chunk
                 )
                 for row in cursor.fetchall():
-                    existing_meta[row["file_path"]] = {
-                        "mtime": row["file_mtime"],
-                        "size": row["file_size"],
-                        "semantic_ready": row["semantic_ready"],
-                        "gps_lat": row["gps_lat"],
-                        "city": row["city"],
-                        "detected_aircraft": self._row_value(row, "detected_aircraft", ""),
+                    existing_meta[row[0]] = {
+                        "mtime": row[1],
+                        "size": row[2],
+                        "semantic_ready": row[3],
+                        "dim": row[4],
+                        "gps_lat": row[5],
+                        "city": row[6]
                     }
-            logger.info(
-                "[INDEX] Pre-fetch completed in %.4fs. Found %d matches in database.",
-                time.time() - t0,
-                len(existing_meta),
-            )
+            logger.info(f"[INDEX] Pre-fetch completed in {time.time() - t0:.4f}s. Found {len(existing_meta)} matches in database.")
 
             def needs_reindex_local(cp, st):
                 if cp not in existing_meta:
@@ -4230,14 +3232,13 @@ class SemanticImageIndex:
                     return True
                 if int(row["size"]) != int(st.st_size):
                     return True
-                if row["gps_lat"] is not None and not str(row["city"] or "").strip():
-                    return True
+                
                 return False
 
+            # 1.2 Identify files that actually need metadata extraction
             to_extract = []
             for fp in filtered_paths:
-                if not fp:
-                    continue
+                if not fp: continue
                 canonical_fp = self._canonical_path(fp)
                 try:
                     st = os.stat(canonical_fp)
@@ -4245,10 +3246,12 @@ class SemanticImageIndex:
                         to_extract.append((canonical_fp, st))
                     else:
                         row = existing_meta[canonical_fp]
-                        if not row["semantic_ready"] or (
-                            self.model_name.startswith("aviation-")
-                            and not str(row.get("detected_aircraft") or "").strip()
-                        ):
+                        sr = int(row["semantic_ready"] or 0)
+                        dim = int(self._row_value(row, "dim", 0) or 0)
+                        needs_semantic = (sr == 0) or (
+                            bool(run_semantic_embeddings) and sr == 1 and dim == 0
+                        )
+                        if needs_semantic:
                             pending_for_semantic.append((canonical_fp, st))
                         else:
                             skipped += 1
@@ -4256,87 +3259,93 @@ class SemanticImageIndex:
                     failed += 1
                     continue
 
-            logger.info(
-                "[INDEX] Needs metadata extraction: %d files. Already indexed & skipped: %d files.",
-                len(to_extract),
-                skipped,
-            )
+            logger.info(f"[INDEX] Needs metadata extraction: {len(to_extract)} files. Already indexed & skipped: {skipped} files.")
 
+            # 1.3 Parallel extraction of metadata
             total_extract = len(to_extract)
             batch_writes = 0
             commit_every = 40
-
+            
             if total_extract > 0:
-                warm_inline = (
-                    self._aircraft_warm_thumbnails_enabled()
-                    and self._warm_with_metadata_enabled()
-                )
-                logger.info(
-                    "[INDEX] Starting parallel metadata extraction for %d files%s...",
-                    total_extract,
-                    " (+ thumbnail warm)" if warm_inline else "",
-                )
+                logger.info(f"[INDEX] Starting parallel metadata extraction for {total_extract} files using ThreadPoolExecutor...")
+                if progress_callback:
+                    progress_callback(
+                        progress_indexed_base,
+                        progress_album_total,
+                        format_index_progress("Metadata", 0, total_extract),
+                    )
                 t_meta_start = time.time()
-                max_workers = min(8, os.cpu_count() or 4)
+                from common_image_loader import index_metadata_worker_count
+
+                max_workers = index_metadata_worker_count(total_extract)
+                logger.info(
+                    "[INDEX] Metadata workers=%d for %d files",
+                    max_workers,
+                    total_extract,
+                )
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                     def extract_task(item):
+                        self._wait_if_paused()
                         cp, st = item
                         try:
-                            if warm_inline:
-                                self._warm_thumbnail_one(cp)
-                            meta = self._extract_exif_brief(cp, include_face=False)
+                            t_single_start = time.time()
+                            meta = self._extract_exif_brief(
+                                cp, include_face=False, file_stat=st
+                            )
+                            t_single_dur = time.time() - t_single_start
+                            if t_single_dur > 2.0:
+                                logger.warning(
+                                    "[INDEX] Slow metadata extraction for %s: %.3fs "
+                                    "(often EXIF cache lock vs folder sort refinement)",
+                                    os.path.basename(cp),
+                                    t_single_dur,
+                                )
                             return cp, st, meta
-                        except Exception:
+                        except Exception as e:
+                            logger.error(f"[INDEX] Failed to extract EXIF for {os.path.basename(cp)}: {e}")
                             return cp, st, None
 
                     futures = [executor.submit(extract_task, item) for item in to_extract]
+                    
                     for i, future in enumerate(concurrent.futures.as_completed(futures), start=1):
-                        if stop_check and stop_check():
-                            executor.shutdown(wait=False, cancel_futures=True)
-                            break
                         cp, st, meta = future.result()
                         if meta:
                             try:
                                 self._upsert_metadata(cp, st, meta, conn=conn)
                                 pending_for_semantic.append((cp, st))
                                 batch_writes += 1
+                                # Do not increment 'indexed' here; it will be incremented in Phase 2
+                                # when the semantic embedding is actually ready.
+                                
                                 if batch_writes >= commit_every:
                                     conn.commit()
                                     batch_writes = 0
                             except Exception as e:
-                                logger.error(
-                                    "[INDEX] Database upsert failed for %s: %s",
-                                    os.path.basename(cp),
-                                    e,
-                                )
+                                logger.error(f"[INDEX] Database upsert failed for {os.path.basename(cp)}: {e}")
                                 failed += 1
                         else:
                             failed += 1
-
-                        if progress_callback and (
-                            i <= 2 or i >= total_extract or i % 10 == 0
-                        ):
+                        
+                        if progress_callback and (i <= 2 or i >= total_extract or i % 10 == 0):
                             progress_callback(
                                 progress_indexed_base,
                                 progress_album_total,
-                                f"Scanning metadata… {i}/{total_extract}",
+                                format_index_progress(
+                                    "Metadata", i, total_extract
+                                ),
                             )
 
                 if batch_writes > 0:
                     conn.commit()
                     batch_writes = 0
-                logger.info(
-                    "[INDEX] Completed metadata extraction for %d files in %.4fs.",
-                    total_extract,
-                    time.time() - t_meta_start,
-                )
+                logger.info(f"[INDEX] Completed metadata extraction for {total_extract} files in {time.time() - t_meta_start:.4f}s.")
 
             face_pending = self._face_pending_paths(conn, unique_canonical)
             total_face = len(face_pending)
             total_sem = len(pending_for_semantic)
             if run_face_scan is None:
                 run_face_scan = not self._defer_face_scan_during_build()
-            run_face_inline = total_face > 0 and bool(run_face_scan)
+            run_face_inline = total_face > 0 and run_face_scan
 
             if total_face > 0 and not run_face_inline:
                 logger.info(
@@ -4344,192 +3353,256 @@ class SemanticImageIndex:
                     total_face,
                 )
 
-            use_embeddings = semantic_embeddings_enabled() and self.semantic_backend_available()
-            aircraft_only = (
-                self.model_name.startswith("aviation-") and not use_embeddings
-            )
+            # Phase 2: semantic embeddings (search-critical). Run before face scan.
             if total_sem > 0:
-                if not use_embeddings and not self.model_name.startswith("aviation-"):
-                    skipped += total_sem
-                elif aircraft_only:
-                    logger.info(
-                        "[INDEX] Starting aircraft classification for %d files...",
-                        total_sem,
-                    )
-                    t_sem_start = time.time()
-                    sem_indexed, sem_failed = self._run_parallel_aircraft_semantic_pass(
-                        pending_for_semantic,
-                        conn,
-                        progress_callback=progress_callback,
-                        stop_check=stop_check,
-                        progress_indexed_base=progress_indexed_base,
-                        progress_album_total=progress_album_total,
-                        commit_every=commit_every,
-                    )
-                    indexed += sem_indexed
-                    failed += sem_failed
-                    logger.info(
-                        "[INDEX] Completed aircraft classification in %.4fs.",
-                        time.time() - t_sem_start,
-                    )
-                else:
-                    logger.info(
-                        "[INDEX] Starting AI features pass for %d files...",
-                        total_sem,
-                    )
-                    t_sem_start = time.time()
-                    for i, (canonical_fp, st) in enumerate(pending_for_semantic, start=1):
-                        if stop_check and stop_check():
-                            break
-                        if use_embeddings:
-                            time.sleep(0.15)
-                        if progress_callback and (
-                            i <= 2 or i >= total_sem or (i % 12 == 0)
-                        ):
-                            msg = (
-                                "Processing AI features…"
-                                if use_embeddings
-                                else "Classifying aircraft…"
-                            )
-                            progress_callback(
-                                progress_indexed_base + i,
-                                progress_album_total,
-                                msg,
-                            )
-                        try:
-                            blur_score_val = None
-                            detected_aircraft = ""
-                            if self.model_name.startswith("aviation-"):
+                self._wait_if_paused()
+                if run_semantic_embeddings:
+                    logger.info(f"[INDEX] Starting AI features neural pass (MobileCLIP) for {total_sem} files...")
+                    if progress_callback:
+                        progress_callback(
+                            progress_indexed_base,
+                            progress_album_total,
+                            format_index_progress("Semantic", 0, total_sem),
+                        )
+                    sem_gpu_accel = False
+                    sem_accel_detail = "unknown"
+                    try:
+                        if self.model_name.startswith("mobileclip-"):
+                            backend = self._mobileclip_backend or resolve_mobileclip_backend()
+                            self._mobileclip_backend = backend
+                            if isinstance(backend, MobileCLIPONNXBackend):
                                 try:
-                                    if (
-                                        not hasattr(self, "_aviation_classifier")
-                                        or self._aviation_classifier is None
-                                    ):
-                                        self._aviation_classifier = MilitaryAircraftClassifier()
-                                    try:
-                                        index_max = _classifier_index_max_size()
-                                    except (TypeError, ValueError):
-                                        index_max = 1280
-                                    prog = (
-                                        lambda m, _i=i, _t=total_sem: progress_callback(
-                                            progress_indexed_base + _i,
-                                            progress_album_total,
-                                            m,
-                                        )
-                                        if progress_callback
-                                        else None
-                                    )
-                                    _src, _rgba, subject_crop = (
-                                        self._aviation_classifier.prepare_subject_pipeline(
-                                            canonical_fp, index_max, progress_callback=prog
-                                        )
-                                    )
-                                    try:
-                                        from blur_score import (
-                                            blur_score_enabled,
-                                            compute_blur_score_for_index,
-                                        )
+                                    import onnxruntime as ort
 
-                                        if (
-                                            blur_score_enabled()
-                                            and _src is not None
-                                            and _rgba is not None
-                                        ):
-                                            blur_score_val, _blur_region = (
-                                                compute_blur_score_for_index(
-                                                    canonical_fp,
-                                                    _src,
-                                                    rgba_for_bbox=_rgba,
-                                                )
-                                            )
-                                    except Exception as blur_exc:
-                                        logger.debug(
-                                            "[BLUR] Laplacian score failed for %s: %s",
-                                            os.path.basename(canonical_fp),
-                                            blur_exc,
-                                        )
-                                    if subject_crop is not None:
-                                        detected_aircraft = (
-                                            self._aviation_classifier.classify_from_subject_crop(
-                                                subject_crop,
-                                                canonical_fp,
-                                                progress_callback=prog,
-                                            )
-                                        )
-                                except Exception as e:
-                                    logger.error(
-                                        "[AVIATION AI] Classification failed for %s: %s",
-                                        os.path.basename(canonical_fp),
-                                        e,
+                                    selected = resolve_onnx_execution_providers(
+                                        list(ort.get_available_providers())
                                     )
-
-                            if use_embeddings:
-                                vec = self._encode_image(canonical_fp)
-                                dim = int(vec.size)
-                                blob = self._to_blob(vec)
-                            else:
-                                dim = 0
-                                blob = self._to_blob(np.zeros(0, dtype=np.float32))
-
-                            conn.execute(
-                                """
-                                UPDATE semantic_index
-                                SET dim = ?, embedding = ?, semantic_ready = 1,
-                                    detected_aircraft = ?, blur_score = ?, updated_at = ?
-                                WHERE file_path = ? AND model_name = ? AND file_size = ? AND mtime_ns = ?
-                                """,
-                                (
-                                    dim,
-                                    blob,
-                                    detected_aircraft,
-                                    blur_score_val,
-                                    float(time.time()),
-                                    canonical_fp,
-                                    self.model_name,
-                                    int(st.st_size),
-                                    self._mtime_ns_from_stat(st),
-                                ),
-                            )
-                            indexed += 1
-                            batch_writes += 1
-                            if batch_writes >= commit_every:
-                                conn.commit()
-                                batch_writes = 0
-                        except Exception as e:
-                            logger.warning(
-                                "[INDEX] Skipping semantic pass for %s: %s",
-                                os.path.basename(canonical_fp),
-                                e,
-                            )
-                            failed += 1
-                            try:
-                                self._mark_semantic_skipped(canonical_fp, st, conn)
-                                self._store_face_count(
-                                    canonical_fp, 0, conn=conn, commit=False
+                                except Exception:
+                                    selected = ["CPUExecutionProvider"]
+                                sem_gpu_accel = any(
+                                    str(p) != "CPUExecutionProvider" for p in selected
                                 )
+                                sem_accel_detail = f"ONNX providers=[{', '.join(selected)}]"
+                            elif isinstance(backend, MobileCLIPCoreMLBackend):
+                                cu = os.environ.get(
+                                    "RAWVIEWER_COREML_COMPUTE_UNITS", "all"
+                                ).strip().lower()
+                                sem_gpu_accel = cu not in ("cpu", "cpuonly")
+                                sem_accel_detail = f"CoreML compute_units={cu}"
+                            else:
+                                sem_accel_detail = backend.__class__.__name__
+                        else:
+                            sem_accel_detail = f"model={self.model_name}"
+                    except Exception as accel_exc:
+                        sem_accel_detail = f"unavailable ({accel_exc})"
+                    logger.info(
+                        "[INDEX][ACCEL] Semantic acceleration: gpu=%s (%s)",
+                        "ON" if sem_gpu_accel else "OFF",
+                        sem_accel_detail,
+                    )
+                    try:
+                        if self.model_name.startswith("mobileclip-"):
+                            backend = self._mobileclip_backend or resolve_mobileclip_backend()
+                            self._mobileclip_backend = backend
+                            if isinstance(backend, MobileCLIPONNXBackend):
+                                backend._ensure_sessions()
+                                img_providers = backend._image_session.get_providers()
+                                txt_providers = backend._text_session.get_providers()
+                                logger.info(
+                                    "[INDEX][ACCEL] ONNX active session providers: image=%s text=%s",
+                                    img_providers,
+                                    txt_providers,
+                                )
+                    except Exception as provider_exc:
+                        logger.debug(
+                            "[INDEX][ACCEL] Could not read active ONNX session providers: %s",
+                            provider_exc,
+                        )
+                    throttle_sec = semantic_gpu_throttle_seconds()
+                    batch_size = self._auto_select_semantic_batch_size(
+                        pending_for_semantic,
+                        sem_accel_detail,
+                    )
+                    logger.info(
+                        "[INDEX][SPEED] Semantic batch size: %d",
+                        batch_size,
+                    )
+                    if throttle_sec > 0:
+                        logger.info(
+                            "[INDEX][SPEED] Semantic throttle enabled: %.0f ms/image",
+                            throttle_sec * 1000.0,
+                        )
+                    t_sem_start = time.time()
+                    sem_success = 0
+                    sem_fail = 0
+                    i = 0
+                    for batch_start in range(0, total_sem, batch_size):
+                        self._wait_if_paused()
+                        batch_items = pending_for_semantic[batch_start : batch_start + batch_size]
+                        batch_paths = [cp for cp, _ in batch_items]
+                        try:
+                            t_batch_neural = time.time()
+                            vecs = self._encode_images_best_effort(batch_paths)
+                            t_batch_dur = time.time() - t_batch_neural
+                            if t_batch_dur > 0.5:
+                                logger.info(
+                                    "[INDEX] MobileCLIP encoding batch=%d took %.4fs",
+                                    len(batch_items),
+                                    t_batch_dur,
+                                )
+                            for (canonical_fp, st), vec in zip(batch_items, vecs):
+                                i += 1
+                                conn.execute(
+                                    """
+                                    UPDATE semantic_index
+                                    SET dim = ?, embedding = ?, semantic_ready = 1, updated_at = ?
+                                    WHERE file_path = ? AND model_name = ? AND file_size = ? AND mtime_ns = ?
+                                    """,
+                                    (
+                                        int(vec.size),
+                                        self._to_blob(vec),
+                                        float(time.time()),
+                                        canonical_fp,
+                                        self.model_name,
+                                        int(st.st_size),
+                                        self._mtime_ns_from_stat(st),
+                                    ),
+                                )
+                                indexed += 1
+                                sem_success += 1
                                 batch_writes += 1
+                                if progress_callback and (
+                                    i <= 2 or i >= total_sem or (i % 5 == 0)
+                                ):
+                                    progress_callback(
+                                        progress_indexed_base + i,
+                                        progress_album_total,
+                                        format_index_progress("Semantic", i, total_sem),
+                                    )
                                 if batch_writes >= commit_every:
                                     conn.commit()
                                     batch_writes = 0
-                            except Exception as mark_exc:
-                                logger.debug(
-                                    "[INDEX] Could not mark skipped for %s: %s",
-                                    os.path.basename(canonical_fp),
-                                    mark_exc,
-                                )
+                                if throttle_sec > 0:
+                                    time.sleep(throttle_sec)
+                        except Exception as batch_exc:
+                            logger.warning(
+                                "[INDEX] Batch semantic encode failed (size=%d): %s. Falling back to per-image.",
+                                len(batch_items),
+                                batch_exc,
+                            )
+                            for canonical_fp, st in batch_items:
+                                i += 1
+                                try:
+                                    t_single_neural = time.time()
+                                    vec = self._encode_image(canonical_fp)
+                                    t_neural_dur = time.time() - t_single_neural
+                                    if t_neural_dur > 0.5:
+                                        logger.info(
+                                            f"[INDEX] MobileCLIP encoding for {os.path.basename(canonical_fp)} took {t_neural_dur:.4f}s"
+                                        )
+                                    conn.execute(
+                                        """
+                                        UPDATE semantic_index
+                                        SET dim = ?, embedding = ?, semantic_ready = 1, updated_at = ?
+                                        WHERE file_path = ? AND model_name = ? AND file_size = ? AND mtime_ns = ?
+                                        """,
+                                        (
+                                            int(vec.size),
+                                            self._to_blob(vec),
+                                            float(time.time()),
+                                            canonical_fp,
+                                            self.model_name,
+                                            int(st.st_size),
+                                            self._mtime_ns_from_stat(st),
+                                        ),
+                                    )
+                                    indexed += 1
+                                    sem_success += 1
+                                    batch_writes += 1
+                                    if batch_writes >= commit_every:
+                                        conn.commit()
+                                        batch_writes = 0
+                                except Exception as e:
+                                    logger.warning(
+                                        "[INDEX] Skipping semantic embedding for %s: %s",
+                                        os.path.basename(canonical_fp),
+                                        e,
+                                    )
+                                    failed += 1
+                                    sem_fail += 1
+                                    try:
+                                        self._mark_semantic_skipped(canonical_fp, st, conn)
+                                        self._store_face_count(
+                                            canonical_fp, 0, conn=conn, commit=False
+                                        )
+                                        batch_writes += 1
+                                        if batch_writes >= commit_every:
+                                            conn.commit()
+                                            batch_writes = 0
+                                    except Exception as mark_exc:
+                                        logger.debug(
+                                            "[INDEX] Could not mark skipped for %s: %s",
+                                            os.path.basename(canonical_fp),
+                                            mark_exc,
+                                        )
+                                if progress_callback and (
+                                    i <= 2 or i >= total_sem or (i % 5 == 0)
+                                ):
+                                    progress_callback(
+                                        progress_indexed_base + i,
+                                        progress_album_total,
+                                        format_index_progress("Semantic", i, total_sem),
+                                    )
+                                if throttle_sec > 0:
+                                    time.sleep(throttle_sec)
+
+                        if i % 25 == 0 or i == total_sem:
+                            elapsed_so_far = max(1e-9, time.time() - t_sem_start)
+                            throughput_so_far = float(i) / elapsed_so_far
+                            logger.info(
+                                "[INDEX][SPEED] Semantic progress: %d/%d in %.3fs (%.2f img/s)",
+                                i,
+                                total_sem,
+                                elapsed_so_far,
+                                throughput_so_far,
+                            )
                     if batch_writes:
                         conn.commit()
+                        batch_writes = 0
+                    sem_elapsed = max(1e-9, time.time() - t_sem_start)
+                    sem_avg = sem_elapsed / max(1, total_sem)
+                    sem_throughput = float(total_sem) / sem_elapsed
+                    logger.info(f"[INDEX] Completed AI neural pass in {sem_elapsed:.4f}s.")
                     logger.info(
-                        "[INDEX] Completed AI features pass in %.4fs.",
-                        time.time() - t_sem_start,
+                        "[INDEX][SPEED] Semantic pass stats: total=%d success=%d failed=%d elapsed=%.3fs avg=%.4fs/img throughput=%.2f img/s",
+                        total_sem,
+                        sem_success,
+                        sem_fail,
+                        sem_elapsed,
+                        sem_avg,
+                        sem_throughput,
                     )
+                else:
+                    logger.info(f"[INDEX] Skipping AI features neural pass (MobileCLIP) for {total_sem} files (metadata-only index).")
+                    for canonical_fp, st in pending_for_semantic:
+                        self._wait_if_paused()
+                        self._mark_metadata_ready_without_embedding(canonical_fp, st, conn)
+                        indexed += 1
+                    conn.commit()
 
+            # Phase 3: face scan (optional; skipped when deferred to a follow-up worker).
             if run_face_inline:
                 logger.info(
                     "[INDEX] Face scanning %d files (semantic pending was %d)",
                     total_face,
                     total_sem,
                 )
+                if progress_callback:
+                    progress_callback(
+                        progress_indexed_base,
+                        progress_album_total,
+                        format_index_progress("Face", 0, total_face),
+                    )
                 self._run_parallel_face_scan(
                     face_pending,
                     conn,
@@ -4541,19 +3614,9 @@ class SemanticImageIndex:
                 )
         finally:
             conn.close()
-
-        if stop_check and stop_check():
-            logger.warning("[SYSTEM] Semantic indexing cancelled by user/folder switch")
-
+            
         duration = time.time() - t_start
-        logger.info(
-            "[INDEX] Finished indexing process in %.4fs. Results -> indexed: %d, skipped: %d, failed: %d, total: %d",
-            duration,
-            indexed,
-            skipped,
-            failed,
-            total,
-        )
+        logger.info(f"[INDEX] Finished indexing process in {duration:.4f}s. Results -> indexed: {indexed}, skipped: {skipped}, failed: {failed}, total: {total}")
         faces_deferred = total_face > 0 and not run_face_inline
         return {
             "indexed": indexed,
@@ -4564,10 +3627,6 @@ class SemanticImageIndex:
             "faces_pending": total_face if faces_deferred else 0,
         }
 
-    def cancel_index_build(self):
-        """No longer used; cancellation is handled via stop_check callback."""
-        pass
-
     def get_index_coverage(self, file_paths: Sequence[str]) -> Dict[str, int]:
         """
         Return index coverage for the given file set.
@@ -4576,8 +3635,9 @@ class SemanticImageIndex:
         if not file_paths:
             return {"total": 0, "indexed": 0, "missing": 0, "ready": 1}
 
-        total = len(file_paths)
-        canonical_paths = [self._canonical_path(p) for p in file_paths if p]
+        indexable_paths, _ = self._filter_duplicate_raw_companions(file_paths)
+        total = len(indexable_paths)
+        canonical_paths = [self._canonical_path(p) for p in indexable_paths if p]
         
         # Bulk lookup in database
         placeholders = ",".join(["?"] * len(canonical_paths))
@@ -4614,149 +3674,95 @@ class SemanticImageIndex:
         if not file_paths:
             return []
 
-        canonical_map = {self._canonical_path(p): p for p in file_paths if p}
+        import time
+        t0 = time.time()
+
+        indexable_paths, _ = self._filter_duplicate_raw_companions(file_paths)
+        if not indexable_paths:
+            return []
+
+        # Bulk fetch rows in one (or a few) database queries!
+        rows = self._fetch_rows_for_paths(indexable_paths)
+        
+        # Build map of canonical path to row
+        row_map = {}
+        for r in rows:
+            fp = r['file_path']
+            row_map[self._canonical_path(fp)] = r
+
         pending: List[str] = []
-        is_aviation = (
-            self.model_name.startswith("aviation-")
-            or os.environ.get("SkySpotter_AVIATION_MODE") == "1"
-        )
+        
+        canonical_map = {self._canonical_path(p): p for p in indexable_paths if p}
         for cp, original in canonical_map.items():
             try:
                 st = os.stat(cp)
             except OSError:
                 pending.append(original)
                 continue
-            if self._needs_reindex(cp, st):
+
+            row = row_map.get(cp)
+            sr = int(self._row_value(row, 'semantic_ready', 0) or 0) if row else 0
+            dim = int(self._row_value(row, 'dim', 0) or 0) if row else 0
+            if (not row) or sr == 0 or (sr == 1 and dim == 0):
                 pending.append(original)
                 continue
-            if is_aviation:
-                rows = self._lookup_index_rows(cp, st)
-                has_aircraft = any(
-                    self._row_semantic_ready(row)
-                    and str(self._row_value(row, "detected_aircraft", "") or "").strip()
-                    for row in rows
-                )
-                if not has_aircraft:
+
+            # Check if file changed on disk (mtime or size mismatch)
+            row_size = self._row_value(row, 'file_size', None)
+            if row_size is None or int(row_size) != int(st.st_size):
+                pending.append(original)
+                continue
+
+            row_mtime_ns = self._row_value(row, 'mtime_ns', None)
+            if row_mtime_ns is not None:
+                try:
+                    if int(row_mtime_ns) != self._mtime_ns_from_stat(st):
+                        pending.append(original)
+                        continue
+                except Exception:
+                    pass
+            else:
+                row_mtime = self._row_value(row, 'file_mtime', None)
+                if row_mtime is None or not self._mtime_matches(float(row_mtime), st):
                     pending.append(original)
+                    continue
+
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(
+            "[INDEX] Pending scan: %d pending of %d paths in %.4fs (bulk)",
+            len(pending),
+            len(file_paths),
+            time.time() - t0
+        )
         return pending
 
-    def get_layout_metadata_for_paths(self, file_paths: Sequence[str]) -> Dict[str, Dict[str, int]]:
+    def get_pending_embedding_paths(self, file_paths: Sequence[str]) -> List[str]:
         """
-        Return lightweight width/height/orientation metadata for gallery pre-layout.
-
-        This is intentionally fast and read-only, so gallery view can seed aspect ratios
-        without blocking on EXIF extraction.
+        Return paths that have metadata in database but are missing semantic embeddings (dim = 0).
         """
         if not file_paths:
-            return {}
+            return []
+        
+        indexable_paths, _ = self._filter_duplicate_raw_companions(file_paths)
+        if not indexable_paths:
+            return []
 
-        canonical_to_original: Dict[str, str] = {}
-        canonical_paths: List[str] = []
-        for p in file_paths:
-            if not p:
-                continue
-            cp = self._canonical_path(p)
-            if cp in canonical_to_original:
-                continue
-            canonical_to_original[cp] = p
-            canonical_paths.append(cp)
+        rows = self._fetch_rows_for_paths(indexable_paths)
+        row_map = {}
+        for r in rows:
+            fp = r['file_path']
+            row_map[self._canonical_path(fp)] = r
 
-        out: Dict[str, Dict[str, int]] = {}
-        if not canonical_paths:
-            return out
+        pending: List[str] = []
+        canonical_map = {self._canonical_path(p): p for p in indexable_paths if p}
+        for cp, original in canonical_map.items():
+            row = row_map.get(cp)
+            if row and int(self._row_value(row, 'semantic_ready', 0) or 0) == 1 and int(self._row_value(row, 'dim', 0) or 0) == 0:
+                pending.append(original)
+                
+        return pending
 
-        batch_size = 900
-        for i in range(0, len(canonical_paths), batch_size):
-            batch = canonical_paths[i : i + batch_size]
-            qs = ",".join(["?"] * len(batch))
-            rows = self._conn.execute(
-                f"SELECT file_path, width, height, detected_aircraft FROM semantic_index "
-                f"WHERE model_name = ? AND file_path IN ({qs})",
-                [self.model_name, *batch],
-            ).fetchall()
-            for row in rows:
-                # Default sqlite3 rows are tuples; do not use _row_value (expects Row/dict).
-                fp = str(row[0] or "")
-                if not fp:
-                    continue
-                original = canonical_to_original.get(fp, fp)
-                out[original] = {
-                    "width": int(row[1] or 0),
-                    "height": int(row[2] or 0),
-                    # semantic_index currently does not persist EXIF orientation.
-                    # Keep shape compatible with gallery caller.
-                    "orientation": 1,
-                    "detected_aircraft": str(row[3] or "").strip(),
-                }
-        return out
-
-    def get_detected_aircraft_for_paths(self, file_paths: Sequence[str]) -> Dict[str, str]:
-        """Return {original_path: aircraft label} from the semantic index (empty if unknown)."""
-        if not file_paths:
-            return {}
-
-        canonical_to_original: Dict[str, str] = {}
-        canonical_paths: List[str] = []
-        for p in file_paths:
-            if not p:
-                continue
-            cp = self._canonical_path(p)
-            if cp in canonical_to_original:
-                continue
-            canonical_to_original[cp] = p
-            canonical_paths.append(cp)
-
-        out: Dict[str, str] = {}
-        if not canonical_paths:
-            return out
-
-        batch_size = 900
-        for i in range(0, len(canonical_paths), batch_size):
-            batch = canonical_paths[i : i + batch_size]
-            qs = ",".join(["?"] * len(batch))
-            rows = self._conn.execute(
-                f"SELECT file_path, detected_aircraft FROM semantic_index "
-                f"WHERE model_name = ? AND file_path IN ({qs})",
-                [self.model_name, *batch],
-            ).fetchall()
-            for row in rows:
-                fp = str(row[0] or "")
-                if not fp:
-                    continue
-                original = canonical_to_original.get(fp, fp)
-                out[original] = str(row[1] or "").strip()
-        return out
-
-    def repath_indexed_files(self, old_to_new: Dict[str, str]) -> int:
-        """Update semantic_index rows after Magic Wand moves files on disk."""
-        if not old_to_new:
-            return 0
-        updated = 0
-        for old_p, new_p in old_to_new.items():
-            if not old_p or not new_p:
-                continue
-            old_c = self._canonical_path(old_p)
-            new_c = self._canonical_path(new_p)
-            if old_c == new_c:
-                continue
-            cur = self._conn.execute(
-                """
-                UPDATE semantic_index
-                SET file_path = ?, file_name = ?, updated_at = ?
-                WHERE file_path = ? AND model_name = ?
-                """,
-                (
-                    new_c,
-                    os.path.basename(new_c),
-                    float(time.time()),
-                    old_c,
-                    self.model_name,
-                ),
-            )
-            updated += int(cur.rowcount or 0)
-        if updated:
-            self._conn.commit()
-        return updated
 
     def _fetch_rows_for_paths(self, paths: Sequence[str]) -> List[sqlite3.Row]:
         """Bulk fetch rows for a list of paths using optimized batch queries."""
@@ -4778,21 +3784,39 @@ class SemanticImageIndex:
             return []
 
         # 2. Bulk fetch by file_path
-        found_map = {}
         self._conn.row_factory = sqlite3.Row
+        
+        found_map = {}
         # SQLite parameter limit is usually 999; use 500 to be safe
         chunk_size = 500
         for i in range(0, len(unique_canonical), chunk_size):
             chunk = unique_canonical[i:i+chunk_size]
             placeholders = ",".join(["?"] * len(chunk))
+            # IMPORTANT: Do NOT filter by model_name here.
+            # Metadata fields (face_count, gps_lat/lon, camera_model, city, iso,
+            # capture_time, etc.) are model-independent and must be accessible
+            # regardless of which AI/embedding model is currently active.
+            # Only `embedding` and `semantic_ready` are model-specific.
+            # If multiple rows exist for the same file_path (different model_names),
+            # prefer the current model's row so that semantic_ready/embedding are
+            # correct; otherwise fall back to any row for the path.
             query = f"""
-                SELECT *
+                SELECT file_path, file_name, file_signature, dim, embedding, capture_time, 
+                       camera_model, lens_model, iso, gps_lat, gps_lon, width, height, 
+                       city, admin1, country, country_code, face_count, semantic_ready,
+                       file_size, file_mtime, mtime_ns, model_name
                 FROM semantic_index
-                WHERE model_name = ? AND file_path IN ({placeholders})
+                WHERE file_path IN ({placeholders})
+                ORDER BY
+                    CASE WHEN model_name = ? THEN 0 ELSE 1 END,
+                    rowid DESC
             """
-            rows = self._conn.execute(query, [self.model_name, *chunk]).fetchall()
+            rows = self._conn.execute(query, [*chunk, self.model_name]).fetchall()
             for r in rows:
-                found_map[r["file_path"]] = r
+                fp = r['file_path']
+                if fp not in found_map:
+                    # First match wins: preferred model first (ORDER BY above), then any row
+                    found_map[fp] = r
         
         # 3. Assemble results in original order, injecting mock rows for missing files
         # This ensures that newly added files appear in search results (as unindexed) 
@@ -4827,7 +3851,6 @@ class SemanticImageIndex:
                     'country': "",
                     'country_code': "",
                     'face_count': 0,
-                    'detected_aircraft': "",
                     'semantic_ready': 0,
                     'file_size': 0,
                     'file_mtime': 0,
@@ -4835,8 +3858,59 @@ class SemanticImageIndex:
                     'model_name': self.model_name
                 }
                 results.append(mock_row)
-                
+            
         return results
+
+    def get_layout_metadata_for_paths(self, paths: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Fast synchronous fetch of layout metadata (width, height, orientation, capture_time) 
+        for pre-seeding the gallery layout to avoid flashing on first render.
+        """
+        if not paths:
+            return {}
+            
+        canonical_to_original = {}
+        unique_canonical = []
+        for p in paths:
+            if not p:
+                continue
+            cp = self._canonical_path(p)
+            if cp not in canonical_to_original:
+                canonical_to_original[cp] = p
+                unique_canonical.append(cp)
+                
+        if not unique_canonical:
+            return {}
+            
+        # Bulk fetch by file_path
+        self._conn.row_factory = sqlite3.Row
+        
+        result_map = {}
+        chunk_size = 500
+        for i in range(0, len(unique_canonical), chunk_size):
+            chunk = unique_canonical[i:i+chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            query = f"""
+                SELECT file_path, width, height, orientation, capture_time
+                FROM semantic_index
+                WHERE file_path IN ({placeholders})
+                ORDER BY
+                    CASE WHEN model_name = ? THEN 0 ELSE 1 END,
+                    rowid DESC
+            """
+            rows = self._conn.execute(query, [*chunk, self.model_name]).fetchall()
+            for r in rows:
+                fp = r['file_path']
+                if fp not in result_map:
+                    orig_path = canonical_to_original[fp]
+                    result_map[orig_path] = {
+                        "width": r["width"] or 0,
+                        "height": r["height"] or 0,
+                        "orientation": r["orientation"] or 1,
+                        "capture_time": r["capture_time"] or "",
+                    }
+                    
+        return result_map
 
     @staticmethod
     def _parse_capture_year(capture_time: str) -> int:
@@ -4924,35 +3998,8 @@ class SemanticImageIndex:
         n = str(needle or "").strip().lower()
         if not n:
             return False
-        
-        # 1. Try standard variants (fastest)
-        variants = {
-            n, 
-            n.replace("_", " "), n.replace(" ", "_"), 
-            n.replace("-", ""), # Handle dashes
-            n.replace(" ", "-"), n.replace("-", " ") 
-        }
-        if any(v and v in h for v in variants):
-            return True
-            
-        # 2. Try normalized "stripped" match (most robust for aircraft/technical IDs)
-        # Removes all common separators from both to catch "F-35" vs "F35"
-        h_stripped = h.replace("-", "").replace("_", "").replace(" ", "")
-        n_stripped = n.replace("-", "").replace("_", "").replace(" ", "")
-        if n_stripped and len(n_stripped) >= 2 and n_stripped in h_stripped:
-            return True
-            
-        return False
-
-    @staticmethod
-    def _row_blur_score(row) -> float | None:
-        raw = SemanticImageIndex._row_value(row, "blur_score", None)
-        if raw is None or raw == "":
-            return None
-        try:
-            return float(raw)
-        except (TypeError, ValueError):
-            return None
+        variants = {n, n.replace("_", " "), n.replace(" ", "_")}
+        return any(v and v in h for v in variants)
 
     def _apply_filters(
         self, rows: Sequence[sqlite3.Row], query_text: str
@@ -4961,9 +4008,6 @@ class SemanticImageIndex:
         Parse a mixed query and filter rows.
 
         Supported filter tokens:
-        - sharp / blurry / blur:sharp / blur:blurry (experimental; requires
-          SkySpotter_ENABLE_BLUR_SCORE=1 and re-index)
-        - blur>=N / blur>N / blur<=N / blur<N / blur=N (experimental numeric Laplacian)
         - camera:<text>
         - lens:<text>
         - city:<text>
@@ -5031,75 +4075,6 @@ class SemanticImageIndex:
                 needle = t.split(":", 1)[1].strip().lower()
                 if needle:
                     filtered = [r for r in filtered if self._contains_loose(str(r["lens_model"] or ""), needle)]
-                continue
-
-            if low.startswith("aircraft:"):
-                matched = True
-                needle = t.split(":", 1)[1].strip().lower()
-                if needle:
-                    filtered = [
-                        r
-                        for r in filtered
-                        if self._contains_loose(
-                            str(self._row_value(r, "detected_aircraft", "") or ""), needle
-                        )
-                    ]
-                continue
-
-            if low in ("sharp", "blur:sharp", "focus:sharp", "infocus", "in-focus"):
-                matched = True
-                from blur_score import blur_score_enabled, filter_rows_by_blur_rank
-
-                if blur_score_enabled():
-                    filtered = filter_rows_by_blur_rank(
-                        filtered, self._row_blur_score, want="sharp"
-                    )
-                continue
-
-            if low in (
-                "blurry",
-                "blur:blurry",
-                "blur",
-                "outoffocus",
-                "out-of-focus",
-                "oof",
-                "defocused",
-            ):
-                matched = True
-                from blur_score import blur_score_enabled, filter_rows_by_blur_rank
-
-                if blur_score_enabled():
-                    filtered = filter_rows_by_blur_rank(
-                        filtered, self._row_blur_score, want="blurry"
-                    )
-                continue
-
-            blur_cmp = re.match(r"^blur\s*(>=|>|<=|<|=)\s*(\d+(?:\.\d+)?)$", low)
-            if blur_cmp:
-                matched = True
-                from blur_score import blur_score_enabled
-
-                if blur_score_enabled():
-                    op, val_str = blur_cmp.group(1), blur_cmp.group(2)
-                    val = float(val_str)
-
-                    def _blur_ok(score: float) -> bool:
-                        if op == "<":
-                            return score < val
-                        if op == "<=":
-                            return score <= val
-                        if op == ">":
-                            return score > val
-                        if op == ">=":
-                            return score >= val
-                        return abs(score - val) < 1e-6
-
-                    filtered = [
-                        r
-                        for r in filtered
-                        if self._row_blur_score(r) is not None
-                        and _blur_ok(self._row_blur_score(r))
-                    ]
                 continue
 
             if low.startswith("date:"):
@@ -5297,51 +4272,6 @@ class SemanticImageIndex:
             t for t in semantic_terms if (t or "").strip().lower() not in metadata_stopwords
         ]
         return filtered, " ".join(semantic_terms).strip()
-
-    def _search_hits_aircraft_label_only(
-        self,
-        rows: Sequence[sqlite3.Row],
-        label_query: str,
-        canonical_to_original: Dict[str, str],
-        signature_to_original: Dict[str, str],
-        top_k: int,
-    ) -> List[SearchHit]:
-        """Match remaining free-text tokens against indexed detected_aircraft labels only."""
-        needle = (label_query or "").strip().lower()
-        if not needle:
-            return []
-        hits: List[SearchHit] = []
-        for r in rows:
-            if not self._row_semantic_ready(r):
-                continue
-            label = str(self._row_value(r, "detected_aircraft", "") or "")
-            if not label or not self._contains_loose(label, needle):
-                continue
-            hits.append(
-                SearchHit(
-                    file_path=str(
-                        signature_to_original.get(str(r["file_signature"] or ""))
-                        or canonical_to_original.get(self._canonical_path(str(r["file_path"])))
-                        or str(r["file_path"])
-                    ),
-                    score=1.0,
-                    file_name=str(r["file_name"] or os.path.basename(str(r["file_path"]))),
-                    capture_time=str(r["capture_time"] or ""),
-                    camera_model=str(r["camera_model"] or ""),
-                    lens_model=str(r["lens_model"] or ""),
-                    iso=int(r["iso"] or 0),
-                    gps_lat=float(r["gps_lat"]) if r["gps_lat"] is not None else None,
-                    gps_lon=float(r["gps_lon"]) if r["gps_lon"] is not None else None,
-                    city=str(r["city"] or ""),
-                    admin1=str(r["admin1"] or ""),
-                    country=str(r["country"] or ""),
-                    country_code=str(r["country_code"] or ""),
-                    face_count=int(r["face_count"] or 0),
-                    detected_aircraft=label,
-                )
-            )
-        hits.sort(key=lambda h: h.capture_time, reverse=True)
-        return hits[: max(1, int(top_k))]
 
     def _normalize_loose_metadata_query(self, raw: str) -> str:
         """
@@ -5549,16 +4479,7 @@ class SemanticImageIndex:
         """
         filtered = list(rows)
         remaining: List[str] = []
-        metadata_fields = (
-            "city",
-            "admin1",
-            "country",
-            "country_code",
-            "camera_model",
-            "lens_model",
-            "file_name",
-            "detected_aircraft",
-        )
+        metadata_fields = ("city", "admin1", "country", "country_code", "camera_model", "lens_model", "file_name")
 
         import logging
         logger = logging.getLogger(__name__)
@@ -5577,17 +4498,13 @@ class SemanticImageIndex:
                 if matched_rows:
                     filtered = matched_rows
                     continue
-            matched_rows = []
-            matching_field = None
-            for r in filtered:
-                for field in metadata_fields:
-                    if self._contains_loose(str(self._row_value(r, field) or ""), needle):
-                        matched_rows.append(r)
-                        matching_field = field
-                        break
-            
+            matched_rows = [
+                r
+                for r in filtered
+                if any(self._contains_loose(str(self._row_value(r, field) or ""), needle) for field in metadata_fields)
+            ]
             if matched_rows:
-                logger.info(f"[SEARCH] Metadata match for '{needle}' found in {len(matched_rows)} image(s) (e.g. via '{matching_field}')")
+                logger.info(f"[SEARCH] Metadata match for '{needle}' found in {len(matched_rows)} image(s)")
                 filtered = matched_rows
             else:
                 # CONTRADICTION FILTER: If this is a location name (e.g. "Korea") but 
@@ -5674,11 +4591,6 @@ class SemanticImageIndex:
             hits.sort(key=lambda h: h.capture_time, reverse=True)
             return hits[: max(1, int(top_k))]
 
-        if not semantic_embeddings_enabled():
-            return self._search_hits_aircraft_label_only(
-                rows, semantic_query, canonical_to_original, signature_to_original, top_k
-            )
-
         query_vec = self._encode_text(semantic_query)
 
         scores: List[SearchHit] = []
@@ -5735,35 +4647,22 @@ class SemanticImageIndex:
         rows = self._metadata_rows_for_search(candidate_paths, needs_face=needs_face)
 
         filtered, semantic_query = self._apply_filters(rows, raw_query)
-        canonical_to_original: Dict[str, str] = {}
-        for p in candidate_paths:
-            if not p:
-                continue
-            cp = self._canonical_path(p)
-            canonical_to_original[cp] = p
-
         hits = [
             SearchHit(
-                file_path=str(
-                    canonical_to_original.get(
-                        self._canonical_path(str(self._row_value(r, "file_path")))
-                    )
-                    or self._row_value(r, "file_path")
-                ),
+                file_path=str(r["file_path"]),
                 score=1.0,
-                file_name=str(self._row_value(r, "file_name") or os.path.basename(str(self._row_value(r, "file_path")))),
-                capture_time=str(self._row_value(r, "capture_time")),
-                camera_model=str(self._row_value(r, "camera_model")),
-                lens_model=str(self._row_value(r, "lens_model")),
-                iso=int(self._row_value(r, "iso", 0)),
-                gps_lat=float(self._row_value(r, "gps_lat", 0)) if self._row_value(r, "gps_lat") is not None else None,
-                gps_lon=float(self._row_value(r, "gps_lon", 0)) if self._row_value(r, "gps_lon") is not None else None,
-                city=str(self._row_value(r, "city")),
-                admin1=str(self._row_value(r, "admin1")),
-                country=str(self._row_value(r, "country")),
-                country_code=str(self._row_value(r, "country_code")),
-                face_count=int(self._row_value(r, "face_count", 0)),
-                detected_aircraft=str(self._row_value(r, "detected_aircraft", "")),
+                file_name=str(r.get("file_name") or os.path.basename(str(r["file_path"]))),
+                capture_time=str(r["capture_time"] or ""),
+                camera_model=str(r["camera_model"] or ""),
+                lens_model=str(r["lens_model"] or ""),
+                iso=int(r["iso"] or 0),
+                gps_lat=float(r["gps_lat"]) if r["gps_lat"] is not None else None,
+                gps_lon=float(r["gps_lon"]) if r["gps_lon"] is not None else None,
+                city=str(r["city"] or ""),
+                admin1=str(r["admin1"] or ""),
+                country=str(r["country"] or ""),
+                country_code=str(r["country_code"] or ""),
+                face_count=int(r["face_count"] or 0),
             )
             for r in filtered
         ]
@@ -5777,12 +4676,15 @@ class SemanticImageIndex:
         if not candidate_paths:
             return []
 
+        # Build a canonical→original map so DB rows can be resolved back to the
+        # original-case path that self.image_files uses. On Windows the DB stores
+        # lowercase paths (_canonical_path lowercases), but the UI file list keeps
+        # the original case from os.listdir(). Returning lowercase paths from search
+        # causes a mismatch where the gallery cannot locate the files.
         canonical_to_original: Dict[str, str] = {}
         for p in candidate_paths:
-            if not p:
-                continue
-            cp = self._canonical_path(p)
-            canonical_to_original[cp] = p
+            if p:
+                canonical_to_original[self._canonical_path(p)] = p
 
         # Bulk fetch all rows that exist in the index
         rows: List[Dict[str, object]] = []
@@ -5791,11 +4693,20 @@ class SemanticImageIndex:
 
         # Rows present in DB (fast path).
         for row in db_rows:
-            canonical = self._canonical_path(str(row["file_path"]))
-            found_paths.add(canonical)
-            display_path = canonical_to_original.get(canonical, canonical)
+            db_path = str(row["file_path"])
+            # Resolve back to original-case path from candidate_paths; fall back to
+            # the DB path (already canonical/lowercase) if not found.
+            canonical = self._canonical_path(db_path)
+            original = canonical_to_original.get(canonical, db_path)
+            found_paths.add(self._canonical_path(original))
             
-            face_count = row["face_count"] if "face_count" in row.keys() else 0
+            face_count = row["face_count"] if "face_count" in row.keys() else None
+            # Only detect faces during search if explicitly needed and missing, 
+            # but ideally this should be done during background indexing.
+            if needs_face and face_count is None:
+                if os.path.isfile(original):
+                    face_count = self._detect_face_count(original)
+                    self._store_face_count(original, int(face_count or 0))
             
             # Lazy metadata repair: If we have GPS but no location names (city/country),
             # it might have been indexed when the geocoder was unavailable. 
@@ -5820,7 +4731,7 @@ class SemanticImageIndex:
                             # Update DB so we don't have to geocode this file again
                             self._conn.execute(
                                 "UPDATE semantic_index SET city=?, admin1=?, country=?, country_code=? WHERE file_path=?",
-                                (city, admin1, country, cc, canonical),
+                                (city, admin1, country, cc, original)
                             )
                             self._conn.commit()
                     except Exception:
@@ -5828,25 +4739,21 @@ class SemanticImageIndex:
 
             rows.append(
                 {
-                    "file_path": display_path,
-                    "file_name": str(self._row_value(row, "file_name") or os.path.basename(display_path)),
-                    "capture_time": str(self._row_value(row, "capture_time")),
-                    "camera_model": str(self._row_value(row, "camera_model")),
-                    "lens_model": str(self._row_value(row, "lens_model")),
-                    "iso": int(self._row_value(row, "iso", 0)),
-                    "width": int(self._row_value(row, "width", 0)),
-                    "height": int(self._row_value(row, "height", 0)),
+                    "file_path": original,
+                    "file_name": str(row["file_name"] or os.path.basename(original)),
+                    "capture_time": str(row["capture_time"] or ""),
+                    "camera_model": str(row["camera_model"] or ""),
+                    "lens_model": str(row["lens_model"] or ""),
+                    "iso": int(row["iso"] or 0),
+                    "width": int(row["width"] or 0),
+                    "height": int(row["height"] or 0),
                     "gps_lat": gps_lat,
                     "gps_lon": gps_lon,
                     "city": city,
                     "admin1": admin1,
                     "country": country,
-                    "country_code": str(self._row_value(row, "country_code")),
+                    "country_code": str(row["country_code"] or ""),
                     "face_count": int(face_count or 0),
-                    "detected_aircraft": str(
-                        self._row_value(row, "detected_aircraft", "") or ""
-                    ).strip(),
-                    "semantic_ready": int(self._row_value(row, "semantic_ready", 0) or 0),
                 }
             )
         # Fallback for files not yet indexed: extract EXIF so metadata search can still
@@ -5857,10 +4764,10 @@ class SemanticImageIndex:
             canonical = self._canonical_path(p)
             if canonical in found_paths:
                 continue
-            meta = self._extract_exif_brief(canonical, include_face=False)
+            meta = self._extract_exif_brief(canonical, include_face=needs_face)
             rows.append(
                 {
-                    "file_path": canonical_to_original.get(canonical, p),
+                    "file_path": canonical,
                     "file_name": os.path.basename(canonical),
                     "capture_time": str(meta.get("capture_time") or ""),
                     "camera_model": str(meta.get("camera_model") or ""),
@@ -5875,8 +4782,6 @@ class SemanticImageIndex:
                     "country": str(meta.get("country") or ""),
                     "country_code": str(meta.get("country_code") or ""),
                     "face_count": int(meta.get("face_count") or 0),
-                    "detected_aircraft": "",
-                    "semantic_ready": 0,
                 }
             )
         return rows
@@ -5912,6 +4817,13 @@ class SemanticImageIndex:
 
     @staticmethod
     def _query_needs_face_detection(query: str) -> bool:
-        # SkySpotter custom build: face detection is intentionally disabled.
-        return False
+        return bool(
+            re.search(
+                r"\b(?:has:faces?|has:people|has:person|has:humans?"
+                r"|no:faces?|no:people|no:person|no:humans?"
+                r"|faces?|people|person|humans?)\b",
+                query or "",
+                flags=re.I,
+            )
+        )
 
