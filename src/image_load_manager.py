@@ -266,7 +266,7 @@ class ImageLoadManager(QObject):
         # CRITICAL: 對於 QObject 子類，必須在最開始就調用 super().__init__()
         # 不能在調用 super().__init__() 之前訪問任何實例屬性（包括 hasattr）
         import sys
-        verbose_init = _env_true("SkySpotter_VERBOSE_MANAGER_INIT", default=False)
+        verbose_init = _env_true("RAWVIEWER_VERBOSE_MANAGER_INIT", default=False)
         if verbose_init:
             print("[ImageLoadManager.__init__] Starting initialization...", flush=True)
         
@@ -299,23 +299,34 @@ class ImageLoadManager(QObject):
         self._work_queue = queue.PriorityQueue()
         self._thread_pool = QThreadPool()
         
-        # INCREASED CONCURRENCY: Scale with CPU cores
-        # For I/O bound tasks (thumbnails), we can have many threads
+        # INCREASED CONCURRENCY: Scale with CPU cores (embedded JPEG thumbnails are I/O-light).
         core_count = os.cpu_count() or 4
-        default_workers = max(12, core_count * 2) 
-        if max_workers == 4: # If default was used, upgrade it
+        default_workers = max(16, core_count * 2)
+        env_workers = os.environ.get("RAWVIEWER_LOAD_MAX_WORKERS", "").strip()
+        if env_workers:
+            try:
+                default_workers = max(4, int(env_workers))
+            except ValueError:
+                pass
+        if max_workers == 4:  # If default was used, upgrade it
             max_workers = default_workers
             
         self._thread_pool.setMaxThreadCount(max_workers)
 
+        # PROCESS POOL (optional): on Windows debug/startup paths, process spawn can
+        # re-import heavy modules and hurt first-load latency. Keep it opt-in.
         # PROCESS POOL: LibRaw postprocess in worker processes (multi-core on Windows).
-        from common_image_loader import use_raw_process_pool
+        from common_image_loader import (
+            process_pool_worker_count,
+            raw_concurrent_load_limit,
+            use_raw_process_pool,
+        )
 
         use_process_pool = use_raw_process_pool()
         self._process_pool = None
         if use_process_pool:
             self._process_pool = concurrent.futures.ProcessPoolExecutor(
-                max_workers=max(2, core_count // 2)
+                max_workers=process_pool_worker_count()
             )
         
         self._active_tasks: Dict[Tuple, ImageLoadTask] = {}
@@ -324,7 +335,7 @@ class ImageLoadManager(QObject):
         self._queue_lock = threading.Lock()
         
         # RAW throttling: Limit concurrent heavy RAW decodes
-        self._raw_load_limit = 4
+        self._raw_load_limit = raw_concurrent_load_limit()
         self._active_raw_tasks = 0
         
         self._stopped = False  # Flag to stop scheduling new tasks
@@ -472,14 +483,17 @@ class ImageLoadManager(QObject):
     
     def _check_cache(self, file_path: str, use_full_resolution: bool, stages: Optional[set] = None) -> bool:
         """檢查快取，如果存在則直接發送信號（只檢查記憶體快取以避免阻塞 UI）"""
-        from common_image_loader import is_raw_file, use_libraw_consistent_preview_first
+        from common_image_loader import (
+            image_covers_sensor_resolution,
+            is_raw_file,
+            use_libraw_consistent_preview_first,
+        )
 
         is_raw = is_raw_file(file_path)
         libraw_first = use_libraw_consistent_preview_first()
         wanted = stages if stages is not None else {'thumbnail', 'exif', 'full'}
 
         cache = self._cache
-        any_terminal_hit = False
 
         # 1) Thumbnail stage: memory-only thumbnail cache (numpy)
         if 'thumbnail' in wanted:
@@ -490,15 +504,14 @@ class ImageLoadManager(QObject):
                     return True
                 # Not terminal if callers also requested EXIF/full image work.
 
-        # 2) EXIF stage: check memory cache and emit if found
+        # 2) EXIF stage: check memory + persistent cache and emit if found
         if 'exif' in wanted:
-            # Check memory cache (now always available via ImageCache.exif_memory_cache)
-            exif_data = cache.exif_memory_cache.get(file_path)
+            exif_data = cache.get_exif(file_path)
             if exif_data is not None:
                 self._emit_cached_result_later(self.exif_data_ready, file_path, exif_data)
                 # Note: EXIF hit alone doesn't terminate processing if pixels are also wanted
         
-        # 3) Full stage: treat RAW preview (1920) as "full" when use_full_resolution=False
+        # 3) Full stage: treat in-memory RAW preview as "full" when use_full_resolution=False
         if 'full' in wanted:
             if is_raw:
                 if use_full_resolution:
@@ -506,9 +519,25 @@ class ImageLoadManager(QObject):
                     if full_img is not None:
                         self._emit_cached_result_later(self.image_ready, file_path, full_img)
                         return True
+                    exif_data = cache.exif_cache.get(file_path)
+                    preview = cache.preview_cache.get(file_path)
+                    if preview is not None:
+                        h, w = preview.shape[:2]
+                        if image_covers_sensor_resolution(w, h, exif_data):
+                            self._emit_cached_result_later(self.image_ready, file_path, preview)
+                            return True
                 else:
                     # Prefer any LibRaw buffer already in memory (fit ↔ zoom consistency)
                     if libraw_first:
+                        exif_data = cache.exif_cache.get(file_path)
+                        preview = cache.preview_cache.get(file_path)
+                        if preview is not None:
+                            h, w = preview.shape[:2]
+                            if image_covers_sensor_resolution(w, h, exif_data):
+                                self._emit_cached_result_later(
+                                    self.image_ready, file_path, preview
+                                )
+                                return True
                         full_img = cache.get_full_image(file_path)
                         if full_img is not None:
                             self._emit_cached_result_later(self.image_ready, file_path, full_img)
@@ -526,7 +555,25 @@ class ImageLoadManager(QObject):
                     self._emit_cached_result_later(self.pixmap_ready, file_path, pixmap)
                     return True
 
-        return any_terminal_hit
+        thumb_ok = (
+            "thumbnail" not in wanted
+            or cache.thumbnail_cache.get(file_path) is not None
+        )
+        exif_ok = "exif" not in wanted or cache.get_exif(file_path) is not None
+        full_ok = "full" not in wanted
+        if "full" in wanted:
+            if is_raw:
+                if use_full_resolution:
+                    full_ok = cache.full_image_cache.get(file_path) is not None
+                elif libraw_first:
+                    full_ok = cache.get_full_image(file_path) is not None
+                else:
+                    full_ok = cache.preview_cache.get(file_path) is not None
+            else:
+                px = cache.pixmap_cache.get(file_path)
+                full_ok = px is not None and not px.isNull()
+
+        return thumb_ok and exif_ok and full_ok
     
     def _schedule_next_task(self):
         """調度下一個任務到線程池，實現 RAW 限制"""
