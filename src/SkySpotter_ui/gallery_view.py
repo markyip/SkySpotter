@@ -9,7 +9,8 @@ from PyQt6.QtWidgets import QWidget, QScrollArea, QLabel
 from PyQt6.QtCore import Qt, QTimer, QRect, QEvent, QSize
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QBrush, QColor, QFont, QTransform
 
-from rawviewer_ui.widgets import ThumbnailLabel, ImageLoaded
+from SkySpotter_ui.widgets import ThumbnailLabel, ImageLoaded
+from skyspotter_runtime import env_flag, env_get, env_int as runtime_env_int
 from image_cache import LRUCache
 from image_load_manager import get_image_load_manager, Priority
 from common_image_loader import get_image_aspect_ratio, is_raw_file
@@ -18,31 +19,23 @@ logger = logging.getLogger(__name__)
 
 
 def _focus_gallery_switch_logs() -> bool:
-    return os.environ.get("RAWVIEWER_FOCUS_GALLERY_SWITCH", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return env_flag("FOCUS_GALLERY_SWITCH", default=False)
 
 
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
-    try:
-        return max(minimum, int(os.environ.get(name, str(default)).strip()))
-    except (TypeError, ValueError):
-        return default
+    return runtime_env_int(name, default, minimum=minimum)
 
 
 def _gallery_prefetch_screens(fast: bool) -> int:
     """Viewport heights to prefetch above/below scroll center (embedded JPEG makes this cheap)."""
     if fast:
-        return _env_int("RAWVIEWER_GALLERY_PREFETCH_SCREENS_FAST", 5, minimum=1)
-    return _env_int("RAWVIEWER_GALLERY_PREFETCH_SCREENS", 6, minimum=1)
+        return _env_int("GALLERY_PREFETCH_SCREENS_FAST", 5, minimum=1)
+    return _env_int("GALLERY_PREFETCH_SCREENS", 6, minimum=1)
 
 
 def _gallery_viewport_buffer_screens() -> float:
     """Extra viewport heights kept for visible tile widgets above/below the scroll window."""
-    raw = os.environ.get("RAWVIEWER_GALLERY_VIEWPORT_BUFFER_SCREENS", "1.25").strip()
+    raw = env_get("GALLERY_VIEWPORT_BUFFER_SCREENS", "1.25")
     try:
         return max(0.0, float(raw))
     except ValueError:
@@ -53,23 +46,23 @@ def _gallery_scheduling_budgets(fast: bool) -> tuple[int, int, int]:
     """Return (max_widgets, max_tasks, active_cap) for the current scroll mode."""
     if fast:
         return (
-            _env_int("RAWVIEWER_GALLERY_MAX_WIDGETS_FAST", 12, minimum=1),
-            _env_int("RAWVIEWER_GALLERY_MAX_TASKS_FAST", 16, minimum=1),
-            _env_int("RAWVIEWER_GALLERY_ACTIVE_CAP_FAST", 24, minimum=4),
+            _env_int("GALLERY_MAX_WIDGETS_FAST", 12, minimum=1),
+            _env_int("GALLERY_MAX_TASKS_FAST", 16, minimum=1),
+            _env_int("GALLERY_ACTIVE_CAP_FAST", 24, minimum=4),
         )
     return (
-        _env_int("RAWVIEWER_GALLERY_MAX_WIDGETS", 28, minimum=1),
-        _env_int("RAWVIEWER_GALLERY_MAX_TASKS", 44, minimum=1),
-        _env_int("RAWVIEWER_GALLERY_ACTIVE_CAP", 44, minimum=4),
+        _env_int("GALLERY_MAX_WIDGETS", 28, minimum=1),
+        _env_int("GALLERY_MAX_TASKS", 44, minimum=1),
+        _env_int("GALLERY_ACTIVE_CAP", 44, minimum=4),
     )
 
 
 def _gallery_idle_preload_batch() -> int:
-    return _env_int("RAWVIEWER_GALLERY_IDLE_PRELOAD_BATCH", 72, minimum=4)
+    return _env_int("GALLERY_IDLE_PRELOAD_BATCH", 72, minimum=4)
 
 
 def _gallery_idle_preload_ms() -> int:
-    return _env_int("RAWVIEWER_GALLERY_IDLE_PRELOAD_MS", 250, minimum=50)
+    return _env_int("GALLERY_IDLE_PRELOAD_MS", 250, minimum=50)
 
 
 def _thumbnail_data_to_base_pixmap(thumbnail_data) -> Optional[QPixmap]:
@@ -174,8 +167,8 @@ class JustifiedGallery(QWidget):
         self._idle_preload_timer.timeout.connect(self._preload_remaining_thumbnails_background)
 
         # Work budget per tick for smooth scrolling (embedded-JPEG thumbnails are cheap).
-        self._max_widgets_per_tick = _env_int("RAWVIEWER_GALLERY_MAX_WIDGETS", 20, minimum=1)
-        self._max_tasks_per_tick = _env_int("RAWVIEWER_GALLERY_MAX_TASKS", 32, minimum=1)
+        self._max_widgets_per_tick = _env_int("GALLERY_MAX_WIDGETS", 20, minimum=1)
+        self._max_tasks_per_tick = _env_int("GALLERY_MAX_TASKS", 32, minimum=1)
 
         # Perf logging (throttled)
         self._perf_last_log_t = 0.0
@@ -1317,7 +1310,7 @@ class JustifiedGallery(QWidget):
         max_widgets, max_tasks, active_cap = _gallery_scheduling_budgets(is_fast)
         active_cap = min(
             active_cap,
-            _env_int("RAWVIEWER_GALLERY_ACTIVE_CAP_HARD", 48, minimum=8),
+            _env_int("GALLERY_ACTIVE_CAP_HARD", 48, minimum=8),
         )
         for idx, item in visible_indices_items:
             path = item.get("file_path")

@@ -26,7 +26,9 @@ _SHELL_DATE_CACHE: Dict[str, float] = {}
 def shell_sort_timestamps_enabled() -> bool:
     if sys.platform != "win32":
         return False
-    flag = os.environ.get("RAWVIEWER_USE_SHELL_SORT_DATES", "1").strip().lower()
+    from skyspotter_runtime import env_get
+
+    flag = env_get("USE_SHELL_SORT_DATES", "1").lower()
     return flag not in ("0", "false", "no", "off")
 
 

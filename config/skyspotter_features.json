@@ -1,4 +1,5 @@
 {
   "blur_score": false,
-  "face_scan": false
+  "face_scan": false,
+  "semantic_search": false
 }

@@ -23,19 +23,20 @@ SIDE_MARGIN = 4
 MIN_CELL_W = 14
 MAX_CELL_W = 140
 DEFAULT_ASPECT = 1.5
+
+from skyspotter_runtime import env_int as runtime_env_int
+
+
 def _filmstrip_env_int(name: str, default: int, *, minimum: int = 1) -> int:
-    try:
-        return max(minimum, int(os.environ.get(name, str(default)).strip()))
-    except (TypeError, ValueError):
-        return default
+    return runtime_env_int(name, default, minimum=minimum)
 
 
-BUFFER_PX = _filmstrip_env_int("RAWVIEWER_FILMSTRIP_BUFFER_PX", 180, minimum=80)
-BUFFER_CELLS = _filmstrip_env_int("RAWVIEWER_FILMSTRIP_BUFFER_CELLS", 4, minimum=1)
+BUFFER_PX = _filmstrip_env_int("FILMSTRIP_BUFFER_PX", 180, minimum=80)
+BUFFER_CELLS = _filmstrip_env_int("FILMSTRIP_BUFFER_CELLS", 4, minimum=1)
 _LAZY_WARM_THRESHOLD = _filmstrip_env_int(
-    "RAWVIEWER_FILMSTRIP_LAZY_WARM_THRESHOLD", 400, minimum=50
+    "FILMSTRIP_LAZY_WARM_THRESHOLD", 400, minimum=50
 )
-_WARM_BAND = _filmstrip_env_int("RAWVIEWER_FILMSTRIP_WARM_BAND", 56, minimum=8)
+_WARM_BAND = _filmstrip_env_int("FILMSTRIP_WARM_BAND", 56, minimum=8)
 # Uniform inset inside each cell so portrait/landscape share the same padding.
 CELL_BORDER = 2
 THUMB_PAD_V = 5

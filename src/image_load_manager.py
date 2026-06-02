@@ -21,10 +21,9 @@ from image_cache import get_image_cache
 
 
 def _env_true(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+    from skyspotter_runtime import env_flag
+
+    return env_flag(name, default=default)
 
 
 class Priority(Enum):
@@ -266,7 +265,7 @@ class ImageLoadManager(QObject):
         # CRITICAL: 對於 QObject 子類，必須在最開始就調用 super().__init__()
         # 不能在調用 super().__init__() 之前訪問任何實例屬性（包括 hasattr）
         import sys
-        verbose_init = _env_true("RAWVIEWER_VERBOSE_MANAGER_INIT", default=False)
+        verbose_init = _env_true("VERBOSE_MANAGER_INIT", default=False)
         if verbose_init:
             print("[ImageLoadManager.__init__] Starting initialization...", flush=True)
         
@@ -302,7 +301,9 @@ class ImageLoadManager(QObject):
         # INCREASED CONCURRENCY: Scale with CPU cores (embedded JPEG thumbnails are I/O-light).
         core_count = os.cpu_count() or 4
         default_workers = max(16, core_count * 2)
-        env_workers = os.environ.get("RAWVIEWER_LOAD_MAX_WORKERS", "").strip()
+        from skyspotter_runtime import env_get
+
+        env_workers = env_get("LOAD_MAX_WORKERS", "")
         if env_workers:
             try:
                 default_workers = max(4, int(env_workers))

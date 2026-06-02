@@ -95,8 +95,20 @@ def face_scan_enabled() -> bool:
     return False
 
 
+def semantic_search_enabled() -> bool:
+    """CLIP/SigLIP text-to-image search (MobileCLIP download, ~400MB). Off for SkySpotter."""
+    env = _flag_from_env("SkySpotter_ENABLE_SEMANTIC_SEARCH")
+    if env is not None:
+        return env
+    file_val = _parse_bool(load_feature_config().get("semantic_search"))
+    if file_val is not None:
+        return file_val
+    return False
+
+
 def feature_flags_summary() -> dict[str, bool]:
     return {
         "blur_score": blur_score_enabled(),
         "face_scan": face_scan_enabled(),
+        "semantic_search": semantic_search_enabled(),
     }

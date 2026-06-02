@@ -16,6 +16,7 @@ from PyQt6.QtGui import QPixmap, QImage
 
 from image_cache import get_image_cache
 from raw_file_extensions import RAW_FILE_EXTENSIONS
+from skyspotter_runtime import env_get, env_flag
 
 
 _CAPTURE_TIME_FORMATS = (
@@ -217,8 +218,7 @@ def use_libraw_consistent_preview_first() -> bool:
     Full-resolution embedded JPEGs (see use_full_embedded_raw_preview) bypass LibRaw even when
     this flag is on.
     """
-    v = os.environ.get("RAWVIEWER_LIBRAW_CONSISTENT_PREVIEW", "0").strip().lower()
-    return v not in ("0", "false", "no", "off")
+    return env_flag("LIBRAW_CONSISTENT_PREVIEW", default=False)
 
 
 # Embedded JPEG long edge must reach this fraction of sensor long edge to count as "full size".
@@ -230,8 +230,7 @@ def use_full_embedded_raw_preview() -> bool:
     When True (default), use camera-embedded JPEG for fit/zoom when it covers sensor resolution,
     avoiding LibRaw demosaic. Set RAWVIEWER_USE_FULL_EMBEDDED_JPEG=0 to always prefer LibRaw.
     """
-    v = os.environ.get("RAWVIEWER_USE_FULL_EMBEDDED_JPEG", "1").strip().lower()
-    return v not in ("0", "false", "no", "off")
+    return env_flag("USE_FULL_EMBEDDED_JPEG", default=True)
 
 
 def sensor_pixel_dimensions(exif_data: Optional[Dict[str, Any]]) -> Optional[Tuple[int, int]]:
@@ -699,8 +698,7 @@ def use_progressive_raw_loading() -> bool:
     the background (may cause a visible color shift). Default: off; use
     RAWVIEWER_LIBRAW_CONSISTENT_PREVIEW=1 for a single LibRaw pipeline instead.
     """
-    v = os.environ.get("RAWVIEWER_PROGRESSIVE_RAW_LOAD") or os.environ.get("SkySpotter_PROGRESSIVE_RAW_LOAD", "")
-    v = v.strip().lower()
+    v = env_get("PROGRESSIVE_RAW_LOAD", "").lower()
     if v in ("0", "false", "no", "off"):
         return False
     if v in ("1", "true", "yes", "on"):
@@ -717,7 +715,7 @@ def pil_downscale_resample():
 
 def metadata_index_idle_delay_ms() -> int:
     """Idle delay after first single-view paint before background metadata indexing starts."""
-    raw = os.environ.get("RAWVIEWER_AUTO_METADATA_INDEX_IDLE_MS", "5000").strip()
+    raw = env_get("AUTO_METADATA_INDEX_IDLE_MS", "5000")
     try:
         return max(0, int(raw))
     except ValueError:
@@ -729,8 +727,7 @@ def use_raw_process_pool() -> bool:
     Offload LibRaw postprocess to a process pool (multi-core). Opt-out with
     SkySpotter_USE_PROCESS_POOL=0. Default: on when CPU count >= 4.
     """
-    raw = os.environ.get("RAWVIEWER_USE_PROCESS_POOL") or os.environ.get("SkySpotter_USE_PROCESS_POOL", "")
-    raw = raw.strip().lower()
+    raw = env_get("USE_PROCESS_POOL", "").lower()
     if raw in ("0", "false", "no", "off"):
         return False
     if raw in ("1", "true", "yes", "on"):
@@ -741,7 +738,7 @@ def use_raw_process_pool() -> bool:
 
 
 def _env_int_bounded(name: str, default: int, *, minimum: int = 1, maximum: int = 64) -> int:
-    raw = os.environ.get(name, "").strip()
+    raw = env_get(name, "")
     if not raw:
         return default
     try:
@@ -760,7 +757,7 @@ def is_slow_storage_path(path: str) -> bool:
     norm = os.path.normpath(path)
     if norm.startswith("\\\\"):
         return True
-    prefixes = os.environ.get("RAWVIEWER_SLOW_STORAGE_PREFIXES", "").strip()
+    prefixes = env_get("SLOW_STORAGE_PREFIXES", "")
     if prefixes:
         for prefix in prefixes.split(","):
             p = prefix.strip()
@@ -781,16 +778,16 @@ def sort_probe_worker_count(
     Conservative mode (fast-open window): RAWVIEWER_SORT_PROBE_WORKERS_CONSERVATIVE or min(3, default).
     Slow storage (UNC / RAWVIEWER_SLOW_STORAGE_PREFIXES): capped at 3.
   """
-    override = os.environ.get("RAWVIEWER_SORT_PROBE_WORKERS", "").strip()
+    override = env_get("SORT_PROBE_WORKERS", "")
     if override:
-        return _env_int_bounded("RAWVIEWER_SORT_PROBE_WORKERS", 4, minimum=1, maximum=32)
+        return _env_int_bounded("SORT_PROBE_WORKERS", 4, minimum=1, maximum=32)
 
     cpu = os.cpu_count() or 4
     if conservative:
-        cons = os.environ.get("RAWVIEWER_SORT_PROBE_WORKERS_CONSERVATIVE", "").strip()
+        cons = env_get("SORT_PROBE_WORKERS_CONSERVATIVE", "")
         if cons:
             return _env_int_bounded(
-                "RAWVIEWER_SORT_PROBE_WORKERS_CONSERVATIVE", 3, minimum=1, maximum=8
+                "SORT_PROBE_WORKERS_CONSERVATIVE", 3, minimum=1, maximum=8
             )
         return min(3, max(2, cpu))
 
@@ -809,9 +806,9 @@ def index_metadata_worker_count(total_files: int) -> int:
     Override: RAWVIEWER_INDEX_METADATA_WORKERS.
     Large folders (>2000) use a lower default to reduce SQLite EXIF cache lock contention.
     """
-    override = os.environ.get("RAWVIEWER_INDEX_METADATA_WORKERS", "").strip()
+    override = env_get("INDEX_METADATA_WORKERS", "")
     if override:
-        return _env_int_bounded("RAWVIEWER_INDEX_METADATA_WORKERS", 2, minimum=1, maximum=16)
+        return _env_int_bounded("INDEX_METADATA_WORKERS", 2, minimum=1, maximum=16)
 
     cpu = os.cpu_count() or 4
     if total_files > 2000:
@@ -823,13 +820,13 @@ def raw_concurrent_load_limit() -> int:
     """Max concurrent LibRaw full/preview decodes in ImageLoadManager."""
     cpu = os.cpu_count() or 4
     default = max(4, cpu)
-    return _env_int_bounded("RAWVIEWER_RAW_LOAD_LIMIT", default, minimum=1, maximum=32)
+    return _env_int_bounded("RAW_LOAD_LIMIT", default, minimum=1, maximum=32)
 
 
 def process_pool_worker_count() -> int:
     """LibRaw postprocess process-pool size when RAWVIEWER_USE_PROCESS_POOL is on."""
     cpu = os.cpu_count() or 4
     default = max(2, cpu - 1)
-    return _env_int_bounded("RAWVIEWER_PROCESS_POOL_WORKERS", default, minimum=1, maximum=32)
+    return _env_int_bounded("PROCESS_POOL_WORKERS", default, minimum=1, maximum=32)
 
 

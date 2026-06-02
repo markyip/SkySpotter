@@ -1,5 +1,5 @@
 """
-High-performance image caching system for RAWviewer.
+High-performance image caching system for SkySpotter.
 
 This module provides intelligent caching for thumbnails, full images, and metadata
 to dramatically improve browsing performance.
@@ -19,10 +19,12 @@ import psutil
 from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from skyspotter_runtime import cache_root, env_flag, env_get, legacy_cache_root
+
 
 def disk_preview_max_edge() -> int:
-    """Max long edge for JPEG files under ~/.rawviewer_cache/previews (grid tier is separate)."""
-    raw = os.environ.get("RAWVIEWER_DISK_PREVIEW_MAX", "512").strip()
+    """Max long edge for JPEG files under ~/.skyspotter_cache/previews (grid tier is separate)."""
+    raw = env_get("DISK_PREVIEW_MAX", "512")
     try:
         v = int(raw)
     except Exception:
@@ -32,7 +34,7 @@ def disk_preview_max_edge() -> int:
 
 def memory_preview_max_edge() -> int:
     """Max in-memory preview for progressive single-image RAW display (not disk size)."""
-    raw = os.environ.get("RAWVIEWER_MEMORY_PREVIEW_MAX", "1920").strip()
+    raw = env_get("MEMORY_PREVIEW_MAX", "1920")
     try:
         v = int(raw)
     except Exception:
@@ -261,7 +263,7 @@ class PersistentEXIFCache:
 
     def __init__(self, cache_dir: str = None):
         if cache_dir is None:
-            cache_dir = os.path.expanduser("~/.rawviewer_cache")
+            cache_dir = cache_root()
         os.makedirs(cache_dir, exist_ok=True)
 
         self.db_path = os.path.join(cache_dir, "exif_cache.db")
@@ -749,7 +751,7 @@ class PersistentThumbnailCache:
     
     def __init__(self, cache_dir: str = None):
         if cache_dir is None:
-            cache_dir = os.path.expanduser("~/.rawviewer_cache")
+            cache_dir = cache_root()
         os.makedirs(cache_dir, exist_ok=True)
         
         self.cache_dir = os.path.join(cache_dir, "thumbnails")
@@ -990,7 +992,7 @@ class PersistentGridCache(PersistentThumbnailCache):
     
     def __init__(self, cache_dir: str = None):
         if cache_dir is None:
-            cache_dir = os.path.expanduser("~/.rawviewer_cache")
+            cache_dir = cache_root()
         # Use 'grid' subdirectory
         self.base_cache_dir = cache_dir 
         super().__init__(cache_dir) # Init with base dir, will setup 'thumbnails'
@@ -1034,7 +1036,7 @@ class PersistentPreviewCache(PersistentThumbnailCache):
     
     def __init__(self, cache_dir: str = None):
         if cache_dir is None:
-            cache_dir = os.path.expanduser("~/.rawviewer_cache")
+            cache_dir = cache_root()
         # Use 'previews' subdirectory
         self.base_cache_dir = cache_dir 
         super().__init__(cache_dir) # Init with base dir, will setup 'thumbnails'
@@ -1132,7 +1134,7 @@ class ImageCache(QObject):
         self.persistent_cache_enabled = persistent_cache_enabled
         if self.persistent_cache_enabled:
             if cache_dir is None:
-                cache_dir = os.path.expanduser("~/.rawviewer_cache")
+                cache_dir = cache_root()
             os.makedirs(cache_dir, exist_ok=True)
             self.cache_dir = cache_dir
         else:
@@ -1683,7 +1685,7 @@ def _cleanup_legacy_disk_cache_once() -> None:
         return
     _legacy_cache_cleanup_done = True
 
-    legacy_dir = os.path.expanduser("~/.rawviewer_cache")
+    legacy_dir = legacy_cache_root()
     if not os.path.isdir(legacy_dir):
         return
 
@@ -1726,7 +1728,7 @@ def get_image_cache() -> ImageCache:
     """Get the global image cache instance."""
     global _global_cache
     if _global_cache is None:
-        persistent = os.environ.get("RAWVIEWER_PERSISTENT_CACHE", "1").lower() in {"1", "true", "yes", "on"}
+        persistent = env_flag("PERSISTENT_CACHE", default=True)
         if not persistent:
             _cleanup_legacy_disk_cache_once()
         _global_cache = ImageCache(persistent_cache_enabled=persistent)

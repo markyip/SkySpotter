@@ -11,9 +11,9 @@ _bg_inference_lock = threading.Lock()
 
 
 def _skyspotter_cache_root() -> str:
-    return os.path.expanduser(
-        os.environ.get("SkySpotter_CACHE_DIR", "~/.skyspotter_cache")
-    )
+    from skyspotter_runtime import cache_root
+
+    return cache_root()
 
 class BackgroundRemover:
     """

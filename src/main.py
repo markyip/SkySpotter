@@ -92,11 +92,14 @@ try:
         _painter.drawText(_splash_pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "RAW")
         _painter.end()
     
-    _startup_splash = QSplashScreen(_splash_pixmap, Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint)
-    _startup_splash.showMessage("Starting RAWviewer...", Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignCenter, Qt.GlobalColor.white)
-    _startup_splash.show()
-    _temp_app.processEvents()
-    
+    if getattr(sys, 'frozen', False):
+        _startup_splash = QSplashScreen(_splash_pixmap, Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint)
+        _startup_splash.showMessage("Starting SkySpotter...", Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignCenter, Qt.GlobalColor.white)
+        _startup_splash.show()
+        _temp_app.processEvents()
+    else:
+        _startup_splash = None
+
     # Now that the Qt splash is visible, close the native one to handover
     close_native_splash()
 except Exception:
@@ -347,7 +350,7 @@ def _norm_path(p: str) -> str:
 
 # Print immediately to verify script is running (main process only, opt-in verbosity)
 safe_print("=" * 80, flush=True)
-safe_print("RAWviewer: Starting imports...", flush=True)
+safe_print("SkySpotter: Starting imports...", flush=True)
 safe_print(f"Python: {sys.version}", flush=True)
 safe_print(f"Working directory: {os.getcwd()}", flush=True)
 safe_print("=" * 80, flush=True)
@@ -5679,14 +5682,16 @@ class RAWImageViewer(QMainWindow):
             f"  Available memory: {memory_info['system_available_gb']:.1f}GB", flush=True)
         QTimer.singleShot(1000, self._cleanup_old_image_cache)
 
-        # Restore last folder / file / view mode (opt-out: RAWVIEWER_DISABLE_SESSION_RESTORE=1)
-        if os.environ.get("RAWVIEWER_DISABLE_SESSION_RESTORE", "0").strip() != "1":
+        # Restore last folder / file / view mode (opt-out: SkySpotter_DISABLE_SESSION_RESTORE=1)
+        from skyspotter_runtime import env_flag
+
+        if not env_flag("DISABLE_SESSION_RESTORE", default=False):
             safe_print("  [RAWImageViewer] Restoring session state...", flush=True)
             if self.restore_session_state():
                 if hasattr(self, "view_mode") and self.view_mode == "gallery":
                     self._show_gallery_view()
         else:
-            safe_print("  [RAWImageViewer] Session restore skipped (RAWVIEWER_DISABLE_SESSION_RESTORE)", flush=True)
+            safe_print("  [SkySpotter] Session restore skipped (SkySpotter_DISABLE_SESSION_RESTORE)", flush=True)
         safe_print("  [RAWImageViewer] Initialization complete!", flush=True)
 
     def _set_single_view_pixmap(self, base: QPixmap) -> None:
@@ -8083,13 +8088,15 @@ class RAWImageViewer(QMainWindow):
                             self_inner.token, done, total, str(message)
                         )
 
+                    from skyspotter_features import face_scan_enabled
+
                     defer_faces = self_inner.index._defer_face_scan_during_build()
                     result = self_inner.index.build_index(
                         self_inner.files,
                         progress_callback=_progress,
                         album_total=self_inner.album_total,
                         album_indexed_base=self_inner.album_indexed_base,
-                        run_face_scan=not defer_faces,
+                        run_face_scan=face_scan_enabled() and not defer_faces,
                     )
                     result["faces_deferred"] = bool(
                         result.get("faces_deferred")
@@ -8936,12 +8943,17 @@ class RAWImageViewer(QMainWindow):
         self._on_search_bottom_clicked()
 
     def _semantic_search_current_folder(self):
+        from skyspotter_features import semantic_search_enabled
+
         if not self.image_files:
             self.status_bar.showMessage("No images to search", 2500)
             return
+        dialog_title = (
+            "Semantic Search" if semantic_search_enabled() else "Gallery Search"
+        )
         query, ok = QInputDialog.getText(
             self,
-            "Semantic Search",
+            dialog_title,
             (
                 "Describe image + optional filters.\n"
                 "Examples:\n"
@@ -9135,7 +9147,7 @@ class RAWImageViewer(QMainWindow):
             self.status_bar.showMessage(message, 5000)
             self._last_semantic_query = query
         except Exception as e:
-            QMessageBox.warning(self, "Semantic Search", str(e))
+            QMessageBox.warning(self, "Gallery Search", str(e))
 
     def _clear_semantic_search_results(self, silent=False, exit_to_gallery=False):
         if not self._semantic_search_backup_files and not self._semantic_search_corpus_files:
@@ -9173,10 +9185,12 @@ class RAWImageViewer(QMainWindow):
             self.load_raw_image(self.current_file_path)
             self._sync_filmstrip_to_folder()
         if not silent:
-            self.status_bar.showMessage("Semantic search filter cleared", 3000)
+            self.status_bar.showMessage("Gallery search filter cleared", 3000)
 
     def get_settings(self):
-        return QSettings("RAWviewer", "RAWviewer")
+        from skyspotter_runtime import app_settings
+
+        return app_settings()
 
     def _semantic_folder_settings_key(self, folder: str) -> str:
         import hashlib
@@ -9204,8 +9218,9 @@ class RAWImageViewer(QMainWindow):
 
     def _maybe_start_background_metadata_index(self) -> None:
         """Start metadata / aircraft indexing silently after folder load."""
-        flag = os.environ.get("RAWVIEWER_AUTO_METADATA_INDEX", "1").strip().lower()
-        if flag in ("0", "false", "no", "off"):
+        from skyspotter_runtime import env_flag
+
+        if not env_flag("AUTO_METADATA_INDEX", default=True):
             return
         if self._semantic_indexing_in_progress:
             return
@@ -17980,7 +17995,7 @@ def main():
 if __name__ == '__main__':
     # Print startup message to console immediately
     safe_print("=" * 80, flush=True)
-    safe_print("RAWviewer Starting...", flush=True)
+    safe_print("SkySpotter Starting...", flush=True)
     safe_print("=" * 80, flush=True)
     
     # Setup logging before anything else

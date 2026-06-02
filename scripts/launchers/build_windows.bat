@@ -5,14 +5,14 @@ echo SkySpotter Windows Build Script
 echo ===============================
 echo.
 
-if not exist "rawviewer_env" (
+if not exist "SkySpotter_env" (
     echo Creating virtual environment...
-    python -m venv rawviewer_env
+    python -m venv SkySpotter_env
     echo Virtual environment created.
 )
 
 echo Activating virtual environment...
-call rawviewer_env\Scripts\activate.bat
+call SkySpotter_env\Scripts\activate.bat
 
 echo Checking MobileCLIP2 ONNX models...
 python scripts/download_mobileclip_onnx.py

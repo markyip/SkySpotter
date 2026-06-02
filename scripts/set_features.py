@@ -20,7 +20,7 @@ def _load(path: Path) -> dict:
                 return data
         except Exception:
             pass
-    return {"blur_score": False, "face_scan": False}
+    return {"blur_score": False, "face_scan": False, "semantic_search": False}
 
 
 def main() -> int:
@@ -40,6 +40,11 @@ def main() -> int:
         "--face-scan",
         choices=("on", "off"),
         help="Enable or disable face-count indexing (people/portrait gallery filters)",
+    )
+    parser.add_argument(
+        "--semantic-search",
+        choices=("on", "off"),
+        help="Enable CLIP/SigLIP semantic image search (MobileCLIP download)",
     )
     parser.add_argument(
         "--copy-experimental",
@@ -75,8 +80,16 @@ def main() -> int:
         data["face_scan"] = True
     elif args.face_scan == "off":
         data["face_scan"] = False
+    if args.semantic_search == "on":
+        data["semantic_search"] = True
+    elif args.semantic_search == "off":
+        data["semantic_search"] = False
 
-    changed = args.blur_score is not None or args.face_scan is not None
+    changed = (
+        args.blur_score is not None
+        or args.face_scan is not None
+        or args.semantic_search is not None
+    )
     if args.show and not changed and not args.copy_experimental:
         print(json.dumps(data, indent=2))
         return 0
