@@ -1,3 +1,4 @@
+import sys
 import time
 import os
 import threading
@@ -7,7 +8,7 @@ from typing import List, Dict, Any, Optional
 
 from PyQt6.QtWidgets import QWidget, QScrollArea, QLabel
 from PyQt6.QtCore import Qt, QTimer, QRect, QEvent, QSize
-from PyQt6.QtGui import QPixmap, QImage, QPainter, QBrush, QColor, QFont, QTransform
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QBrush, QColor, QFont, QTransform, QMouseEvent
 
 from SkySpotter_ui.widgets import ThumbnailLabel, ImageLoaded
 from skyspotter_runtime import env_flag, env_get, env_int as runtime_env_int
@@ -186,7 +187,12 @@ class JustifiedGallery(QWidget):
         self._last_scroll_time = time.time()
         self._current_scroll_speed = 0.0
         self._is_scrolling_fast = False
-        self._scroll_optimize_threshold = 6000
+        # Trackpads emit many small deltas; a lower threshold causes "fast scroll" mode
+        # and blank tiles. macOS defaults higher; override with RAWVIEWER_GALLERY_FAST_SCROLL_PX_S.
+        default_fast = 12000 if sys.platform == "darwin" else 6000
+        self._scroll_optimize_threshold = _env_int(
+            "RAWVIEWER_GALLERY_FAST_SCROLL_PX_S", default_fast, minimum=2000
+        )
 
         # Metadata tracking for dynamic layout
         self._metadata_changed_paths = set()
@@ -201,6 +207,10 @@ class JustifiedGallery(QWidget):
 
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        self._rubber_origin = None
+        self._rubber_active = False
+        self._rubber_toggled_paths = set()
 
         QTimer.singleShot(0, self._post_init)
 
@@ -731,6 +741,9 @@ class JustifiedGallery(QWidget):
         """Rebuild justified rows when the scroll viewport width changes."""
         if getattr(self, "_ignore_resize_events", False):
             return
+        # Rebuilding rows during scroll jumps content height and causes visible glitches.
+        if self._is_scrolling_fast or (time.time() - self._last_scroll_event_t) < 0.12:
+            debounce_ms = max(debounce_ms, 280)
         try:
             current_viewport_width = self._get_viewport_width()
             if current_viewport_width <= 0:
@@ -826,22 +839,32 @@ class JustifiedGallery(QWidget):
             self._schedule_viewport_width_rebuild()
             return False
 
-        # Smooth wheel scrolling: translate wheel deltas into pixel scrolling
+        # Wheel: trackpads send pixelDelta — apply immediately (native feel).
+        # Mouse wheels send angleDelta only — use the smoothed step timer.
         if event.type() == QEvent.Type.Wheel and self._scroll_area and obj is self._scroll_area.viewport():
             try:
+                sb = self._scroll_area.verticalScrollBar()
+                if sb is None:
+                    return False
                 pixel = event.pixelDelta()
                 angle = event.angleDelta()
-                if not pixel.isNull():
-                    delta_y = pixel.y()
-                else:
-                    # Typical mouse wheel: 120 units per notch
-                    # Map to pixels (negative y = scroll down in Qt)
-                    notches = angle.y() / 120.0 if angle.y() else 0.0
-                    delta_y = int(notches * 120)  # base magnitude
-                # Qt wheel delta is inverted relative to scrollbar value direction
-                self._wheel_accum_px += -float(delta_y)
-                if not self._wheel_timer.isActive():
-                    self._wheel_timer.start(self._wheel_tick_ms)
+                if not pixel.isNull() and pixel.y() != 0:
+                    self._wheel_timer.stop()
+                    self._wheel_accum_px = 0.0
+                    new_val = int(
+                        max(sb.minimum(), min(sb.maximum(), sb.value() - pixel.y()))
+                    )
+                    sb.setValue(new_val)
+                    event.accept()
+                    return True
+                if angle.y() != 0:
+                    notches = angle.y() / 120.0
+                    delta_y = int(notches * 120)
+                    self._wheel_accum_px += -float(delta_y)
+                    if not self._wheel_timer.isActive():
+                        self._wheel_timer.start(self._wheel_tick_ms)
+                    event.accept()
+                    return True
             except Exception:
                 pass
             event.accept()
@@ -1250,19 +1273,21 @@ class JustifiedGallery(QWidget):
         prefetch_indices_items = self._get_visible_range(prefetch_rect)
         prefetch_paths = {item["file_path"] for idx, item in prefetch_indices_items if item.get("file_path")}
 
+        is_fast = self._is_scrolling_fast
         for idx in list(self._visible_widgets.keys()):
             if idx not in visible_indices_set:
                 w = self._visible_widgets.pop(idx)
                 w.hide()
-                w.clear()
+                # During fast scroll, keep the last pixmap in the pool to avoid blank flashes.
+                if not is_fast:
+                    w.clear()
+                    w.original_pixmap = None
                 w.file_path = None
-                w.original_pixmap = None
                 self._widget_pool.append(w)
 
         # Fast scroll policy:
         # - still keep visible thumbnails loading (small budget)
         # - avoid heavy prefetch
-        is_fast = self._is_scrolling_fast
         # First-paint mode: prioritize visible tiles only until first thumbnail arrives
         # (or a short timeout), then enable prefetch.
         warmup_elapsed = time.time() - float(getattr(self, "_gallery_set_images_ts", 0.0) or 0.0)
@@ -1330,16 +1355,21 @@ class JustifiedGallery(QWidget):
                 display_rect = self._content_rect_to_viewport(rect)
                 w.setGeometry(display_rect)
                 w.setFixedSize(display_rect.size())
-                def _on_thumb_click(e, _w=w):
+                def _on_thumb_press(e, _w=w):
                     try:
                         if e.button() == Qt.MouseButton.LeftButton:
                             e.accept()
-                            # Read the widget's CURRENT file_path. Widgets are pooled and
-                            # reused by index, so a captured path can go stale when the
-                            # image list changes (e.g. after a search filter).
                             target_path = getattr(_w, "file_path", None)
-                            if target_path:
-                                self.parent_viewer._gallery_item_clicked(target_path)
+                            pv = self.parent_viewer
+                            if target_path and pv is not None:
+                                if hasattr(pv, "_gallery_has_extend_modifier") and pv._gallery_has_extend_modifier(
+                                    e.modifiers()
+                                ):
+                                    pt = _w.mapTo(self, e.position().toPoint())
+                                    self._begin_ctrl_drag_selection(pt)
+                                    self.grabMouse()
+                                    return
+                                pv._gallery_item_clicked(target_path)
                             return
                     except Exception:
                         pass
@@ -1347,7 +1377,7 @@ class JustifiedGallery(QWidget):
                         e.ignore()
                     except Exception:
                         pass
-                w.mousePressEvent = _on_thumb_click
+                w.mousePressEvent = _on_thumb_press
                 created_widgets += 1
                 self._visible_widgets[idx] = w
             else:
@@ -1414,6 +1444,10 @@ class JustifiedGallery(QWidget):
                     w.setText("")
 
             w.show()
+            pv = self.parent_viewer
+            if pv is not None and hasattr(pv, "_is_gallery_path_selected"):
+                if hasattr(w, "set_gallery_selected"):
+                    w.set_gallery_selected(pv._is_gallery_path_selected(path))
             thumb_missing = not cache_hit
             
             m = self._metadata_cache.get(path)
@@ -1977,6 +2011,101 @@ class JustifiedGallery(QWidget):
                     child.deleteLater()
             except Exception:
                 pass
+
+    @staticmethod
+    def _extend_selection_modifier(modifiers) -> bool:
+        return bool(
+            modifiers
+            & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier)
+        )
+
+    def refresh_gallery_selection_visuals(self) -> None:
+        """Sync selection border on visible pooled thumbnails."""
+        pv = self.parent_viewer
+        if pv is None or not hasattr(pv, "_is_gallery_path_selected"):
+            return
+        for w in self._visible_widgets.values():
+            path = getattr(w, "file_path", None)
+            if path and hasattr(w, "set_gallery_selected"):
+                w.set_gallery_selected(pv._is_gallery_path_selected(path))
+
+    def _paths_intersecting_rect(self, rect: QRect) -> List[str]:
+        if rect is None or rect.isNull():
+            return []
+        paths: List[str] = []
+        seen = set()
+        for item in self._gallery_layout_items:
+            item_rect = item.get("rect")
+            if item_rect is None or not rect.intersects(item_rect):
+                continue
+            fp = item.get("file_path")
+            if not fp or fp in seen:
+                continue
+            seen.add(fp)
+            paths.append(fp)
+        return paths
+
+    def _begin_ctrl_drag_selection(self, origin) -> None:
+        self._rubber_origin = origin
+        self._rubber_active = True
+        self._rubber_toggled_paths = set()
+
+    def _update_ctrl_drag_selection(self, current) -> None:
+        if not self._rubber_active or self._rubber_origin is None:
+            return
+        sel_rect = QRect(self._rubber_origin, current).normalized()
+        pv = self.parent_viewer
+        if pv is None or not hasattr(pv, "_gallery_toggle_path_selection"):
+            return
+        for fp in self._paths_intersecting_rect(sel_rect):
+            if fp in self._rubber_toggled_paths:
+                continue
+            self._rubber_toggled_paths.add(fp)
+            pv._gallery_toggle_path_selection(fp)
+
+    def _end_ctrl_drag_selection(self, current) -> None:
+        if not self._rubber_active:
+            return
+        if self._rubber_origin is not None and not self._rubber_toggled_paths:
+            pt_rect = QRect(self._rubber_origin, QSize(1, 1))
+            pv = self.parent_viewer
+            if pv is not None and hasattr(pv, "_gallery_toggle_path_selection"):
+                for fp in self._paths_intersecting_rect(pt_rect):
+                    pv._gallery_toggle_path_selection(fp)
+                    break
+        self._rubber_active = False
+        self._rubber_origin = None
+        self._rubber_toggled_paths = set()
+        if self.mouseGrabber() is self:
+            self.releaseMouse()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._extend_selection_modifier(event.modifiers())
+        ):
+            self._begin_ctrl_drag_selection(event.position().toPoint())
+            self.grabMouse()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._rubber_active and self._rubber_origin is not None:
+            self._update_ctrl_drag_selection(event.position().toPoint())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if (
+            self._rubber_active
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self._end_ctrl_drag_selection(event.position().toPoint())
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def _update_empty_label_geometry(self):
         """Lay out empty-state text across the justified gallery canvas (fills the frame when empty)."""

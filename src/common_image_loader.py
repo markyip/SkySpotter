@@ -55,9 +55,7 @@ def decode_embedded_jpeg_bytes(
             im = im.convert("RGB")
         w, h = im.size
         if max_size > 0 and (w > max_size or h > max_size):
-            work = im.copy()
-            work.thumbnail((max_size, max_size), Image.Resampling.HAMMING)
-            im = work
+            im.thumbnail((max_size, max_size), Image.Resampling.HAMMING)
         return np.array(im)
     except Exception:
         return None
@@ -363,6 +361,13 @@ def is_raw_file(file_path: str) -> bool:
     """檢查是否為 RAW 文件（與 semantic `format:raw` 使用同一附檔名集合）。"""
     ext = os.path.splitext(file_path)[1].lower().lstrip(".")
     return ext in RAW_FILE_EXTENSIONS
+
+
+def dng_prefers_embedded_preview_first(file_path: str) -> bool:
+    """Composite/HDR DNGs often fail LibRaw; use embedded JPEG before sensor decode."""
+    if os.path.splitext(file_path)[1].lower() != ".dng":
+        return False
+    return "-hdr" in os.path.basename(file_path).lower()
 
 
 def is_tiff_file(file_path: str) -> bool:
@@ -763,6 +768,16 @@ def is_slow_storage_path(path: str) -> bool:
             p = prefix.strip()
             if p and norm.lower().startswith(os.path.normpath(p).lower()):
                 return True
+    if os.name == "nt" and len(norm) >= 2 and norm[1] == ":":
+        try:
+            import ctypes
+
+            root = norm[:2] + "\\"
+            # DRIVE_REMOTE=4, DRIVE_CDROM=5 — prefer scan-first embedded JPEG extraction
+            if ctypes.windll.kernel32.GetDriveTypeW(root) in (4, 5):
+                return True
+        except Exception:
+            pass
     return False
 
 

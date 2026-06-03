@@ -19,7 +19,7 @@ Environment toggles:
 
 import os
 
-from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal
+from PyQt6.QtCore import Qt, QRect, QRectF, QPointF, pyqtSignal, QEvent
 from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen
 from PyQt6.QtWidgets import (
     QGraphicsView,
@@ -266,6 +266,41 @@ class GpuImageView(QGraphicsView):
     def clear(self) -> None:
         self.set_pixmap(QPixmap())
 
+    def capture_viewport_pixmap(self) -> QPixmap | None:
+        """Capture the visible view for resolution cross-fade (OpenGL-safe)."""
+        if not self._has_pixmap:
+            return None
+        vp = self.viewport()
+        w = max(1, vp.width())
+        h = max(1, vp.height())
+        try:
+            from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+
+            if isinstance(vp, QOpenGLWidget):
+                fb = vp.grabFramebuffer()
+                if fb is not None and not fb.isNull():
+                    return fb
+        except Exception:
+            pass
+        try:
+            target = QRect(0, 0, w, h)
+            pix = QPixmap(w, h)
+            pix.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pix)
+            self.render(painter, target, target)
+            painter.end()
+            if not pix.isNull():
+                return pix
+        except Exception:
+            pass
+        try:
+            snap = vp.grab()
+            if snap is not None and not snap.isNull():
+                return snap
+        except Exception:
+            pass
+        return None
+
     # ------------------------------------------------------------------ zoom
     def fit_to_window(self) -> None:
         self._fit_mode = True
@@ -345,18 +380,25 @@ class GpuImageView(QGraphicsView):
         self.zoomChanged.emit(self.current_scale())
 
     # ------------------------------------------------------------------ events
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._update_placeholder()
-        if self._has_pixmap and not self._fit_mode:
-            if self.current_scale() < self.fit_scale() * self._FIT_SCALE_EPS:
-                self.fit_to_window()
-
     def mouseMoveEvent(self, event) -> None:
         host = self.parentWidget()
         if host is not None and hasattr(host, "handle_pointer_for_filmstrip"):
             host.handle_pointer_for_filmstrip(event.globalPosition())
         super().mouseMoveEvent(event)
+
+    def event(self, event) -> bool:
+        """Trackpad pinch (macOS) and smart-zoom gestures."""
+        if event.type() == QEvent.Type.NativeGesture and self._has_pixmap:
+            gtype = event.gestureType()
+            if gtype == Qt.NativeGestureType.ZoomNativeGesture:
+                self.zoom_by(1.0 + event.value() * 0.5)
+                event.accept()
+                return True
+            if gtype == Qt.NativeGestureType.SmartZoomNativeGesture:
+                self.toggle_fit()
+                event.accept()
+                return True
+        return super().event(event)
 
     def wheelEvent(self, event) -> None:
         delta = event.angleDelta().y()
