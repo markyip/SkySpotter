@@ -159,6 +159,7 @@ def update_macos_plist(app_path):
         plist['CFBundleExecutable'] = 'SkySpotter'
         plist['CFBundlePackageType'] = 'APPL'
         plist['CFBundleShortVersionString'] = VERSION
+        plist['CFBundleVersion'] = VERSION
         
         # Add macOS permission usage descriptions
         plist['NSDesktopFolderUsageDescription'] = 'SkySpotter needs access to your Desktop to display images.'

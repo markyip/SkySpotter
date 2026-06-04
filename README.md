@@ -99,11 +99,20 @@ This is a **pre-filtering tool**, letting you go through hundreds of RAW files e
 ### Download Executable
 
 #### Windows
+<<<<<<< HEAD
 
 1. Download the latest release from the [Releases Page](https://github.com/markyip/SkySpotter/releases/latest)
 2. Download `SkySpotter.exe` directly (no zip extraction needed)
 3. Double-click `SkySpotter.exe` to initiate the installation process. It will automatically download dependencies and the **gallery classifier** (`models/gallery-classifier/skyspotter-military-aircraft-vit/`). The installer bundles weights when you build after `git lfs pull`; otherwise it uses the GitHub release zip from `manifest.json` or `SkySpotter_APP_MODEL_URL`.
 4. Launch SkySpotter from the Desktop shortcut created during installation! (You can safely delete the original `SkySpotter.exe` installer afterwards).
+=======
+1. Download the appropriate version for your system from the [Releases Page](https://github.com/markyip/RAWviewer/releases/latest):
+   - **`RAWviewer-CUDA.exe`**: Recommended for **NVIDIA GPU** users who have CUDA installed. This provides the fastest indexing and search performance.
+   - **`RAWviewer-DirectML.exe`**: Recommended for **AMD, Intel, or NVIDIA** users who want an out-of-the-box hardware-accelerated experience without installing CUDA.
+2. Run the downloaded installer directly (no zip extraction needed).
+3. Double-click the installer to initiate the installation process. It will automatically set up the dependencies (via Pixi) and download the local AI models to a destination of your choice.
+4. Launch RAWviewer from the Desktop shortcut! (You can safely delete the installer afterwards).
+>>>>>>> rawviewer/main
 
 #### macOS
 
@@ -242,11 +251,26 @@ Separate tokens with spaces. Filters use `key:value` or comparison forms.
 | Date prefix | `date:2024-05` |
 | GPS | `has:gps` · `no:gps` |
 
+<<<<<<< HEAD
 ---
 
 ## Experimental features
 
 These capabilities exist in the codebase but are **off by default**. We tried them in real airshow folders; results were **not reliable enough** for everyday culling (rankings did not always match how sharp a photo looks). You can still enable them to experiment on your own machine.
+=======
+Optional: **stronger semantic models** (advanced). The app default is **MobileCLIP2-S0** (vision: ~43MB) for speed and size. You can choose a stronger model by setting the environment variable **`RAWVIEWER_MOBILECLIP_VARIANT`** to one of the following:
+
+- **`s0`** (Default): Vision model ~43MB, fastest indexing, lower memory usage.
+- **`s2`**: Vision model ~136MB, better accuracy on complex search terms.
+- **`b`**: ViT-B model ~330MB, significantly improved search understanding.
+- **`l14`**: ViT-L/14 model ~1.1GB, highest quality, recommended for heavy/large search applications.
+
+When a different variant is selected, the application will automatically download the correct model assets from Hugging Face (`plhery/mobileclip2-onnx` on Windows/Linux) to a separate cache folder.
+
+*Note for macOS users:* Bundled macOS Core ML models are discovered automatically in common app/resource paths:
+- Apple Hub naming: `mobileclip_s2_image.mlpackage` + `mobileclip_s2_text.mlpackage`
+- App export naming (`--for-app`): `mobileclip2_s0_image.mlpackage` + `mobileclip2_s0_text.mlpackage`
+>>>>>>> rawviewer/main
 
 ### Blur detection (`sharp` / `blurry` gallery filters)
 
@@ -327,12 +351,17 @@ Open files directly from disk—no import step. SkySpotter uses [LibRaw](https:/
 
 Gallery `format:raw` / `format:jpeg` filters use the same extension sets as the app (see [`src/raw_file_extensions.py`](src/raw_file_extensions.py)).
 
+<<<<<<< HEAD
 ---
+=======
+Launch scripts live under [`scripts/Launch/`](scripts/Launch/README.md).
+>>>>>>> rawviewer/main
 
 ## 🏗️ Building from Source
 
 Launch and build scripts live under [`scripts/launchers/`](scripts/launchers/README.md). Upstream RAWviewer uses `scripts/Launch/`; SkySpotter keeps the `scripts/launchers/` layout instead.
 
+<<<<<<< HEAD
 ### Prerequisites
 
 - Install **[Pixi](https://pixi.sh/latest/)** — required for development and building from source
@@ -346,6 +375,9 @@ From the project root:
 pixi install
 pixi run start
 ```
+=======
+**Folder sort (capture time):** Gallery and folder load sort by **EXIF** (`metadata_backend` probe when cold; bulk cache when warm). Default order is **oldest first**; use the gallery **⇅ Oldest / Newest** control to toggle (saved in QSettings). Windows Explorer `DateTaken` via Shell was evaluated and rejected for production (slower than EXIF, no benefit on test folders).
+>>>>>>> rawviewer/main
 
 **Local testing from source** (console logs, same on both platforms):
 
@@ -365,6 +397,49 @@ Train, verify, and build scripts are in the same folder — see `scripts/launche
 | `RAWVIEWER_GPU_VIEW=1` | Use the experimental GPU-accelerated single-image viewport (smoother zoom/pan; default remains the classic scroll area) |
 | `RAWVIEWER_GPU_VIEW_NO_GL=1` | Force raster viewport when GPU view is enabled (debug / fallback) |
 | `RAWVIEWER_PERSISTENT_CACHE=1` | Enable disk/SQLite cache persistence (off by default) |
+<<<<<<< HEAD
+=======
+| `RAWVIEWER_EXIF_BACKEND=auto` | EXIF via pyexiv2 (JPEG/TIFF) + exifread (RAW headers); `exifread` or `pyexiv2` to force one backend |
+| `RAWVIEWER_SORT_PROBE_WORKERS` | Parallel EXIF header probes during folder sort (default scales with CPU, up to 12 on local disk; 3 on UNC / `RAWVIEWER_SLOW_STORAGE_PREFIXES`) |
+| `RAWVIEWER_INDEX_METADATA_WORKERS` | Semantic index metadata extraction pool (default 2–6; lower on folders &gt;2000 files) |
+| `RAWVIEWER_RAW_LOAD_LIMIT` | Max concurrent LibRaw decodes in the load manager (default `4`) |
+| `RAWVIEWER_PROCESS_POOL_WORKERS` | LibRaw postprocess process pool size when `RAWVIEWER_USE_PROCESS_POOL=1` |
+| `RAWVIEWER_SLOW_STORAGE_PREFIXES` | Comma-separated path prefixes (e.g. `K:\Photos,N:\`) to cap sort-probe parallelism at 3 |
+
+**macOS share (v2.2, single-image view only):**
+
+| Variable | Default in `launch_dev.sh` | Effect |
+|----------|------------------------------|--------|
+| `RAWVIEWER_SHARE_MENU` | `1` | Qt menu listing `NSSharingService` targets (recommended under Qt6) |
+| `RAWVIEWER_SHARE_TRY_NATIVE_PICKER` | off | Try `NSSharingServicePicker` first, then menu fallback |
+| `RAWVIEWER_SHARE_SHOW_AIRDROP` | off | Include AirDrop in the menu (in-app AirDrop is unreliable in the Qt host) |
+| `RAWVIEWER_SHARE_DEBUG` | off | Share diagnostics in status bar and `[SHARE]` logs |
+
+Details: [`docs/macos-sharing-v21-v22.md`](docs/macos-sharing-v21-v22.md) and [`scripts/Launch/README.md`](scripts/Launch/README.md#macos--release-smoke-test-manual).
+
+### macOS — build and smoke test (v2.2)
+
+```bash
+chmod +x scripts/Launch/shell/*.sh
+./scripts/Launch/shell/build_macos.sh    # or: pixi install && pixi run python build.py
+xattr -cr dist/RAWviewer.app
+open dist/RAWviewer.app
+```
+
+**Dev run** (preflight checks for `pyexiv2` and semantic backend):
+
+```bash
+./scripts/Launch/shell/launch_dev.sh
+# Skip preflight: RAWVIEWER_TEST_PYEXIV2=0 RAWVIEWER_TEST_SEMANTIC=0 ./scripts/Launch/shell/launch_dev.sh
+```
+
+Before tagging a macOS release: confirm app version **2.2**, single-view **share** menu works (Mail attach), and bundled `models/mobileclip2_coreml` if semantic search is required in the `.app`.
+
+## 🏗️ Building from Source
+
+### Prerequisites
+- [Pixi](https://pixi.sh/latest/) (Package manager for development and dependencies)
+>>>>>>> rawviewer/main
 
 ### Windows
 
@@ -412,7 +487,7 @@ Optional: set `RAWVIEWER_FILE_LOG=1` when developing to enable extra file loggin
 - **"Windows protected your PC"**: Click "More info" → "Run anyway"
 - **Antivirus warnings**: Add SkySpotter to your antivirus exclusions
 - **Performance issues**: Try running as administrator
-- **"Open with another app" does nothing**: Ensure a file is loaded in single-image view; restart the app after upgrading. The picker uses the native `OpenAs_RunDLLW` API (Unicode paths supported).
+- **"Open with another app" / bottom share button**: v2.2 implements the native Open with APIs (`OpenAs_RunDLLW`, `SHOpenWithDialog` + `OAIF_EXEC`), but the bottom-bar control is **hidden on Windows** in current `main`. Use Explorer **Open with** on the file until the in-app button is re-enabled (see `scripts/Launch/README.md`).
 - **AttributeError with stdout**: This is normal for windowed builds - the application runs without a console window
 - **Installer stuck on "Downloading MobileCLIP ONNX Models" / `No module named 'requests'`**:
   - Fixed in recent builds (`requests` in `pixi.toml`). Re-run the installer from a fresh build, or in the install folder run `_internal\pixi\pixi.exe install` then retry.
@@ -459,7 +534,14 @@ If you are on macOS 12 or older, OR if you simply want to permanently bypass all
   - **The fix**: From the repo root run `pixi install`, then use `pixi run python build.py` or the `scripts/launchers/` build script. Remove any old manual virtualenv folders (`skyspotter_env`, `rawviewer_env`) if you created them earlier.
 - **Homebrew delays on macOS 12 Monterey or older**:
   - Homebrew has officially dropped "binary bottle" support for Monterey. However, **it still works**. When the build script attempts to `brew install inih gettext`, Homebrew will simply compile them from source on your machine. This is completely normal but may take 2-3 extra minutes.
+<<<<<<< HEAD
 - **Permission Denied / Cannot Read Folder**: Modern macOS requires explicit permission for apps to access the Desktop or Documents.
+=======
+
+- **Share menu empty or native picker spins**: Use dev defaults (`RAWVIEWER_SHARE_MENU=1` via `launch_dev.sh`). Avoid opening the picker on mouse-up; see [`docs/macos-sharing-v21-v22.md`](docs/macos-sharing-v21-v22.md). For AirDrop, prefer Finder on the file.
+
+- **Permission Denied / Cannot Read Folder**: Modern macOS requires explicit permission for apps to access the Desktop or Documents. 
+>>>>>>> rawviewer/main
   1. Go to **System Settings** > **Privacy & Security** > **Full Disk Access**.
   2. Click the **+** button and add `SkySpotter.app`.
   3. Toggle it to **ON**.
@@ -584,6 +666,10 @@ git lfs pull
 ```
 
 ## ⚠️ Known Issues
+
+### Platform (v2.2)
+- **Windows:** In-app **Open with** picker is implemented but the bottom-bar button is not shown on `win32` in current `main`.
+- **macOS:** `NSSharingServicePicker` popover often fails under the Qt6 host; default product path is the **Qt share menu**, not the popover.
 
 ### Camera compatibility
 
