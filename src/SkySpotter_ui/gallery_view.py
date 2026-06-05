@@ -362,6 +362,23 @@ class JustifiedGallery(QWidget):
             ):
                 if bulk_metadata:
                     self._metadata_cache.update(bulk_metadata)
+
+                # Fetch updated metadata from cache for paths that are missing it or have minimal metadata
+                if self.parent_viewer and hasattr(self.parent_viewer, "image_cache"):
+                    paths = [img for img in self.images if isinstance(img, str)]
+                    missing_paths = [p for p in paths if p not in self._metadata_cache or self._metadata_cache[p].get("minimal_preview_exif")]
+                    if missing_paths:
+                        bulk_fetched = self.parent_viewer.image_cache.get_multiple_exif(missing_paths)
+                        if bulk_fetched:
+                            self._metadata_cache.update(bulk_fetched)
+                            # If any aspect ratios/rotations changed, trigger a layout rebuild
+                            layout_changed = False
+                            for path, exif in bulk_fetched.items():
+                                if self.on_visual_rotation_changed(path, defer_rebuild=True):
+                                    layout_changed = True
+                            if layout_changed:
+                                self.build_gallery(force=True)
+
                 if self._pending_scroll_to_path:
                     QTimer.singleShot(0, self._apply_pending_scroll_to_file)
                 else:
@@ -1099,7 +1116,7 @@ class JustifiedGallery(QWidget):
                 if missing_paths and self.parent_viewer and hasattr(
                     self.parent_viewer, "image_cache"
                 ):
-                    cap = 2048 if len(paths) > 500 else self.BUILD_EXIF_PREFETCH_MAX
+                    cap = len(paths)
                     bulk_fetched = self.parent_viewer.image_cache.get_multiple_exif(
                         missing_paths[:cap]
                     )
@@ -1733,6 +1750,30 @@ class JustifiedGallery(QWidget):
         
         if file_path in self._active_tasks:
             del self._active_tasks[file_path]
+            
+        # Dynamically exclude failed/unsupported images from gallery and parent lists
+        removed = False
+        if file_path in self.images:
+            self.images.remove(file_path)
+            removed = True
+            
+        pv = self.parent_viewer
+        if pv is not None:
+            if hasattr(pv, "image_files") and file_path in pv.image_files:
+                try:
+                    pv.image_files.remove(file_path)
+                    removed = True
+                except ValueError:
+                    pass
+            if removed and hasattr(pv, "_update_gallery_counter"):
+                try:
+                    pv._update_gallery_counter()
+                except Exception:
+                    pass
+
+        if removed:
+            logger.info(f"[GALLERY] Removed failed load image from list: {file_path}")
+            self.build_gallery(force=True)
             
         if self.parent_viewer is not None and getattr(
             self.parent_viewer, "view_mode", "gallery"

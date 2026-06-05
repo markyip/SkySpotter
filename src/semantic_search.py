@@ -175,7 +175,7 @@ def semantic_warm_thumbs_before_index() -> bool:
 
 
 def semantic_batch_candidates() -> List[int]:
-    raw = env_get("SEMANTIC_BATCH_CANDIDATES", "1,2,4,8,16,32,64")
+    raw = env_get("SEMANTIC_BATCH_CANDIDATES", "8,16,32,64,128")
     cap = semantic_batch_max()
     out: List[int] = []
     for item in raw.split(","):
@@ -187,7 +187,7 @@ def semantic_batch_candidates() -> List[int]:
         except Exception:
             continue
     if not out:
-        out = [1, 2, 4, 8, 16, 32, 64]
+        out = [8, 16, 32, 64, 128]
     # stable dedupe
     seen = set()
     uniq: List[int] = []
@@ -2917,6 +2917,21 @@ class SemanticImageIndex:
                     return True
             except Exception:
                 pass
+
+            # Heavy fallback on failure:
+            try:
+                from unified_image_processor import UnifiedImageProcessor, _LIBRAW_UNSUPPORTED_PATHS
+                thumb = UnifiedImageProcessor().process_thumbnail(path, allow_heavy_fallback=True)
+                if thumb is not None:
+                    return True
+                else:
+                    _LIBRAW_UNSUPPORTED_PATHS.add(os.path.normcase(os.path.abspath(path)))
+            except Exception:
+                try:
+                    from unified_image_processor import _LIBRAW_UNSUPPORTED_PATHS
+                    _LIBRAW_UNSUPPORTED_PATHS.add(os.path.normcase(os.path.abspath(path)))
+                except Exception:
+                    pass
             return False
 
         logger.info(
@@ -3629,6 +3644,22 @@ class SemanticImageIndex:
                         progress_album_total=progress_album_total,
                         progress_indexed_base=progress_indexed_base,
                     )
+                    from unified_image_processor import _LIBRAW_UNSUPPORTED_PATHS
+                    filtered_pending = []
+                    for cp, st in pending_for_semantic:
+                        norm_p = os.path.normcase(os.path.abspath(cp))
+                        if norm_p in _LIBRAW_UNSUPPORTED_PATHS:
+                            logger.info(f"[INDEX] Skipping unsupported/undecodable image: {os.path.basename(cp)}")
+                            try:
+                                self._mark_semantic_skipped(cp, st, conn)
+                                self._store_face_count(cp, 0, conn=conn, commit=False)
+                                batch_writes += 1
+                            except Exception as mark_exc:
+                                logger.debug(f"[INDEX] Could not mark skipped for {os.path.basename(cp)}: {mark_exc}")
+                        else:
+                            filtered_pending.append((cp, st))
+                    pending_for_semantic = filtered_pending
+                    total_sem = len(pending_for_semantic)
                     throttle_sec = semantic_gpu_throttle_seconds()
                     batch_size = self._auto_select_semantic_batch_size(
                         pending_for_semantic,

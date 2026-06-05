@@ -25,7 +25,8 @@ def close_native_splash():
 try:
     from PyQt6.QtWidgets import QApplication, QSplashScreen
     from PyQt6.QtGui import QPixmap, QColor, QPainter, QPen, QIcon
-    from PyQt6.QtCore import Qt, QEvent, QSize, QPoint
+    from PyQt6.QtCore import Qt, QEvent, QSize, QPoint, QLoggingCategory
+    QLoggingCategory.setFilterRules("qt.imageformats.tiff.warning=false\nqt.imageformats.warning=false\nqt.imageformats.tiff=false")
     
     def resource_path(relative_path):
         """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -721,6 +722,7 @@ def _macos_try_force_dark_titlebar_for_window(widget):
 logging.getLogger('PIL').setLevel(logging.ERROR)
 # rawpy doesn't always use standard logging, but we'll try to catch it if it does
 logging.getLogger('rawpy').setLevel(logging.ERROR)
+logging.getLogger('exifread').setLevel(logging.ERROR)
 
 safe_print("Basic imports done, importing PyQt6...", flush=True)
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -9099,14 +9101,34 @@ class RAWImageViewer(QMainWindow):
         # Repeated QMessageBox.exec() blocks user input and can look like folder switching is broken.
         import time
         now = time.time()
-        last_key = getattr(self, "_last_manager_error_key", None)
+        last_error_path = getattr(self, "_last_manager_error_path", None)
         last_t = getattr(self, "_last_manager_error_ts", 0.0)
-        key = (_norm_path(file_path), str(error_message))
-        if key == last_key and (now - last_t) < 2.0:
+        norm_p = _norm_path(file_path)
+        if last_error_path == norm_p and (now - last_t) < 5.0:
             return
-        self._last_manager_error_key = key
+        self._last_manager_error_path = norm_p
         self._last_manager_error_ts = now
-        self.show_error("Load Error", f"Failed to load image: {error_message}")
+        
+        # Check if the error indicates an unsupported RAW format or decoding failure
+        lower_err = error_message.lower()
+        is_unsupported = any(term in lower_err for term in ("unsupported", "decode", "returned none", "failed"))
+        
+        if is_unsupported:
+            try:
+                from raw_file_extensions import get_supported_extensions
+                exts = get_supported_extensions()
+            except Exception:
+                exts = ['.arw', '.cr2', '.nef', '.dng', '.jpg', '.jpeg', '.png']
+            
+            dialog = CustomWarningDialog(
+                self,
+                title="Unsupported File Format",
+                message=f"The file '{os.path.basename(file_path)}' is not supported by SkySpotter or is corrupt.",
+                informative_text=f"Check if the file is corrupt. Supported formats list: {', '.join(exts)}"
+            )
+            dialog.exec()
+        else:
+            self.show_error("Load Error", f"Failed to load image: {error_message}")
         
         # Graceful handling for ejected volumes or missing files
         if not os.path.exists(file_path):
@@ -10855,6 +10877,13 @@ class RAWImageViewer(QMainWindow):
     def _on_semantic_index_progress(self, token, i, n, message):
         if token != self._semantic_index_active_token:
             return
+            
+        # Dynamically load newly warmed thumbnails into gallery view to speed up scrolling/display
+        if getattr(self, "view_mode", "") == "gallery":
+            gj = getattr(self, "gallery_justified", None)
+            if gj is not None and hasattr(gj, "_request_load_visible_images"):
+                gj._request_load_visible_images(0)
+
         if not getattr(self, "_gallery_search_show_index_progress", False):
             return
         msg = str(message or "").strip()
@@ -11034,6 +11063,13 @@ class RAWImageViewer(QMainWindow):
     def _on_face_index_progress(self, token, i, n, message):
         if token != getattr(self, "_face_index_active_token", None):
             return
+            
+        # Dynamically load newly warmed thumbnails into gallery view to speed up scrolling/display
+        if getattr(self, "view_mode", "") == "gallery":
+            gj = getattr(self, "gallery_justified", None)
+            if gj is not None and hasattr(gj, "_request_load_visible_images"):
+                gj._request_load_visible_images(0)
+
         msg = str(message or "").strip()
         if msg and self._should_show_search_index_progress(msg):
             self._set_gallery_search_status(msg)
