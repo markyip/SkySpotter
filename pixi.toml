@@ -1,10 +1,10 @@
 [workspace]
 name = "skyspotter"
-version = "1.0.0"
+version = "2.3.0"
 description = "SkySpotter - Aviation Specialist Image Viewer"
 authors = ["Mark Yip"]
 channels = ["conda-forge"]
-platforms = ["win-64"]
+platforms = ["win-64", "osx-arm64", "osx-64"]
 
 # pyexiv2 arm64 wheels target macOS 14+ (macosx_14_0_arm64); Intel wheels use macosx_13_0_x86_64.
 [system-requirements]
@@ -53,6 +53,7 @@ full = { features = ["dev-ml", "semantic-search"], solve-group = "default" }
 [activation.env]
 PYTHONNOUSERSITE = "1"
 SkySpotter_FEATURES_FILE = "config/skyspotter_features.json"
+RAWVIEWER_GPU_VIEW = "1"
 
 [dependencies]
 python = ">=3.10,<3.13"
@@ -86,4 +87,10 @@ torch = "*"
 torchvision = "*"
 transformers = "*"
 
+# macOS EXIF (Exiv2). After `pixi install`, ensure native libs: brew install inih gettext
+[target.osx-arm64.pypi-dependencies]
+pyexiv2 = ">=2.15.4"
+
+[target.osx-64.pypi-dependencies]
+pyexiv2 = ">=2.15.4"
 

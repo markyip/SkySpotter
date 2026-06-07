@@ -47,13 +47,17 @@ def _jpeg_bytes_max_edge(jpeg_data: bytes, max_edge: int) -> bytes:
     if not jpeg_data or max_edge <= 0:
         return jpeg_data
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
         import io
 
         pil_image = Image.open(io.BytesIO(jpeg_data))
+        pil_image = ImageOps.exif_transpose(pil_image)
         w, h = pil_image.size
         if max(w, h) <= max_edge:
-            return jpeg_data
+            # We must re-save to strip EXIF orientation and ensure it stays rotated.
+            out = io.BytesIO()
+            pil_image.save(out, format="JPEG", quality=85)
+            return out.getvalue()
         scale = max_edge / float(max(w, h))
         new_w = max(1, int(w * scale))
         new_h = max(1, int(h * scale))
@@ -79,6 +83,11 @@ def _exif_cache_path_key(file_path: str) -> str:
     if os.sep == "\\":
         key = key.replace("/", "\\")
     return key
+
+
+def _cache_path_key(file_path: str) -> str:
+    """Normalized path key for thumbnail/grid/preview caches (matches semantic canonical paths on Windows)."""
+    return _exif_cache_path_key(file_path)
 
 
 def _exif_sql_path_expr(column: str = "file_path") -> str:
@@ -835,12 +844,13 @@ class PersistentThumbnailCache:
     
     def _get_cache_file_path(self, file_path: str) -> str:
         """Generate cache file path from source file path."""
-        # Use hash of file path to avoid filesystem issues with long paths
-        path_hash = hashlib.md5(file_path.encode('utf-8')).hexdigest()
+        # Use hash of normalized path so case variants share one disk entry on Windows.
+        path_hash = hashlib.md5(_cache_path_key(file_path).encode('utf-8')).hexdigest()
         return os.path.join(self.cache_dir, f"{path_hash}.jpg")
     
     def get(self, file_path: str) -> Optional[bytes]:
         """Get cached JPEG thumbnail if still valid."""
+        key = _cache_path_key(file_path)
         file_size, file_mtime = self._get_file_hash(file_path)
         if file_size == 0:
             return None
@@ -850,7 +860,7 @@ class PersistentThumbnailCache:
             conn = self._get_connection()
             cursor = conn.execute(
                 "SELECT file_size, file_mtime, cache_file FROM thumbnail_cache WHERE file_path = ?",
-                (file_path,)
+                (key,)
             )
             row = cursor.fetchone()
             
@@ -870,6 +880,7 @@ class PersistentThumbnailCache:
     
     def put(self, file_path: str, jpeg_data: bytes) -> bool:
         """Cache JPEG thumbnail to disk."""
+        key = _cache_path_key(file_path)
         file_size, file_mtime = self._get_file_hash(file_path)
         if file_size == 0:
             return False
@@ -888,7 +899,7 @@ class PersistentThumbnailCache:
                     "INSERT OR REPLACE INTO thumbnail_cache "
                     "(file_path, file_size, file_mtime, cache_file, cached_time) "
                     "VALUES (?, ?, ?, ?, ?)",
-                    (file_path, file_size, file_mtime, cache_file, time.time())
+                    (key, file_size, file_mtime, cache_file, time.time())
                 )
                 conn.commit()
                 return True
@@ -903,12 +914,13 @@ class PersistentThumbnailCache:
     
     def remove(self, file_path: str) -> bool:
         """Remove cached thumbnail for a file."""
+        key = _cache_path_key(file_path)
         with self.lock:
             try:
                 conn = self._get_connection()
                 cursor = conn.execute(
                     "SELECT cache_file FROM thumbnail_cache WHERE file_path = ?",
-                    (file_path,)
+                    (key,)
                 )
                 row = cursor.fetchone()
                 
@@ -922,7 +934,7 @@ class PersistentThumbnailCache:
                         pass
                 
                 # Remove from database
-                cursor = conn.execute("DELETE FROM thumbnail_cache WHERE file_path = ?", (file_path,))
+                cursor = conn.execute("DELETE FROM thumbnail_cache WHERE file_path = ?", (key,))
                 conn.commit()
                 return cursor.rowcount > 0
             except Exception:
@@ -1181,6 +1193,10 @@ class ImageCache(QObject):
         self.memory_check_interval = 60  # seconds
         self.last_memory_check = 0
 
+    @staticmethod
+    def _path_key(file_path: str) -> str:
+        return _cache_path_key(file_path)
+
     def _check_memory_pressure(self) -> bool:
         """Check if we're under memory pressure and need to reduce cache sizes."""
         current_time = time.time()
@@ -1222,8 +1238,9 @@ class ImageCache(QObject):
         self.stats['thumbnail_requests'] += 1
         self._check_memory_pressure()
 
+        key = self._path_key(file_path)
         # Check in-memory cache first
-        thumbnail = self.thumbnail_cache.get(file_path)
+        thumbnail = self.thumbnail_cache.get(key)
         if thumbnail is not None:
             self.cache_hit.emit(file_path, 'thumbnail')
             return thumbnail
@@ -1238,7 +1255,7 @@ class ImageCache(QObject):
                 if thumbnail is None:
                     raise ValueError("decode_embedded_jpeg_bytes failed")
                 # Also cache in memory for faster subsequent access
-                self.thumbnail_cache.put(file_path, thumbnail.copy())
+                self.thumbnail_cache.put(key, thumbnail.copy())
                 self.cache_hit.emit(file_path, 'thumbnail')
                 return thumbnail
             except Exception:
@@ -1247,14 +1264,15 @@ class ImageCache(QObject):
         
         # --- Dynamic Mipmap Fallback ---
         # 1. Downsample from Grid cache (512px) if available
-        grid = self.grid_cache.get(file_path)
+        grid = self.grid_cache.get(key)
         if grid is None:
             grid_jpeg = self.disk_grid_cache.get(file_path)
             if grid_jpeg is not None:
                 try:
-                    from PIL import Image
+                    from PIL import Image, ImageOps
                     import io
                     pil_image = Image.open(io.BytesIO(grid_jpeg))
+                    pil_image = ImageOps.exif_transpose(pil_image)
                     if pil_image.mode != 'RGB':
                         pil_image = pil_image.convert('RGB')
                     grid = np.array(pil_image)
@@ -1285,14 +1303,15 @@ class ImageCache(QObject):
                 pass
                 
         # 2. Downsample from preview cache (memory or disk, up to ~512px) if available
-        preview = self.preview_cache.get(file_path)
+        preview = self.preview_cache.get(key)
         if preview is None:
             preview_jpeg = self.disk_preview_cache.get(file_path)
             if preview_jpeg is not None:
                 try:
-                    from PIL import Image
+                    from PIL import Image, ImageOps
                     import io
                     pil_image = Image.open(io.BytesIO(preview_jpeg))
+                    pil_image = ImageOps.exif_transpose(pil_image)
                     if pil_image.mode != 'RGB':
                         pil_image = pil_image.convert('RGB')
                     preview = np.array(pil_image)
@@ -1332,8 +1351,9 @@ class ImageCache(QObject):
             if thumbnail.shape[0] > 1024 or thumbnail.shape[1] > 1024:
                 # This should be handled by the caller, but safety check
                 return
+            key = self._path_key(file_path)
             # Cache in memory
-            self.thumbnail_cache.put(file_path, thumbnail.copy())
+            self.thumbnail_cache.put(key, thumbnail.copy())
             
             # If JPEG data is provided, also cache to disk
             if jpeg_data is not None:
@@ -1346,8 +1366,9 @@ class ImageCache(QObject):
         self.stats['grid_requests'] += 1
         self._check_memory_pressure()
 
+        key = self._path_key(file_path)
         # 1. Check in-memory grid cache
-        grid = self.grid_cache.get(file_path)
+        grid = self.grid_cache.get(key)
         if grid is not None:
             self.cache_hit.emit(file_path, 'grid')
             return grid
@@ -1356,27 +1377,29 @@ class ImageCache(QObject):
         jpeg_data = self.disk_grid_cache.get(file_path)
         if jpeg_data is not None:
             try:
-                from PIL import Image
+                from PIL import Image, ImageOps
                 import io
                 pil_image = Image.open(io.BytesIO(jpeg_data))
+                pil_image = ImageOps.exif_transpose(pil_image)
                 if pil_image.mode != 'RGB':
                     pil_image = pil_image.convert('RGB')
                 grid = np.array(pil_image)
-                self.grid_cache.put(file_path, grid.copy())
+                self.grid_cache.put(key, grid.copy())
                 self.cache_hit.emit(file_path, 'grid')
                 return grid
             except Exception:
                 self.disk_grid_cache.remove(file_path)
 
         # 3. Dynamic Mipmap Fallback 1: Downsample from preview tier
-        preview = self.preview_cache.get(file_path)
+        preview = self.preview_cache.get(key)
         if preview is None:
             preview_jpeg = self.disk_preview_cache.get(file_path)
             if preview_jpeg is not None:
                 try:
-                    from PIL import Image
+                    from PIL import Image, ImageOps
                     import io
                     pil_image = Image.open(io.BytesIO(preview_jpeg))
+                    pil_image = ImageOps.exif_transpose(pil_image)
                     if pil_image.mode != 'RGB':
                         pil_image = pil_image.convert('RGB')
                     preview = np.array(pil_image)
@@ -1407,14 +1430,15 @@ class ImageCache(QObject):
                 pass
 
         # 4. Dynamic Mipmap Fallback 2: Upsample from Thumbnail (256px)
-        thumb = self.thumbnail_cache.get(file_path)
+        thumb = self.thumbnail_cache.get(key)
         if thumb is None:
             thumb_jpeg = self.disk_thumbnail_cache.get(file_path)
             if thumb_jpeg is not None:
                 try:
-                    from PIL import Image
+                    from PIL import Image, ImageOps
                     import io
                     pil_image = Image.open(io.BytesIO(thumb_jpeg))
+                    pil_image = ImageOps.exif_transpose(pil_image)
                     if pil_image.mode != 'RGB':
                         pil_image = pil_image.convert('RGB')
                     thumb = np.array(pil_image)
@@ -1433,7 +1457,7 @@ class ImageCache(QObject):
                 new_h = max(1, int(h * scale))
                 grid_pil = pil_img.resize((new_w, new_h), Image.Resampling.BICUBIC)
                 grid = np.array(grid_pil)
-                self.grid_cache.put(file_path, grid.copy())
+                self.grid_cache.put(key, grid.copy())
                 return grid
             except Exception:
                 pass
@@ -1444,11 +1468,12 @@ class ImageCache(QObject):
     def put_grid(self, file_path: str, grid: np.ndarray, jpeg_data: bytes = None) -> None:
         """Cache a grid image (max 512px)."""
         if grid is not None:
+            key = self._path_key(file_path)
             # Ensure grid image is reasonable size (max 512x512)
             if grid.shape[0] > 512 or grid.shape[1] > 512:
                 return
             # Cache in memory
-            self.grid_cache.put(file_path, grid.copy())
+            self.grid_cache.put(key, grid.copy())
             
             # Cache on disk
             if self.persistent_cache_enabled:
@@ -1472,8 +1497,9 @@ class ImageCache(QObject):
         self.stats['preview_requests'] += 1
         self._check_memory_pressure()
 
+        key = self._path_key(file_path)
         # Check in-memory cache first
-        preview = self.preview_cache.get(file_path)
+        preview = self.preview_cache.get(key)
         if preview is not None:
             self.cache_hit.emit(file_path, 'preview')
             return preview
@@ -1484,14 +1510,15 @@ class ImageCache(QObject):
             jpeg_data = self.disk_grid_cache.get(file_path)
         if jpeg_data is not None:
              try:
-                from PIL import Image
+                from PIL import Image, ImageOps
                 import io
                 pil_image = Image.open(io.BytesIO(jpeg_data))
+                pil_image = ImageOps.exif_transpose(pil_image)
                 if pil_image.mode != 'RGB':
                     pil_image = pil_image.convert('RGB')
                 preview = np.array(pil_image)
                 # Also cache in memory
-                self.preview_cache.put(file_path, preview.copy())
+                self.preview_cache.put(key, preview.copy())
                 self.cache_hit.emit(file_path, 'preview')
                 return preview
              except Exception:
@@ -1503,7 +1530,8 @@ class ImageCache(QObject):
     def put_preview(self, file_path: str, preview: np.ndarray, jpeg_data: bytes = None) -> None:
         """Cache a preview image (memory); optional disk JPEG clamped to disk_preview_max_edge()."""
         if preview is not None:
-            self.preview_cache.put(file_path, preview.copy())
+            key = self._path_key(file_path)
+            self.preview_cache.put(key, preview.copy())
             if jpeg_data is not None:
                 cap = disk_preview_max_edge()
                 jpeg_data = _jpeg_bytes_max_edge(jpeg_data, cap)
@@ -1621,9 +1649,10 @@ class ImageCache(QObject):
 
     def invalidate_file(self, file_path: str) -> None:
         """Remove all cached data for a specific file."""
-        self.thumbnail_cache.remove(file_path)
-        self.grid_cache.remove(file_path)
-        self.preview_cache.remove(file_path)
+        key = self._path_key(file_path)
+        self.thumbnail_cache.remove(key)
+        self.grid_cache.remove(key)
+        self.preview_cache.remove(key)
         self.full_image_cache.remove(file_path)
         self.pixmap_cache.remove(file_path)
         self.disk_thumbnail_cache.remove(file_path)

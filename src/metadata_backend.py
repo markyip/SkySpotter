@@ -2,7 +2,7 @@
 EXIF read path: prefer pyexiv2 (Exiv2), fall back to exifread.
 
 Environment:
-  SkySpotter_EXIF_BACKEND=auto|pyexiv2|exifread
+  RAWVIEWER_EXIF_BACKEND=auto|pyexiv2|exifread
     auto   — try pyexiv2 first when installed, else exifread (default)
     pyexiv2 — only pyexiv2 (raises / empty dict if unusable)
     exifread — only exifread
@@ -23,12 +23,8 @@ from typing import Any, BinaryIO, Mapping
 _HAS_PYEXIV2 = None
 _pyexiv2 = None  # type: ignore
 
-from raw_file_extensions import RAW_FILE_EXTENSIONS
-
-def is_raw_file(file_path: str) -> bool:
-    """Check if file is a RAW format (case-insensitive extension check)."""
-    ext = os.path.splitext(file_path)[1].lower().lstrip(".")
-    return ext in RAW_FILE_EXTENSIONS
+import logging
+logging.getLogger("exifread").setLevel(logging.ERROR)
 
 def _ensure_pyexiv2():
     global _HAS_PYEXIV2, _pyexiv2
@@ -44,7 +40,7 @@ def _ensure_pyexiv2():
         _HAS_PYEXIV2 = False
     return _HAS_PYEXIV2
 
-_BACKEND = os.environ.get("SkySpotter_EXIF_BACKEND", "auto").strip().lower()
+_BACKEND = os.environ.get("RAWVIEWER_EXIF_BACKEND", "auto").strip().lower()
 
 
 def exif_backend_mode() -> str:

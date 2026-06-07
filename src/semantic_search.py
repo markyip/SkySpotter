@@ -30,7 +30,6 @@ import numpy as np
 from PIL import Image, ImageOps
 
 import metadata_backend
-from skyspotter_runtime import cache_root, env_get, env_flag, legacy_cache_root
 
 from raw_file_extensions import RAW_FILE_EXTENSIONS
 
@@ -57,20 +56,20 @@ def format_index_progress(stage: str, done: int, total: int) -> str:
 
 
 def semantic_embeddings_enabled() -> bool:
-    """CLIP/SigLIP embeddings for free-text image search (opt-in; off in SkySpotter builds)."""
+    """CLIP/SigLIP embeddings for free-text search (off in SkySpotter by default)."""
     try:
         from skyspotter_features import semantic_search_enabled
-
         if not semantic_search_enabled():
             return False
     except ImportError:
         pass
+    from skyspotter_runtime import env_flag
     return env_flag("ENABLE_SEMANTIC_SEARCH", default=False)
 
 
 def metadata_auto_index_enabled() -> bool:
     """Check if auto metadata indexing is enabled via environment."""
-    flag = env_get("AUTO_METADATA_INDEX", "1").lower()
+    flag = os.environ.get("RAWVIEWER_AUTO_METADATA_INDEX", "1").strip().lower()
     return flag in ("1", "true", "yes", "on")
 
 
@@ -81,7 +80,7 @@ def semantic_gpu_throttle_seconds() -> float:
     to reduce indexing pressure (e.g., keep UI extra responsive).
     Default is 0ms so indexing is not artificially slowed down.
     """
-    raw = env_get("SEMANTIC_GPU_THROTTLE_MS", "0")
+    raw = os.environ.get("RAWVIEWER_SEMANTIC_GPU_THROTTLE_MS", "0").strip()
     try:
         ms = float(raw)
     except Exception:
@@ -92,7 +91,7 @@ def semantic_gpu_throttle_seconds() -> float:
 
 def semantic_batch_max() -> int:
     """Upper cap for semantic ONNX batch size (auto-tune and forced)."""
-    raw = env_get("SEMANTIC_BATCH_MAX", "128")
+    raw = os.environ.get("RAWVIEWER_SEMANTIC_BATCH_MAX", "128").strip()
     try:
         v = int(raw)
     except Exception:
@@ -102,7 +101,7 @@ def semantic_batch_max() -> int:
 
 def semantic_batch_size() -> int:
     """Semantic ONNX batch size. Default 1 keeps legacy behavior."""
-    raw = env_get("SEMANTIC_BATCH_SIZE", "1")
+    raw = os.environ.get("RAWVIEWER_SEMANTIC_BATCH_SIZE", "1").strip()
     try:
         v = int(raw)
     except Exception:
@@ -112,7 +111,7 @@ def semantic_batch_size() -> int:
 
 def semantic_batch_size_forced() -> Optional[int]:
     """Return forced batch size when explicitly set by env, else None."""
-    raw = env_get("SEMANTIC_BATCH_SIZE", "")
+    raw = os.environ.get("RAWVIEWER_SEMANTIC_BATCH_SIZE", "").strip()
     if not raw:
         return None
     try:
@@ -124,12 +123,12 @@ def semantic_batch_size_forced() -> Optional[int]:
 
 def semantic_batch_auto_enabled() -> bool:
     """Auto tune semantic batch size when no forced batch is provided."""
-    raw = env_get("SEMANTIC_BATCH_AUTO", "1").lower()
+    raw = os.environ.get("RAWVIEWER_SEMANTIC_BATCH_AUTO", "1").strip().lower()
     return raw not in ("0", "false", "no", "off")
 
 
 def semantic_batch_tune_sample_count() -> int:
-    raw = env_get("SEMANTIC_BATCH_TUNE_SAMPLES", "32")
+    raw = os.environ.get("RAWVIEWER_SEMANTIC_BATCH_TUNE_SAMPLES", "32").strip()
     try:
         v = int(raw)
     except Exception:
@@ -138,8 +137,8 @@ def semantic_batch_tune_sample_count() -> int:
 
 
 def semantic_batch_tie_ratio() -> float:
-    """When throughput is within this ratio of the best, prefer a larger batch."""
-    raw = env_get("SEMANTIC_BATCH_TIE_RATIO", "0.92")
+    """On equal throughput (within this ratio of the best), prefer a larger batch."""
+    raw = os.environ.get("RAWVIEWER_SEMANTIC_BATCH_TIE_RATIO", "0.92").strip()
     try:
         r = float(raw)
     except Exception:
@@ -149,13 +148,13 @@ def semantic_batch_tie_ratio() -> float:
 
 def semantic_encode_prep_workers() -> int:
     """Parallel CPU workers for resize/load before ONNX image batch."""
-    raw = env_get("SEMANTIC_PREP_WORKERS", "")
+    raw = os.environ.get("RAWVIEWER_SEMANTIC_PREP_WORKERS", "").strip()
     if raw:
         try:
             return max(1, min(int(raw), 32))
         except Exception:
             pass
-    return max(1, min(8, os.cpu_count() or 4))
+    return max(1, min(16, os.cpu_count() or 4))
 
 
 def semantic_coreml_chunk_size() -> int:
@@ -175,7 +174,9 @@ def semantic_warm_thumbs_before_index() -> bool:
 
 
 def semantic_batch_candidates() -> List[int]:
-    raw = env_get("SEMANTIC_BATCH_CANDIDATES", "8,16,32,64,128")
+    raw = os.environ.get(
+        "RAWVIEWER_SEMANTIC_BATCH_CANDIDATES", "8,16,32,64,128"
+    ).strip()
     cap = semantic_batch_max()
     out: List[int] = []
     for item in raw.split(","):
@@ -198,8 +199,8 @@ def semantic_batch_candidates() -> List[int]:
     return uniq
 
 
-# Bump when auto-tune defaults/logic change so ~/.skyspotter_cache picks are refreshed.
-SEMANTIC_BATCH_TUNE_CACHE_VERSION = "v3"
+# Bump when auto-tune defaults/logic change so ~/.rawviewer_cache picks are refreshed.
+SEMANTIC_BATCH_TUNE_CACHE_VERSION = "v4"
 
 
 def _prep_mobileclip_image_chw_resized(file_path: str, size: tuple[int, int] = (256, 256)) -> np.ndarray:
@@ -217,7 +218,9 @@ def _prep_mobileclip_image_chw(file_path: str) -> np.ndarray:
 
 
 def _semantic_batch_cache_path() -> str:
-    return os.path.join(cache_root(), "semantic_batch_tuning.json")
+    return os.path.join(
+        os.path.expanduser("~"), ".rawviewer_cache", "semantic_batch_tuning.json"
+    )
 
 
 def _load_semantic_batch_cache() -> Dict[str, int]:
@@ -245,6 +248,46 @@ def _save_semantic_batch_cache(cache: Dict[str, int]) -> None:
 
 
 
+def _import_onnxruntime():
+    """Return onnxruntime module, or None if missing or broken (e.g. partial install)."""
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        return None
+    if not callable(getattr(ort, "InferenceSession", None)):
+        return None
+    return ort
+
+
+def _onnxruntime_availability_error() -> str:
+    ort = _import_onnxruntime()
+    if ort is None:
+        return (
+            "Broken or missing 'onnxruntime' dependency "
+            "(run: pixi run pip install --force-reinstall onnxruntime-gpu)"
+        )
+    if not callable(getattr(ort, "get_available_providers", None)):
+        return (
+            "Broken 'onnxruntime' install (missing get_available_providers; "
+            "run: pixi run pip install --force-reinstall onnxruntime-gpu)"
+        )
+    return ""
+
+
+def _ort_get_available_providers(ort=None) -> List[str]:
+    if ort is None:
+        ort = _import_onnxruntime()
+    if ort is None:
+        return ["CPUExecutionProvider"]
+    getter = getattr(ort, "get_available_providers", None)
+    if callable(getter):
+        try:
+            return list(getter())
+        except Exception:
+            pass
+    return ["CPUExecutionProvider"]
+
+
 def resolve_onnx_execution_providers(
     available: Optional[Sequence[str]] = None,
 ) -> List[str]:
@@ -257,15 +300,10 @@ def resolve_onnx_execution_providers(
     custom onnxruntime build, else CPU — source-only, not tested as a product target.
     Override with RAWVIEWER_ORT_PROVIDERS (comma-separated EP names).
     """
-    try:
-        import onnxruntime as ort
-    except ImportError:
-        return ["CPUExecutionProvider"]
-
     if available is None:
-        available = list(ort.get_available_providers())
+        available = _ort_get_available_providers()
 
-    override = env_get("ORT_PROVIDERS", "")
+    override = os.environ.get("RAWVIEWER_ORT_PROVIDERS", "").strip()
     if override:
         names = [p.strip() for p in override.split(",") if p.strip()]
         selected = [p for p in names if p in available]
@@ -306,7 +344,7 @@ def resolve_opencv_dnn_backend_target() -> tuple:
     """
     import cv2
 
-    override = env_get("FACE_DNN_TARGET", "").lower()
+    override = os.environ.get("RAWVIEWER_FACE_DNN_TARGET", "").strip().lower()
     backend_opencv = cv2.dnn.DNN_BACKEND_OPENCV
     target_cpu = cv2.dnn.DNN_TARGET_CPU
 
@@ -455,7 +493,7 @@ def _coreml_compute_units():
     """Core ML compute-unit preference for MobileCLIP on macOS."""
     import CoreML
 
-    raw = env_get("COREML_COMPUTE_UNITS", "all").lower()
+    raw = os.environ.get("RAWVIEWER_COREML_COMPUTE_UNITS", "all").strip().lower()
     mapping = {
         "cpu": CoreML.MLComputeUnitsCPUOnly,
         "gpu": CoreML.MLComputeUnitsCPUAndGPU,
@@ -484,9 +522,7 @@ def log_inference_acceleration_profile(force: bool = False) -> None:
         parts.append("semantic=Core ML (Apple GPU/ANE when available)")
     else:
         try:
-            import onnxruntime as ort
-
-            available = list(ort.get_available_providers())
+            available = _ort_get_available_providers()
             selected = resolve_onnx_execution_providers(available)
             parts.append(f"semantic=ONNX [{', '.join(selected)}]")
         except Exception:
@@ -507,15 +543,47 @@ def log_inference_acceleration_profile(force: bool = False) -> None:
         except Exception:
             parts.append("face=OpenCV YuNet (CPU)")
 
-    gpu_view = env_get("GPU_VIEW", "").lower()
-    if gpu_view in ("1", "true", "yes", "on"):
-        no_gl = env_get("GPU_VIEW_NO_GL", "").lower()
+    gpu_view = os.environ.get("RAWVIEWER_GPU_VIEW", "1").strip().lower()
+    if gpu_view not in ("0", "false", "no", "off"):
+        no_gl = os.environ.get("RAWVIEWER_GPU_VIEW_NO_GL", "").strip().lower()
         if no_gl in ("1", "true", "yes", "on"):
             parts.append("display=Qt raster viewport")
         else:
             parts.append("display=Qt OpenGL viewport (vendor-agnostic)")
 
     logger.info("[ACCEL] Inference profile: %s", "; ".join(parts))
+
+
+def _cached_index_source_array(cache, file_path: str) -> Optional[np.ndarray]:
+    """RGB array from ImageCache tiers usable for semantic/face indexing (gallery may warm preview/grid)."""
+    for getter_name in ("get_preview", "get_grid", "get_thumbnail"):
+        try:
+            arr = getattr(cache, getter_name)(file_path)
+            if arr is not None:
+                return np.asarray(arr, dtype=np.uint8)
+        except Exception:
+            continue
+    return None
+
+
+def _index_source_cache_tier(cache, file_path: str) -> str:
+    """Which ImageCache tier satisfied the lookup, or empty string if miss."""
+    for tier, getter_name in (
+        ("preview", "get_preview"),
+        ("grid", "get_grid"),
+        ("thumbnail", "get_thumbnail"),
+    ):
+        try:
+            arr = getattr(cache, getter_name)(file_path)
+            if arr is not None:
+                return tier
+        except Exception:
+            continue
+    return ""
+
+
+def _index_source_image_cached(cache, file_path: str) -> bool:
+    return _cached_index_source_array(cache, file_path) is not None
 
 
 def _load_index_source_image(file_path: str, max_size: int = 1024) -> Image.Image:
@@ -529,16 +597,19 @@ def _load_index_source_image(file_path: str, max_size: int = 1024) -> Image.Imag
     try:
         from image_cache import get_image_cache
         cache = get_image_cache()
-        for getter_name in ("get_thumbnail", "get_preview"):
-            try:
-                arr = getattr(cache, getter_name)(file_path)
-                if arr is not None:
-                    im = Image.fromarray(np.asarray(arr, dtype=np.uint8)).convert("RGB")
-                    _THREAD_LOCAL_DETECTORS.last_original_sizes = (im.width, im.height)
-                    im.thumbnail((max_size, max_size), Image.Resampling.BICUBIC)
-                    return im
-            except Exception:
-                continue
+        arr = _cached_index_source_array(cache, file_path)
+        if arr is not None:
+            im = Image.fromarray(arr).convert("RGB")
+            _THREAD_LOCAL_DETECTORS.last_original_sizes = (im.width, im.height)
+            im.thumbnail((max_size, max_size), Image.Resampling.BICUBIC)
+            tier = _index_source_cache_tier(cache, file_path)
+            if tier:
+                hits = getattr(_THREAD_LOCAL_DETECTORS, "index_source_cache_hits", None)
+                if hits is None:
+                    hits = {"preview": 0, "grid": 0, "thumbnail": 0}
+                    _THREAD_LOCAL_DETECTORS.index_source_cache_hits = hits
+                hits[tier] = int(hits.get(tier, 0)) + 1
+            return im
     except Exception:
         pass
 
@@ -702,13 +773,10 @@ class MobileCLIPCoreMLBackend:
     @staticmethod
     def _candidate_model_dirs() -> List[str]:
         dirs: List[str] = []
-        env_dir = env_get("MOBILECLIP_MODEL_DIR", "")
+        env_dir = os.environ.get("RAWVIEWER_MOBILECLIP_MODEL_DIR")
         if env_dir:
             dirs.append(env_dir)
-        dirs.append(os.path.join(cache_root(), "mobileclip_coreml"))
-        legacy_ml = os.path.join(legacy_cache_root(), "mobileclip_coreml")
-        if os.path.isdir(legacy_ml):
-            dirs.append(legacy_ml)
+        dirs.append(os.path.expanduser("~/.rawviewer_cache/mobileclip_coreml"))
         if getattr(sys, "frozen", False):
             exe_dir = os.path.dirname(sys.executable)
             meipass = getattr(sys, "_MEIPASS", None)
@@ -834,7 +902,7 @@ class MobileCLIPCoreMLBackend:
             url = Foundation.NSURL.fileURLWithPath_(path)
             
             # Persistent cache for compiled models to avoid O(seconds) re-compilation
-            cache_dir = os.path.join(cache_root(), "compiled_models")
+            cache_dir = os.path.expanduser("~/.rawviewer_cache/compiled_models")
             os.makedirs(cache_dir, exist_ok=True)
             
             try:
@@ -1092,9 +1160,10 @@ class MobileCLIPONNXBackend:
     @staticmethod
     def _candidate_model_dirs(variant: str = "b") -> List[str]:
         dirs: List[str] = []
-        env_dir = env_get("MOBILECLIP_MODEL_DIR", "")
+        env_dir = os.environ.get("RAWVIEWER_MOBILECLIP_MODEL_DIR")
         if env_dir:
             dirs.append(env_dir)
+            
         suffix = f"_{variant}" if variant != "b" else ""
         if getattr(sys, "frozen", False):
             # Prioritize the actual executable directory for external (non-bundled) models
@@ -1106,10 +1175,7 @@ class MobileCLIPONNXBackend:
             if hasattr(sys, "_MEIPASS"):
                 dirs.append(os.path.join(sys._MEIPASS, "models", f"mobileclip_onnx{suffix}"))
             
-        dirs.append(os.path.join(cache_root(), f"mobileclip_onnx{suffix}"))
-        legacy_onnx = os.path.join(legacy_cache_root(), f"mobileclip_onnx{suffix}")
-        if os.path.isdir(legacy_onnx):
-            dirs.append(legacy_onnx)
+        dirs.append(os.path.expanduser(f"~/.rawviewer_cache/mobileclip_onnx{suffix}"))
         
         module_dir = os.path.dirname(os.path.abspath(__file__))
         dirs.append(os.path.join(module_dir, "..", "models", f"mobileclip_onnx{suffix}"))
@@ -1126,10 +1192,9 @@ class MobileCLIPONNXBackend:
         return cls._candidate_model_dirs(variant)[0]
 
     def availability_error(self) -> str:
-        try:
-            import onnxruntime  # noqa: F401
-        except ImportError:
-            return "Missing 'onnxruntime' dependency"
+        err = _onnxruntime_availability_error()
+        if err:
+            return err
         if not os.path.exists(self.image_model_path):
             return f"Missing MobileCLIP image model: {self.IMAGE_MODEL_FILE}"
         if not os.path.exists(self.text_model_path):
@@ -1191,9 +1256,12 @@ class MobileCLIPONNXBackend:
     def _ensure_sessions(self):
         if self._image_session is not None:
             return
+        err = _onnxruntime_availability_error()
+        if err:
+            raise RuntimeError(err)
         import onnxruntime as ort
 
-        available = list(ort.get_available_providers())
+        available = _ort_get_available_providers(ort)
         selected_providers = resolve_onnx_execution_providers(available)
 
         import logging
@@ -1420,7 +1488,7 @@ def get_semantic_capture_times_for_paths(
     if not paths:
         return {}
     if db_path is None:
-        cache_dir = cache_root()
+        cache_dir = os.path.expanduser("~/.rawviewer_cache")
         db_path = os.path.join(cache_dir, "semantic_index.db")
     if not os.path.isfile(db_path):
         return {}
@@ -1470,7 +1538,7 @@ def get_semantic_capture_times_for_folder(
     if not folder_path:
         return {}
     if db_path is None:
-        cache_dir = cache_root()
+        cache_dir = os.path.expanduser("~/.rawviewer_cache")
         db_path = os.path.join(cache_dir, "semantic_index.db")
     if not os.path.isfile(db_path):
         return {}
@@ -1569,7 +1637,7 @@ class SemanticImageIndex:
 
     def __init__(self, db_path: Optional[str] = None, model_name: Optional[str] = None):
         if db_path is None:
-            cache_dir = cache_root()
+            cache_dir = os.path.expanduser("~/.rawviewer_cache")
             os.makedirs(cache_dir, exist_ok=True)
             db_path = os.path.join(cache_dir, "semantic_index.db")
         self.db_path = db_path
@@ -1588,7 +1656,7 @@ class SemanticImageIndex:
 
     def _wait_if_paused(self) -> None:
         """Helper to sleep/wait while the indexing process is paused."""
-        flag = env_get("INDEX_PAUSE_IN_GALLERY", "1").lower()
+        flag = os.environ.get("RAWVIEWER_INDEX_PAUSE_IN_GALLERY", "1").strip().lower()
         if flag not in ("1", "true", "yes", "on"):
             return
         while True:
@@ -2422,7 +2490,7 @@ class SemanticImageIndex:
                         _THREAD_LOCAL_DETECTORS = threading.local()
                     
                     # Ensure the model file is present
-                    cache_dir = os.path.join(cache_root(), "models")
+                    cache_dir = os.path.expanduser("~/.rawviewer_cache/models")
                     os.makedirs(cache_dir, exist_ok=True)
                     model_path = os.path.join(cache_dir, "face_detection_yunet_2023mar.onnx")
                     
@@ -2496,7 +2564,7 @@ class SemanticImageIndex:
                     if _FACE_DETECTOR_NET is None:
                         with _FACE_DETECTOR_LOCK:
                             if _FACE_DETECTOR_NET is None:
-                                models_dir = os.path.join(cache_root(), "models")
+                                models_dir = os.path.expanduser("~/.rawviewer_cache/models")
                                 os.makedirs(models_dir, exist_ok=True)
                                 
                                 prototxt_path = os.path.join(models_dir, "deploy.prototxt")
@@ -2679,10 +2747,8 @@ class SemanticImageIndex:
                 backend = self._mobileclip_backend or resolve_mobileclip_backend()
                 self._mobileclip_backend = backend
                 if isinstance(backend, MobileCLIPONNXBackend):
-                    import onnxruntime as ort
-
                     selected = resolve_onnx_execution_providers(
-                        list(ort.get_available_providers())
+                        _ort_get_available_providers()
                     )
                     ep = ",".join(selected)
                 else:
@@ -2772,7 +2838,13 @@ class SemanticImageIndex:
                 if tput > best_tput:
                     best_tput = tput
                     best_batch = cand
-                elif tput >= best_tput * tie_ratio and cand > best_batch:
+                elif (
+                    best_tput > 0
+                    and tput >= best_tput
+                    and tput >= best_tput * tie_ratio
+                    and cand > best_batch
+                ):
+                    # True tie only: never prefer a larger batch when it is slower.
                     best_batch = cand
 
         cache[cache_key] = int(best_batch)
@@ -2797,7 +2869,7 @@ class SemanticImageIndex:
     @staticmethod
     def _face_scan_worker_count() -> int:
         """Parallel face-detection workers (CPU). Override with RAWVIEWER_FACE_SCAN_WORKERS."""
-        raw = env_get("FACE_SCAN_WORKERS", "")
+        raw = os.environ.get("RAWVIEWER_FACE_SCAN_WORKERS", "").strip()
         if raw:
             try:
                 return max(1, min(16, int(raw)))
@@ -2808,7 +2880,7 @@ class SemanticImageIndex:
 
     @staticmethod
     def _face_scan_parallel_enabled() -> bool:
-        v = env_get("FACE_SCAN_PARALLEL", "1").lower()
+        v = os.environ.get("RAWVIEWER_FACE_SCAN_PARALLEL", "1").strip().lower()
         return v not in ("0", "false", "no", "off")
 
     @staticmethod
@@ -2817,13 +2889,13 @@ class SemanticImageIndex:
         When true, build_index finishes after metadata + semantic embeddings.
         Face backfill runs in a second background pass so search becomes usable sooner.
         """
-        v = env_get("INDEX_DEFER_FACE_SCAN", "1").lower()
+        v = os.environ.get("RAWVIEWER_INDEX_DEFER_FACE_SCAN", "1").strip().lower()
         return v not in ("0", "false", "no", "off")
 
     @staticmethod
     def _thumbnail_warm_before_face_scan() -> bool:
         # Default off: warming 6k+ RAWs before face scan blocks indexing for hours.
-        v = env_get("FACE_SCAN_WARM_THUMBS", "0").lower()
+        v = os.environ.get("RAWVIEWER_FACE_SCAN_WARM_THUMBS", "0").strip().lower()
         return v not in ("0", "false", "no", "off")
 
     @staticmethod
@@ -2832,7 +2904,7 @@ class SemanticImageIndex:
         Cap warm-up work so face indexing cannot appear frozen for giant albums.
         0 disables warm-up entirely; negative means unlimited.
         """
-        raw = env_get("FACE_SCAN_WARM_MAX_FILES", "256")
+        raw = os.environ.get("RAWVIEWER_FACE_SCAN_WARM_MAX_FILES", "256").strip()
         if raw:
             try:
                 return int(raw)
@@ -2843,7 +2915,7 @@ class SemanticImageIndex:
     @staticmethod
     def _face_scan_warm_max_seconds() -> float:
         """Best-effort warm-up deadline; exceeded budget continues with face scan directly."""
-        raw = env_get("FACE_SCAN_WARM_MAX_SECONDS", "25")
+        raw = os.environ.get("RAWVIEWER_FACE_SCAN_WARM_MAX_SECONDS", "25").strip()
         if raw:
             try:
                 return max(0.0, float(raw))
@@ -2854,7 +2926,7 @@ class SemanticImageIndex:
     @staticmethod
     def face_detection_max_edge() -> int:
         """Longest edge passed to YuNet/Vision (see _load_index_source_image in _detect_face_count)."""
-        raw = env_get("FACE_DETECT_MAX_EDGE", "")
+        raw = os.environ.get("RAWVIEWER_FACE_DETECT_MAX_EDGE", "").strip()
         if raw:
             try:
                 return max(320, min(2048, int(raw)))
@@ -2881,20 +2953,42 @@ class SemanticImageIndex:
             return 0
 
         cache = get_image_cache()
-        pending = [p for p in paths if cache.get_thumbnail(p) is None]
+        pending = [p for p in paths if not _index_source_image_cached(cache, p)]
+        already_cached = len(paths) - len(pending)
+        tier_counts = {"preview": 0, "grid": 0, "thumbnail": 0}
+        for p in paths:
+            if p in pending:
+                continue
+            tier = _index_source_cache_tier(cache, p) or "thumbnail"
+            tier_counts[tier] = tier_counts.get(tier, 0) + 1
         if not pending:
             logger.info(
-                "[INDEX] Semantic thumbnail warm-up: all %d paths already cached",
+                "[INDEX] Semantic thumbnail warm-up: all %d paths already in ImageCache "
+                "(preview=%d grid=%d thumb=%d)",
                 len(paths),
+                tier_counts.get("preview", 0),
+                tier_counts.get("grid", 0),
+                tier_counts.get("thumbnail", 0),
             )
             return 0
+        if already_cached:
+            logger.info(
+                "[INDEX] Semantic thumbnail warm-up: %d/%d already in ImageCache "
+                "(preview=%d grid=%d thumb=%d); %d still need extract",
+                already_cached,
+                len(paths),
+                tier_counts.get("preview", 0),
+                tier_counts.get("grid", 0),
+                tier_counts.get("thumbnail", 0),
+                len(pending),
+            )
 
-        workers = min(semantic_encode_prep_workers(), 8)
+        workers = min(semantic_encode_prep_workers(), 16)
         t0 = time.time()
         warmed = 0
 
         def _warm_one(path: str) -> bool:
-            if cache.get_thumbnail(path) is not None:
+            if _index_source_image_cached(cache, path):
                 return True
             try:
                 from enhanced_raw_processor import (
@@ -2917,21 +3011,6 @@ class SemanticImageIndex:
                     return True
             except Exception:
                 pass
-
-            # Heavy fallback on failure:
-            try:
-                from unified_image_processor import UnifiedImageProcessor, _LIBRAW_UNSUPPORTED_PATHS
-                thumb = UnifiedImageProcessor().process_thumbnail(path, allow_heavy_fallback=True)
-                if thumb is not None:
-                    return True
-                else:
-                    _LIBRAW_UNSUPPORTED_PATHS.add(os.path.normcase(os.path.abspath(path)))
-            except Exception:
-                try:
-                    from unified_image_processor import _LIBRAW_UNSUPPORTED_PATHS
-                    _LIBRAW_UNSUPPORTED_PATHS.add(os.path.normcase(os.path.abspath(path)))
-                except Exception:
-                    pass
             return False
 
         logger.info(
@@ -3010,7 +3089,7 @@ class SemanticImageIndex:
             return 0
 
         cache = get_image_cache()
-        pending = [p for p in paths if cache.get_thumbnail(p) is None]
+        pending = [p for p in paths if not _index_source_image_cached(cache, p)]
         if not pending:
             logger.info("[INDEX] Thumbnail warm-up: all %d face-scan paths already cached", len(paths))
             return 0
@@ -3028,7 +3107,7 @@ class SemanticImageIndex:
         warmed = 0
 
         def _warm_one(path: str) -> bool:
-            if cache.get_thumbnail(path) is not None:
+            if _index_source_image_cached(cache, path):
                 return True
             try:
                 from enhanced_raw_processor import (
@@ -3374,7 +3453,7 @@ class SemanticImageIndex:
         elif not _face_scan_product_flag():
             run_face_scan = False
         logger.info(f"[INDEX] Starting indexing of {len(file_paths)} file paths.")
-        if run_face_scan and sys.platform != "darwin":
+        if sys.platform != "darwin":
             logger.info("[VISION] Using OpenCV offline face scanner on Windows.")
 
         filtered_paths, skipped_raw_paths = self._filter_duplicate_raw_companions(file_paths)
@@ -3562,8 +3641,8 @@ class SemanticImageIndex:
             face_pending = self._face_pending_paths(conn, unique_canonical)
             total_face = len(face_pending)
             total_sem = len(pending_for_semantic)
-            if not _face_scan_product_flag():
-                run_face_scan = False
+            if run_face_scan is None:
+                run_face_scan = not self._defer_face_scan_during_build()
             run_face_inline = total_face > 0 and run_face_scan
 
             if total_face > 0 and not run_face_inline:
@@ -3591,10 +3670,8 @@ class SemanticImageIndex:
                             self._mobileclip_backend = backend
                             if isinstance(backend, MobileCLIPONNXBackend):
                                 try:
-                                    import onnxruntime as ort
-
                                     selected = resolve_onnx_execution_providers(
-                                        list(ort.get_available_providers())
+                                        _ort_get_available_providers()
                                     )
                                 except Exception:
                                     selected = ["CPUExecutionProvider"]
@@ -3644,22 +3721,6 @@ class SemanticImageIndex:
                         progress_album_total=progress_album_total,
                         progress_indexed_base=progress_indexed_base,
                     )
-                    from unified_image_processor import _LIBRAW_UNSUPPORTED_PATHS
-                    filtered_pending = []
-                    for cp, st in pending_for_semantic:
-                        norm_p = os.path.normcase(os.path.abspath(cp))
-                        if norm_p in _LIBRAW_UNSUPPORTED_PATHS:
-                            logger.info(f"[INDEX] Skipping unsupported/undecodable image: {os.path.basename(cp)}")
-                            try:
-                                self._mark_semantic_skipped(cp, st, conn)
-                                self._store_face_count(cp, 0, conn=conn, commit=False)
-                                batch_writes += 1
-                            except Exception as mark_exc:
-                                logger.debug(f"[INDEX] Could not mark skipped for {os.path.basename(cp)}: {mark_exc}")
-                        else:
-                            filtered_pending.append((cp, st))
-                    pending_for_semantic = filtered_pending
-                    total_sem = len(pending_for_semantic)
                     throttle_sec = semantic_gpu_throttle_seconds()
                     batch_size = self._auto_select_semantic_batch_size(
                         pending_for_semantic,
@@ -3826,6 +3887,20 @@ class SemanticImageIndex:
                     )
                 else:
                     logger.info(f"[INDEX] Skipping AI features neural pass (MobileCLIP) for {total_sem} files (metadata-only index).")
+                    
+                    # Warm the thumbnail cache in the background even if not doing semantic embeddings now!
+                    # This populates the cache for future gallery display and future semantic searches.
+                    warm_paths = [cp for cp, _ in pending_for_semantic]
+                    try:
+                        self._warm_thumbnail_cache_for_semantic_index(
+                            warm_paths,
+                            progress_callback,
+                            progress_album_total=progress_album_total,
+                            progress_indexed_base=progress_indexed_base,
+                        )
+                    except Exception as e:
+                        logger.warning(f"[INDEX] Background thumbnail warming failed: {e}")
+
                     for canonical_fp, st in pending_for_semantic:
                         self._wait_if_paused()
                         self._mark_metadata_ready_without_embedding(canonical_fp, st, conn)
@@ -3971,7 +4046,7 @@ class SemanticImageIndex:
 
         import logging
         logger = logging.getLogger(__name__)
-        logger.info(
+        logger.debug(
             "[INDEX] Pending scan: %d pending of %d paths in %.4fs (bulk)",
             len(pending),
             len(file_paths),

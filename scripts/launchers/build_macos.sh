@@ -1,12 +1,16 @@
-#!/bin/bash
+﻿#!/bin/bash
+# Build SkySpotter on macOS.
+# Repo root: scripts/launchers -> ../..
 
 set -e
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-cd "$ROOT"
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$REPO_ROOT"
 
-echo "SkySpotter macOS Build Script"
-echo "============================="
+VERSION="$(grep -E '^VERSION = ' "$REPO_ROOT/build.py" | sed -E 's/.*"([^"]+)".*/\1/')"
+VERSION="${VERSION:-2.3.0}"
+echo "SkySpotter macOS Build Script (v${VERSION})"
+echo "======================================"
 echo ""
 
 if [[ "$OSTYPE" != "darwin"* ]]; then
@@ -17,23 +21,27 @@ fi
 
 if ! command -v python3 &> /dev/null; then
     echo "[ERROR] python3 is not installed or not in PATH"
+    echo "Please install Python 3.10 or higher from https://www.python.org/"
     exit 1
 fi
 
 if [ ! -f "icons/appicon.icns" ]; then
     echo "[WARNING] Icon file not found: icons/appicon.icns"
+    echo "The app will be built without a custom icon."
 fi
 
-VENV_DIR="$ROOT/rawviewer_env"
+VENV_DIR="$REPO_ROOT/SkySpotter_env"
 PYTHON_BIN="$VENV_DIR/bin/python3"
 
 if [ ! -d "$VENV_DIR" ]; then
     echo "Creating virtual environment..."
     python3 -m venv "$VENV_DIR"
+    echo "Virtual environment created."
 fi
 
 if [ ! -x "$PYTHON_BIN" ]; then
     echo "[ERROR] Missing venv interpreter: $PYTHON_BIN"
+    echo "Remove the broken folder and re-run: rm -rf SkySpotter_env"
     exit 1
 fi
 
@@ -43,15 +51,26 @@ if command -v brew >/dev/null 2>&1; then
     echo "Checking Homebrew dependencies for pyexiv2 (inih, gettext)..."
     brew list inih &>/dev/null || brew install inih
     brew list gettext &>/dev/null || brew install gettext
+else
+    echo "[INFO] brew not on PATH. If the build fails on pyexiv2: install Homebrew, then: brew install inih gettext"
 fi
 
 echo "Upgrading pip..."
 "$PYTHON_BIN" -m pip install --upgrade pip
 
-echo "Installing dependencies..."
-"$PYTHON_BIN" -m pip install --upgrade PyQt6 rawpy send2trash pyinstaller natsort exifread pyexiv2 Pillow psutil numpy qtawesome pyqtgraph reverse-geocoder pycountry huggingface-hub pyobjc-framework-Cocoa pyobjc-framework-CoreML pyobjc-framework-Quartz pyobjc-framework-Vision onnxruntime tokenizers sentencepiece protobuf onnxscript torchvision
+echo "Installing core dependencies..."
+"$PYTHON_BIN" -m pip install --upgrade PyQt6 rawpy send2trash pyinstaller natsort exifread Pillow psutil numpy scipy qtawesome pyqtgraph reverse-geocoder pycountry huggingface-hub requests pyobjc-framework-Cocoa pyobjc-framework-CoreML pyobjc-framework-Quartz pyobjc-framework-Vision
 
-"$PYTHON_BIN" -m pip uninstall -y sentence-transformers torch torchvision transformers scikit-learn scipy safetensors coremltools >/dev/null 2>&1 || true
+echo "Installing required dependency: pyexiv2..."
+if ! "$PYTHON_BIN" -m pip install --upgrade pyexiv2; then
+    echo "[ERROR] pyexiv2 install failed (required for macOS release builds)."
+    echo "  Install native libraries, then re-run:"
+    echo "    brew install inih gettext"
+    exit 1
+fi
+echo "[INFO] pyexiv2 installed (Exiv2 / focus-point path enabled)."
+
+"$PYTHON_BIN" -m pip uninstall -y sentence-transformers torch torchvision transformers scikit-learn tokenizers safetensors coremltools >/dev/null 2>&1 || true
 
 echo "Cleaning previous builds..."
 chmod -R u+w build dist 2>/dev/null || true
@@ -60,16 +79,28 @@ chmod -R u+w dist 2>/dev/null || true
 rm -rf dist || true
 rm -f *.spec
 
-echo "Building SkySpotter..."
+echo "Building SkySpotter (GPU single-image viewport enabled by default)..."
 if "$PYTHON_BIN" build.py; then
     echo ""
     echo "[SUCCESS] Build completed!"
+    echo ""
+
     if [ -d "dist/SkySpotter.app" ]; then
-        echo "  dist/SkySpotter.app"
-    elif [ -d "dist/RAWviewer.app" ]; then
-        echo "  dist/RAWviewer.app"
+        echo "macOS App Bundle created: dist/SkySpotter.app (v${VERSION})"
+        echo ""
+        echo "To run without installing:"
+        echo "  xattr -cr dist/SkySpotter.app && open dist/SkySpotter.app"
+    elif [ -f "dist/SkySpotter/SkySpotter" ] || [ -f "dist/SkySpotter" ]; then
+        echo "Executable created under dist/SkySpotter/"
+        echo ""
+        echo "To run the app:"
+        echo "  open dist/SkySpotter.app  # or run from dist/SkySpotter/"
+    else
+        echo "[WARNING] Build completed but output files not found in expected location"
+        echo "Check the dist/ directory for output files"
     fi
 else
-    echo "[ERROR] Build failed."
+    echo ""
+    echo "[ERROR] Build failed. Check the error messages above."
     exit 1
 fi
