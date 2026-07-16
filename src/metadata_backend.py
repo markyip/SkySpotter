@@ -134,7 +134,7 @@ def rotate_exif_orientation_meta_cw90(path: str) -> None:
     if not has_pyexiv2() or _pyexiv2 is None:
         raise RuntimeError(
             "Rotating RAW files updates metadata only (sensor pixels are unchanged) and "
-            "requires pyexiv2 (Exiv2). Install pyexiv2 for your platform (see RAWviewer "
+            "requires pyexiv2 (Exiv2). Install pyexiv2 for your platform (see SkySpotter "
             "requirements / build scripts)."
         )
     o = read_exif_orientation(path)
@@ -324,7 +324,13 @@ def process_file_from_path(
         ext = os.path.splitext(path)[1].lower().lstrip(".")
         from raw_file_extensions import RAW_FILE_EXTENSIONS
         if ext in RAW_FILE_EXTENSIONS:
-            return _exifread_process_path(path, details=False, stop_tag=stop_tag)
+            tags = _exifread_process_path(path, details=False, stop_tag=stop_tag)
+            # Canon CR2/CR3: exifread header-only reads often omit orientation and capture time.
+            if (ext in ("cr2", "cr3") or len(tags) < 3) and has_pyexiv2():
+                py_tags = _pyexiv2_tags(path)
+                if py_tags:
+                    return py_tags
+            return tags
 
         if has_pyexiv2():
             tags = _pyexiv2_tags(path)

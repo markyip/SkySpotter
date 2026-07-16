@@ -7,17 +7,20 @@ import os
 from typing import Dict, List, Optional, Set
 
 import numpy as np
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer
-from PyQt6.QtGui import QPixmap, QImage, QWheelEvent, QKeyEvent, QTransform
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer, QUrl, QMimeData, QPoint
+from PyQt6.QtGui import QPixmap, QImage, QWheelEvent, QKeyEvent, QTransform, QDrag
 from PyQt6.QtWidgets import (
     QFrame,
     QLabel,
     QScrollArea,
     QWidget,
+    QApplication,
 )
 
-# Single justified row (same idea as gallery row: width = row_height * aspect)
-ROW_H = 66
+from SkySpotter_ui.widgets import stamp_rawviewer_export_drag
+
+# Single justified row
+ROW_H = 78
 MIN_GAP = 2
 SIDE_MARGIN = 4
 MIN_CELL_W = 14
@@ -39,7 +42,7 @@ _LAZY_WARM_THRESHOLD = _filmstrip_env_int(
 _WARM_BAND = _filmstrip_env_int("FILMSTRIP_WARM_BAND", 56, minimum=8)
 # Uniform inset inside each cell so portrait/landscape share the same padding.
 CELL_BORDER = 2
-THUMB_PAD_V = 5
+THUMB_PAD_V = 2
 THUMB_PAD_H = 2
 # Rebuild layout when stored aspect differs from measured thumb aspect.
 ASPECT_REBUILD_EPS = 0.02
@@ -60,21 +63,90 @@ def _thumbnail_to_pixmap(thumbnail) -> Optional[QPixmap]:
     if isinstance(thumbnail, QPixmap):
         return thumbnail if not thumbnail.isNull() else None
     if isinstance(thumbnail, QImage):
-        return QPixmap.fromImage(thumbnail) if not thumbnail.isNull() else None
+        if thumbnail.isNull():
+            return None
+        rgb = thumbnail.convertToFormat(QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(rgb) if not rgb.isNull() else None
     try:
         arr = np.ascontiguousarray(thumbnail)
-        h, w = arr.shape[:2]
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr], axis=-1)
+        elif arr.ndim == 3 and arr.shape[2] == 1:
+            arr = np.repeat(arr, 3, axis=2)
+        h, w, c = arr.shape[:3]
         if h <= 0 or w <= 0:
             return None
-        channels = arr.shape[2] if len(arr.shape) > 2 else 1
-        if channels == 1:
-            qimg = QImage(arr.data, w, h, w, QImage.Format.Format_Grayscale8).copy()
+        if c == 3:
+            bpl = arr.strides[0]
+            qimg = QImage(arr.data, w, h, bpl, QImage.Format.Format_RGB888).copy()
+        elif c == 4:
+            bpl = arr.strides[0]
+            qimg = QImage(arr.data, w, h, bpl, QImage.Format.Format_RGBA8888).copy()
         else:
-            bpl = 3 * w
-            qimg = QImage(arr.data.tobytes(), w, h, bpl, QImage.Format.Format_RGB888)
+            return None
         return QPixmap.fromImage(qimg)
     except Exception:
         return None
+
+
+class FilmstripCell(QLabel):
+    clicked = pyqtSignal(int, object)  # index, QMouseEvent
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.index = -1
+        self.file_path = ""
+        self._drag_start_pos = None
+        self._drag_started = False
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.file_path:
+            self._drag_start_pos = event.position().toPoint()
+            self._drag_started = False
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not (event.buttons() & Qt.MouseButton.LeftButton) or not self.file_path:
+            super().mouseMoveEvent(event)
+            return
+
+        if self._drag_start_pos is not None and not self._drag_started:
+            dist = (event.position().toPoint() - self._drag_start_pos).manhattanLength()
+            if dist >= QApplication.startDragDistance():
+                self._drag_started = True
+                self._start_drag()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            drag_started = self._drag_started
+            self._drag_start_pos = None
+            self._drag_started = False
+            if not drag_started and self.index >= 0:
+                self.clicked.emit(self.index, event)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def _start_drag(self):
+        if not self.file_path or not os.path.exists(self.file_path):
+            return
+        
+        drag = QDrag(self)
+        mime_data = QMimeData()
+        mime_data.setUrls([QUrl.fromLocalFile(self.file_path)])
+        stamp_rawviewer_export_drag(mime_data)
+        drag.setMimeData(mime_data)
+        
+        px = self.pixmap()
+        if px and not px.isNull():
+            drag_px = px.scaled(100, 100, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            drag.setPixmap(drag_px)
+            drag.setHotSpot(QPoint(drag_px.width() // 2, drag_px.height() // 2))
+            
+        drag.exec(Qt.DropAction.CopyAction)
 
 
 class FilmStripBar(QFrame):
@@ -91,8 +163,8 @@ class FilmStripBar(QFrame):
         self.setStyleSheet(
             """
             QFrame#filmstrip_bar {
-                background-color: rgba(24, 24, 24, 230);
-                border-top: 1px solid #3A3A3A;
+                background-color: rgba(20, 18, 15, 230);
+                border-top: 1px solid #3A332A;
             }
             QLabel#filmstrip_cell {
                 background-color: transparent;
@@ -104,8 +176,16 @@ class FilmStripBar(QFrame):
             }
             QLabel#filmstrip_cell_selected {
                 background-color: rgba(51, 51, 51, 120);
-                border: 2px solid #5CB8FF;
+                border: 2px solid #d9691e;
                 border-radius: 3px;
+                padding: 0px;
+            }
+            QLabel#filmstrip_batch_badge {
+                color: #D9A441;
+                font-size: 11px;
+                font-weight: 700;
+                background: transparent;
+                border: none;
                 padding: 0px;
             }
             """
@@ -125,6 +205,7 @@ class FilmStripBar(QFrame):
         self._thumb_gen: Dict[str, int] = {}
         self._path_to_index: Dict[str, int] = {}
         self._generation = 0
+        self._bookmarked_norm: Set[str] = set()
         # Measured slot widths from decoded/scaled thumbs (survives layout rebuilds).
         self._measured_widths: Dict[str, int] = {}
 
@@ -144,7 +225,7 @@ class FilmStripBar(QFrame):
         self._scroll.setWidget(self._content)
 
         layout_outer = __import__("PyQt6.QtWidgets", fromlist=["QVBoxLayout"]).QVBoxLayout(self)
-        layout_outer.setContentsMargins(0, 4, 0, 4)
+        layout_outer.setContentsMargins(0, 2, 0, 2)
         layout_outer.addWidget(self._scroll)
 
         self._scroll.horizontalScrollBar().valueChanged.connect(self._on_scroll)
@@ -165,7 +246,7 @@ class FilmStripBar(QFrame):
         self._content.setMouseTracking(True)
 
     def sizeHint(self):
-        return QSize(-1, ROW_H + 8)
+        return QSize(-1, ROW_H + 4)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -417,7 +498,11 @@ class FilmStripBar(QFrame):
             return None
         try:
             # FAST IN-MEMORY CHECK ONLY to avoid blocking UI thread on thousands of files!
-            thumb = viewer.image_cache.thumbnail_cache.get(path)
+            # Grid tier (~512px) is now the film strip's authoritative source, same as
+            # gallery tiles; 256px thumbnail tier is only a fallback.
+            thumb = viewer.image_cache.grid_cache.get(path)
+            if thumb is None:
+                thumb = viewer.image_cache.thumbnail_cache.get(path)
             if thumb is None:
                 return None
         except Exception:
@@ -521,7 +606,9 @@ class FilmStripBar(QFrame):
         if viewer is None or not hasattr(viewer, "image_cache"):
             return False
         try:
-            thumb = viewer.image_cache.get_thumbnail(path)
+            thumb = viewer.image_cache.get_grid(path)
+            if thumb is None:
+                thumb = viewer.image_cache.get_thumbnail(path)
         except Exception:
             return False
         if thumb is None:
@@ -674,6 +761,7 @@ class FilmStripBar(QFrame):
         y = max(0, (self._content.height() - ROW_H) // 2)
         cell.setFixedSize(w, ROW_H)
         cell.setGeometry(x, y, w, ROW_H)
+        self._position_bookmark_badge(cell)
 
     def _on_scroll(self, _value: int) -> None:
         self._reload_timer.start(16)
@@ -714,6 +802,9 @@ class FilmStripBar(QFrame):
             if path:
                 self._active_paths.discard(path)
             self._clear_cell_thumbnail(cell)
+            badge = getattr(cell, "_bookmark_badge", None)
+            if badge is not None:
+                badge.hide()
             cell.setObjectName("filmstrip_cell")
             cell.setStyleSheet("")
             cell.hide()
@@ -729,7 +820,7 @@ class FilmStripBar(QFrame):
             cell.setObjectName("filmstrip_cell")
             cell.setStyleSheet("")
         else:
-            cell = QLabel(self._content)
+            cell = FilmstripCell(self._content)
             cell.setObjectName("filmstrip_cell")
             cell.setAlignment(Qt.AlignmentFlag.AlignCenter)
             cell.setScaledContents(False)
@@ -758,7 +849,13 @@ class FilmStripBar(QFrame):
         for idx in range(first, last + 1):
             path = self._files[idx]
             cell = self._acquire_cell(idx)
-            self._wire_cell(cell, idx)
+            cell.index = idx
+            cell.file_path = path
+            try:
+                cell.clicked.disconnect()
+            except Exception:
+                pass
+            cell.clicked.connect(self._on_cell_clicked)
             self._active_paths.add(path)
             self._thumb_gen[path] = self._generation
             if self._prepare_cell_for_path(cell, idx, path):
@@ -779,19 +876,55 @@ class FilmStripBar(QFrame):
         if needed_paths:
             self.thumbnails_needed.emit(needed_paths)
 
-    def _wire_cell(self, cell: QLabel, index: int) -> None:
-        def _on_click(event, i=index):
-            if event.button() == Qt.MouseButton.LeftButton:
-                self._pending_index = i
-                self._update_selection_style()
-                self.committed.emit(i)
-            event.accept()
+    def _on_cell_clicked(self, idx: int, event) -> None:
+        self._pending_index = idx
+        self._update_selection_style()
+        self.committed.emit(idx)
 
-        cell.mousePressEvent = _on_click
+    def _position_bookmark_badge(self, cell: QLabel) -> None:
+        badge = getattr(cell, "_bookmark_badge", None)
+        if badge is None or not badge.isVisible():
+            return
+        size = 14
+        margin = 2
+        badge.setFixedSize(size, size)
+        badge.move(
+            max(0, cell.width() - size - margin),
+            max(0, cell.height() - size - margin),
+        )
+        badge.raise_()
+
+    def _set_cell_bookmarked(self, cell: QLabel, bookmarked: bool) -> None:
+        badge = getattr(cell, "_bookmark_badge", None)
+        if bookmarked:
+            if badge is None:
+                badge = QLabel("★", cell)
+                badge.setObjectName("filmstrip_batch_badge")
+                badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                cell._bookmark_badge = badge
+            badge.show()
+            self._position_bookmark_badge(cell)
+        elif badge is not None:
+            badge.hide()
+
+    def set_bookmarked_norm_paths(self, norm_paths: Set[str]) -> None:
+        """Show star badges on filmstrip cells that are bookmarked (norm paths)."""
+        self._bookmarked_norm = set(norm_paths or set())
+        self._update_selection_style()
+
+    @staticmethod
+    def _norm_path(path: str) -> str:
+        return os.path.normcase(os.path.normpath(path or ""))
 
     def _update_selection_style(self) -> None:
         sel = self._pending_index
         for idx, cell in self._cells.items():
+            path = self._files[idx] if 0 <= idx < len(self._files) else ""
+            bookmarked = bool(
+                path
+                and self._bookmarked_norm
+                and self._norm_path(path) in self._bookmarked_norm
+            )
             if idx == sel:
                 cell.setObjectName("filmstrip_cell_selected")
             else:
@@ -799,6 +932,7 @@ class FilmStripBar(QFrame):
             cell.setStyleSheet("")
             cell.style().unpolish(cell)
             cell.style().polish(cell)
+            self._set_cell_bookmarked(cell, bookmarked)
 
     def _scroll_to_index_centered(self) -> None:
         if not self._files or self._pending_index < 0 or not self._starts:

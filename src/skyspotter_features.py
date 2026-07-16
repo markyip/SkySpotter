@@ -85,7 +85,7 @@ def blur_score_enabled() -> bool:
 
 
 def face_scan_enabled() -> bool:
-    """RAWviewer-style face-count indexing for ``people`` / ``portrait`` gallery filters."""
+    """SkySpotter-style face-count indexing for ``people`` / ``portrait`` gallery filters."""
     env = _flag_from_env("SkySpotter_ENABLE_FACE_SCAN")
     if env is not None:
         return env

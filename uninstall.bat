@@ -1,64 +1,167 @@
 @echo off
-setlocal
-:: SkySpotter Silent Uninstaller
-:: This script handles the automated removal of SkySpotter triggered by Windows Settings.
 
-:: Standardize Path: Get current directory WITHOUT trailing backslash
+:: SkySpotter Uninstaller v1.3
+
+setlocal EnableExtensions
+
+:: Handles removal from the install folder or Windows Settings (UninstallString).
+
+
+
 set "BASE_DIR=%~dp0"
+
 if "%BASE_DIR:~-1%"=="\" set "BASE_DIR=%BASE_DIR:~0,-1%"
 
-:: 1. If running as CLEANUP (from TEMP), perform the wipe
-if "%~1"=="__CLEANUP__" goto :CLEANUP
 
-:: 2. Migration to TEMP
-:: Since we can't delete the folder while this script is running from it,
-:: we copy ourselves to TEMP and launch from there.
-set "TEMP_SCRIPT=%TEMP%\uninstall_skyspotter_%RANDOM%.bat"
+
+if /I not "%~1"=="__CLEANUP__" goto :STAGE1
+
+goto :CLEANUP
+
+
+
+:STAGE1
+
+set "TEMP_SCRIPT=%TEMP%\uninstall_rawviewer_%RANDOM%.bat"
+
 copy /y "%~f0" "%TEMP_SCRIPT%" >nul
 
-:: Launch the second stage HIDDEN via PowerShell
-set "EXE_CMD=powershell.exe -WindowStyle Hidden -Command \"& '%TEMP_SCRIPT%' __CLEANUP__ '%BASE_DIR%'\""
-start "" %EXE_CMD%
-exit /b
+if errorlevel 1 (
 
-:CLEANUP
-set "TARGET_DIR=%~2"
+    echo Failed to prepare uninstaller.
 
-:: Wait a bit for the original launcher to exit
-timeout /t 2 /nobreak >nul
+    pause
 
-:: 3. Kill Processes
-:: Force-kill any lingering processes
-taskkill /F /T /IM SkySpotter.exe >nul 2>&1
-taskkill /F /T /IM SkySpotter_Setup.exe >nul 2>&1
-taskkill /F /T /IM SkySpotter_Uninstaller.exe >nul 2>&1
+    exit /b 1
 
-:: Fallback: PowerShell commandline match for python windowless processes
-powershell -Command "Get-CimInstance Win32_Process -Filter \"Name = 'python.exe' OR Name = 'pythonw.exe'\" | Where-Object { $_.CommandLine -match 'src[/\\]main\.py' -or $_.CommandLine -match 'src[/\\]bootstrap\.py' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >nul 2>&1
-
-:: 4. Remove Registry Keys
-reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\SkySpotter" /f >nul 2>&1
-
-:: 5. Remove Shortcuts
-set "START_MENU_PROG=%APPDATA%\Microsoft\Windows\Start Menu\Programs"
-if exist "%START_MENU_PROG%\SkySpotter.lnk" del /f /q "%START_MENU_PROG%\SkySpotter.lnk" >nul 2>&1
-
-set "DESKTOP_LNK=%USERPROFILE%\Desktop"
-if exist "%DESKTOP_LNK%\SkySpotter.lnk" del /f /q "%DESKTOP_LNK%\SkySpotter.lnk" >nul 2>&1
-
-:: 6. Wipe App Directory (with retry loop)
-set "RETRY=0"
-:RETRY_LOOP
-if exist "%TARGET_DIR%" (
-    rd /s /q "%TARGET_DIR%" >nul 2>&1
-    if exist "%TARGET_DIR%" (
-        set /a RETRY+=1
-        if %RETRY% LSS 10 (
-            timeout /t 2 /nobreak >nul
-            goto :RETRY_LOOP
-        )
-    )
 )
 
-:: 7. Vanish (Self-delete the temp script)
+start "" /min "%ComSpec%" /c call "%TEMP_SCRIPT%" __CLEANUP__ "%BASE_DIR%"
+
+exit /b 0
+
+
+
+:CLEANUP
+
+set "TARGET_DIR=%~2"
+
+if not defined TARGET_DIR set "TARGET_DIR=%BASE_DIR%"
+
+
+
+timeout /t 2 /nobreak >nul
+
+
+
+taskkill /F /T /IM SkySpotter.exe >nul 2>&1
+
+taskkill /F /T /IM RAWviewer_Setup.exe >nul 2>&1
+
+taskkill /F /T /IM RAWviewer_Uninstaller.exe >nul 2>&1
+
+
+
+set "TARGET_ESC=%TARGET_DIR:\=\\%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$td = $env:TARGET_ESC; Get-CimInstance Win32_Process -Filter \"Name = 'python.exe' OR Name = 'pythonw.exe' OR Name = 'pixi.exe'\" | Where-Object { $_.CommandLine -match 'src[/\\]main\.py' -or $_.CommandLine -match 'src[/\\]bootstrap\.py' -or ($td -and $_.CommandLine -like ('*' + $td + '*')) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+
+
+
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\SkySpotter" /f >nul 2>&1
+
+:: Remove file associations (Open With); keep HKCU\Software\SkySpotter QSettings unless FULL uninstall.
+reg delete "HKCU\Software\Classes\Applications\SkySpotter.exe" /f >nul 2>&1
+reg delete "HKCU\Software\Classes\SkySpotter.Image" /f >nul 2>&1
+reg delete "HKCU\Software\SkySpotter\Capabilities" /f >nul 2>&1
+reg delete "HKCU\Software\RegisteredApplications" /v SkySpotter /f >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$progId = 'SkySpotter.Image';" ^
+  "$exts = @('.cr2','.cr3','.nef','.arw','.dng','.orf','.rw2','.pef','.srw','.x3f','.raf','.3fr','.fff','.iiq','.cap','.erf','.mef','.mos','.nrw','.rwl','.srf','.jpeg','.jpg','.png','.webp','.heif','.heic','.tif','.tiff');" ^
+  "foreach ($ext in $exts) {" ^
+  "  $owp = \"HKCU:\\Software\\Classes\\$ext\\OpenWithProgids\";" ^
+  "  if (Test-Path -LiteralPath $owp) { Remove-ItemProperty -LiteralPath $owp -Name $progId -ErrorAction SilentlyContinue };" ^
+  "  $extKey = \"HKCU:\\Software\\Classes\\$ext\";" ^
+  "  if (Test-Path -LiteralPath $extKey) {" ^
+  "    $def = (Get-ItemProperty -LiteralPath $extKey -Name '(default)' -ErrorAction SilentlyContinue).'(default)';" ^
+  "    if ($def -eq $progId) { Remove-ItemProperty -LiteralPath $extKey -Name '(default)' -ErrorAction SilentlyContinue }" ^
+  "  };" ^
+  "  $owl = \"HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\$ext\\OpenWithList\";" ^
+  "  if (Test-Path -LiteralPath $owl) {" ^
+  "    $props = Get-ItemProperty -LiteralPath $owl;" ^
+  "    foreach ($name in @($props.PSObject.Properties.Name)) {" ^
+  "      if ($name -in @('PSPath','PSParentPath','PSChildName','PSDrive','PSProvider')) { continue };" ^
+  "      if ($props.$name -eq 'SkySpotter.exe') { Remove-ItemProperty -LiteralPath $owl -Name $name -ErrorAction SilentlyContinue }" ^
+  "    }" ^
+  "  }" ^
+  "}" >nul 2>&1
+
+if exist "%USERPROFILE%\.rawviewer_cache" rd /s /q "%USERPROFILE%\.rawviewer_cache" >nul 2>&1
+
+if /I "%RAWVIEWER_UNINSTALL_FULL%"=="1" (
+    reg delete "HKCU\Software\SkySpotter" /f >nul 2>&1
+)
+
+
+
+set "DESKTOP=%USERPROFILE%\Desktop"
+
+if exist "%DESKTOP%\SkySpotter.lnk" del /f /q "%DESKTOP%\SkySpotter.lnk" >nul 2>&1
+
+
+
+set "START_MENU_PROG=%APPDATA%\Microsoft\Windows\Start Menu\Programs"
+
+if exist "%START_MENU_PROG%\SkySpotter.lnk" del /f /q "%START_MENU_PROG%\SkySpotter.lnk" >nul 2>&1
+
+
+
+set "RETRY=0"
+
+:RETRY_LOOP
+
+if exist "%TARGET_DIR%" (
+
+    rd /s /q "%TARGET_DIR%" >nul 2>&1
+
+    if exist "%TARGET_DIR%" (
+
+        set /a RETRY+=1
+
+        if %RETRY% LSS 10 (
+
+            timeout /t 2 /nobreak >nul
+
+            goto :RETRY_LOOP
+
+        )
+
+    )
+
+)
+
+
+
+set "LOGS_DIR=%LOCALAPPDATA%\SkySpotter\logs"
+if exist "%LOGS_DIR%" rd /s /q "%LOGS_DIR%" >nul 2>&1
+if exist "%LOCALAPPDATA%\SkySpotter\map_tiles" rd /s /q "%LOCALAPPDATA%\SkySpotter\map_tiles" >nul 2>&1
+if exist "%LOCALAPPDATA%\SkySpotter" (
+    rd /s /q "%LOCALAPPDATA%\SkySpotter" >nul 2>&1
+)
+
+set "UNINSTALL_MSG=SkySpotter has been removed."
+
+if exist "%TARGET_DIR%" (
+
+    set "UNINSTALL_MSG=SkySpotter was removed from Windows, but some files could not be deleted. Close SkySpotter if it is still running, then delete the install folder manually."
+
+)
+if /I "%RAWVIEWER_UNINSTALL_FULL%"=="1" (
+    set "UNINSTALL_MSG=%UNINSTALL_MSG% User cache and preferences were also removed."
+)
+
+powershell -NoProfile -ExecutionPolicy Bypass -Command "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; [System.Windows.Forms.MessageBox]::Show($env:UNINSTALL_MSG,'SkySpotter Uninstall','OK','Information') | Out-Null"
+
+
+
 (goto) 2>nul & del "%~f0"
+

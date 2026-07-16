@@ -2,7 +2,7 @@
 SkySpotter runtime paths, settings, and environment variable names.
 
 Prefer SkySpotter_* env vars and ~/.skyspotter_cache; accept RAWVIEWER_* /
-~/.rawviewer_cache as legacy fallbacks. One-time migration moves legacy cache
+~/.skyspotter_cache as legacy fallbacks. One-time migration moves legacy cache
 and QSettings into SkySpotter locations when the new store is empty.
 """
 
@@ -14,11 +14,11 @@ from typing import Optional
 
 SETTINGS_ORG = "SkySpotter"
 SETTINGS_APP = "SkySpotter"
-LEGACY_SETTINGS_ORG = "RAWviewer"
-LEGACY_SETTINGS_APP = "RAWviewer"
+LEGACY_SETTINGS_ORG = "SkySpotter"
+LEGACY_SETTINGS_APP = "SkySpotter"
 
 CACHE_DIRNAME = ".skyspotter_cache"
-LEGACY_CACHE_DIRNAME = ".rawviewer_cache"
+LEGACY_CACHE_DIRNAME = ".skyspotter_cache"
 
 _cache_migrated = False
 _settings_migrated = False
@@ -111,7 +111,7 @@ def env_int(name: str, default: int, *, minimum: Optional[int] = None) -> int:
 
 
 def app_settings():
-    """QSettings for SkySpotter with one-time copy from legacy RAWviewer registry."""
+    """QSettings for SkySpotter with one-time copy from legacy SkySpotter registry."""
     from PyQt6.QtCore import QSettings
 
     settings = QSettings(SETTINGS_ORG, SETTINGS_APP)

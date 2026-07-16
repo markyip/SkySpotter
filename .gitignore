@@ -12,8 +12,6 @@ __pycache__/
 # IDE files
 .vscode/
 .idea/
-.cursor/
-.agent/
 .gemini/
 *.swp
 *.swo
@@ -43,22 +41,33 @@ desktop.ini
 *.PNG
 *.TIF
 *.TIFF
-
-# App/UI assets (allow icons despite image rules above)
-!icons/
-!icons/**
+# Brand icons (must remain tracked despite the image ignores above)
+!icons/appicon.png
+!icons/appicon-master.png
+!icons/appicon.ico
+!icons/appicon.icns
+!icons/favicon.png
+!icons/favicon-master.png
+!icons/favicon.ico
+!icons/folder_open_md3.svg
 
 # Log files
 *.log
 rawviewer_debug_*.log
 debug_*.log
 
-# Test files (repo root only)
+# Test files (ad-hoc root scripts — not the tracked testplan suite)
 test_images/
 sample_images/
 test_*.py
 *_test.py
 *_tests.py
+# Keep CI / auto regression tests under testplan/ (names are t_*.py, but
+# also un-ignore any test_*.py that land there by convention).
+!testplan/
+!testplan/**
+!testplan/auto/
+!testplan/auto/**
 
 # Debug and development files
 debug_*.py
@@ -91,13 +100,20 @@ C:*/
 
 # Local agent / IDE scratch (not part of the app)
 .agent/
+.claude/
+
+# Local planning / agent docs (not for release)
+docs/local/
+docs/macos-sharing-v21-v22.md
+docs/thumbnail-cache-unification-plan.md
+docs/windows-gallery-performance-investigation.md
 
 # Local MobileCLIP2 / OpenCLIP Core ML export trees (not part of the app bundle)
 .build/
 .hf_cache_mobileclip/
 artifacts/mobileclip2_coreml/
 
-# Bundled MobileCLIP2 Core ML (large)
+# Bundled MobileCLIP2 Core ML (large); export with scripts/export_mobileclip2_coreml.py --for-app
 models/mobileclip2_coreml/**
 !models/mobileclip2_coreml/.gitkeep
 
@@ -133,6 +149,7 @@ PERFORMANCE_ANALYSIS.md
 
 # Icon source assets
 icon.iconset/
+icons/concepts/
 
 # Tests directory (local scripts and reports)
 tests/
@@ -145,52 +162,29 @@ Untitled
 # Ad-hoc script outputs
 scripts/output/
 
-# Local one-off profiling scripts (hardcoded paths)
+# Local one-off profiling / cache-debug scripts (hardcoded paths)
 scripts/profile_*.py
+scripts/check_folder_cache.py
+
+# Local gallery crash repro / stress automation (keep locally; not for release)
+scripts/run_gallery_stress_tests.ps1
+scripts/stress_*.py
 
 # .NET build output (Windows share helper)
 src/windows_share_helper/bin/
 src/windows_share_helper/obj/
 
-# Aviation Specialist AI
-aviation_model_v2/
-old_semantic.py
+# Python packaging / test caches
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Training & test data (README + .gitkeep only — no images, checkpoints, or run outputs)
-training_data/classified_images/**
-!training_data/classified_images/.gitkeep
-!training_data/classified_images/README.md
+# Test plan: automation is tracked; perf baselines are per-machine
+testplan/baselines/
 
-training_data/processed_images/*
-!training_data/processed_images/.gitkeep
-!training_data/processed_images/README.md
+bench_results/
 
-testing_data/test_images/*
-!testing_data/test_images/.gitkeep
-!testing_data/test_images/README.md
-
-testing_data/test_output/*
-!testing_data/test_output/.gitkeep
-
-customized_model/*
-!customized_model/.gitkeep
-!customized_model/README.md
-
-# Local classifier PoC / batch test outputs (not for git)
-testing_data/poc_app_model_test_set/
-testing_data/test_output_app_model_test_set/
-
-# Training artifacts (keep weights under models/gallery-classifier/ only)
-app_model/*.safetensors
-app_model/*.json
-app_model/*.bin
-app_model/labels.txt
-!app_model/README.md
-poc_f35_output_legacy/
-poc_f35_output_legacy_pixi/
-poc_f35_output_legacy_pixi5/
-poc_f35_output_legacy_sample20/
-
-# Local cache / index artifacts
-.skyspotter_cache/
-semantic_index.db
+# Cursor Canvas / local IDE artifacts (never ship)
+*.canvas.tsx
+.cursor/
