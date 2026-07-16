@@ -56,6 +56,123 @@ def _bundled_resource_path(relative_path: str) -> str:
 import metadata_backend
 
 from raw_file_extensions import RAW_FILE_EXTENSIONS
+from exif_subject_area import pixmap_ltwh_focus_hint
+from onnxruntime_providers import (
+    create_onnxruntime_session,
+    dml_available,
+    onnxruntime_providers_prefer_dml,
+    prefer_directml_classifier,
+    rembg_uses_directml,
+    suggested_aircraft_classify_workers,
+)
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+_classifier_device_logged = False
+_AVIATION_THREAD_LOCAL = threading.local()
+_EMPTY_EMBEDDING_BLOB: bytes | None = None
+
+
+def _empty_embedding_blob() -> bytes:
+    """Reuse one empty embedding payload for aviation-only index rows."""
+    global _EMPTY_EMBEDDING_BLOB
+    if _EMPTY_EMBEDDING_BLOB is None:
+        _EMPTY_EMBEDDING_BLOB = np.asarray([], dtype=np.float32).tobytes()
+    return _EMPTY_EMBEDDING_BLOB
+
+
+def _resolve_classifier_torch_device():
+    """Pick ViT device. Override with SkySpotter_CLASSIFIER_DEVICE=cpu|cuda|mps."""
+    import torch
+
+    override = os.environ.get("SkySpotter_CLASSIFIER_DEVICE", "").strip().lower()
+    if override == "cpu":
+        return torch.device("cpu")
+    if override == "cuda":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        logger.warning(
+            "[MODEL] SkySpotter_CLASSIFIER_DEVICE=cuda but CUDA unavailable; using CPU"
+        )
+        return torch.device("cpu")
+    if override == "mps":
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        logger.warning(
+            "[MODEL] SkySpotter_CLASSIFIER_DEVICE=mps but MPS unavailable; using CPU"
+        )
+        return torch.device("cpu")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def _skyspotter_cache_root() -> str:
+    try:
+        from skyspotter_runtime import cache_root
+
+        return cache_root()
+    except Exception:
+        return os.path.expanduser(
+            os.environ.get("SkySpotter_CACHE_DIR", "~/.skyspotter_cache")
+        )
+
+
+def _checkpoint_dir_candidates(project_root: str) -> list[str]:
+    from gallery_model_paths import checkpoint_dir_candidates
+
+    return checkpoint_dir_candidates(project_root)
+
+
+def _classifier_min_crop_fraction() -> float:
+    try:
+        value = float(os.environ.get("SkySpotter_CLASSIFIER_MIN_CROP_FRACTION", "0.20"))
+        return min(1.0, max(0.01, value))
+    except (TypeError, ValueError):
+        return 0.20
+
+
+def _classifier_min_crop_thresholds(
+    source_width: int, source_height: int
+) -> tuple[int, int]:
+    w = max(1, int(source_width or 1))
+    h = max(1, int(source_height or 1))
+    pct = _classifier_min_crop_fraction()
+    min_w = max(1, int(round(w * pct)))
+    min_h = max(1, int(round(h * pct)))
+    floor_raw = (
+        os.environ.get("SkySpotter_CLASSIFIER_MIN_CROP_FLOOR", "").strip()
+        or os.environ.get("SkySpotter_CLASSIFIER_MIN_CROP_SIZE", "").strip()
+    )
+    if floor_raw:
+        try:
+            floor = max(1, int(floor_raw))
+            min_w = max(min_w, floor)
+            min_h = max(min_h, floor)
+        except ValueError:
+            pass
+    return min_w, min_h
+
+
+def _aircraft_rembg_max_size() -> int:
+    """Longest edge for rembg input (dominant cost). Default 768."""
+    try:
+        return max(320, min(2048, int(os.environ.get("SkySpotter_REMBG_MAX_SIZE", "768"))))
+    except (TypeError, ValueError):
+        return 768
+
+
+def _aircraft_index_max_size() -> int:
+    """Longest edge for aircraft index source load. Default 1024."""
+    try:
+        return max(256, min(2048, int(os.environ.get("SkySpotter_INDEX_MAX_SIZE", "1024"))))
+    except (TypeError, ValueError):
+        return 1024
+
 
 try:
     import pycountry
@@ -1357,7 +1474,13 @@ class MilitaryAircraftClassifier:
             return False
 
     def _legacy_bg_remove(self, image: Image.Image) -> Image.Image:
-        """Legacy PoC background removal: rembg isnet-general-use first."""
+        """Background removal via rembg isnet-general-use (downscaled for speed)."""
+        # rembg dominates classify cost — keep its input modest.
+        rembg_max = _aircraft_rembg_max_size()
+        work = image
+        if max(work.size) > rembg_max:
+            work = work.copy()
+            work.thumbnail((rembg_max, rembg_max), Image.Resampling.BILINEAR)
         try:
             from rembg import new_session, remove
 
@@ -1370,22 +1493,26 @@ class MilitaryAircraftClassifier:
                     "[AVIATION AI] rembg session initialized: isnet-general-use providers=%s",
                     providers,
                 )
-            return remove(image, session=self._rembg_session, alpha_matting=False)
+            return remove(work, session=self._rembg_session, alpha_matting=False)
         except Exception as e:
             if self._strict_rembg:
-                logger.warning("[AVIATION AI] strict rembg mode: rembg failed (%s), skip classification", e)
+                logger.warning(
+                    "[AVIATION AI] strict rembg mode: rembg failed (%s), skip classification",
+                    e,
+                )
                 raise
-            # Fallback to current app background remover.
             try:
                 from background_removal import get_background_remover
 
-                logger.warning("[AVIATION AI] rembg unavailable, fallback to background_removal pipeline: %s", e)
-                bg = get_background_remover().remove_background(image.convert("RGB"))
-                rgba = bg.convert("RGBA")
-                rgba.putalpha(Image.new("L", rgba.size, 255))
-                return rgba
+                logger.warning(
+                    "[AVIATION AI] rembg unavailable, fallback to background_removal pipeline: %s",
+                    e,
+                )
+                # U2-Net path already composites onto white RGB — keep as opaque RGBA.
+                bg = get_background_remover().remove_background(work.convert("RGB"))
+                return bg.convert("RGBA")
             except Exception:
-                return image.convert("RGBA")
+                return work.convert("RGBA")
 
     def _crop_below_classify_minimum(
         self,
@@ -1412,60 +1539,110 @@ class MilitaryAircraftClassifier:
         return True
 
     def _legacy_focus_blob_crop(self, file_path: str, image_rgba: Image.Image) -> tuple[Image.Image, str]:
-        """Match legacy PoC blob-selection logic (focus-overlap first, else largest blob)."""
-        try:
-            from skimage.measure import label, regionprops
-        except Exception:
-            return image_rgba.convert("RGB"), "legacy_no_skimage"
-
-        alpha = np.array(image_rgba.split()[-1])
+        """Focus-overlap blob first, else largest blob — avoid full-image RGBA copies."""
+        alpha = np.asarray(image_rgba.getchannel("A"), dtype=np.uint8)
         binary_mask = alpha > 20
-        labeled_mask = label(binary_mask)
-        props = regionprops(labeled_mask)
-        if not props:
+        if not np.any(binary_mask):
             return image_rgba.convert("RGB"), "legacy_empty_mask"
 
-        target_blob_label = None
-        focus_hint = pixmap_ltwh_focus_hint(file_path, image_rgba.width, image_rgba.height)
+        mode = "alpha_bbox"
+        ys, xs = np.where(binary_mask)
+        minr, maxr = int(ys.min()), int(ys.max()) + 1
+        minc, maxc = int(xs.min()), int(xs.max()) + 1
+
+        # Optional focus-aware blob (skimage) — only when EXIF focus hint exists.
+        focus_hint = pixmap_ltwh_focus_hint(
+            file_path, image_rgba.width, image_rgba.height
+        )
         if focus_hint:
-            ltwh, _ = focus_hint
-            cx = ltwh[0] + ltwh[2] / 2.0
-            cy = ltwh[1] + ltwh[3] / 2.0
-            for p in props:
-                minr, minc, maxr, maxc = p.bbox
-                if minc <= cx <= maxc and minr <= cy <= maxr:
-                    target_blob_label = p.label
-                    break
+            try:
+                from skimage.measure import label, regionprops
 
-        if target_blob_label is None:
-            target_blob_label = max(props, key=lambda p: p.area).label
-            mode = "largest_blob"
-        else:
-            mode = "focused_blob"
+                labeled_mask = label(binary_mask)
+                props = regionprops(labeled_mask)
+                if props:
+                    ltwh, _ = focus_hint
+                    # Scale focus hint if rembg input was downscaled vs original load size.
+                    cx = ltwh[0] + ltwh[2] / 2.0
+                    cy = ltwh[1] + ltwh[3] / 2.0
+                    # Clamp to rembg image coordinates.
+                    cx = min(max(cx, 0), image_rgba.width - 1)
+                    cy = min(max(cy, 0), image_rgba.height - 1)
+                    target = None
+                    for p in props:
+                        pr0, pc0, pr1, pc1 = p.bbox
+                        if pc0 <= cx <= pc1 and pr0 <= cy <= pr1:
+                            target = p
+                            break
+                    if target is None:
+                        target = max(props, key=lambda p: p.area)
+                        mode = "largest_blob"
+                    else:
+                        mode = "focused_blob"
+                    minr, minc, maxr, maxc = target.bbox
+            except Exception:
+                mode = "alpha_bbox"
 
-        blob_mask = labeled_mask == target_blob_label
-        new_alpha = np.where(blob_mask, alpha, 0).astype(np.uint8)
-        final_img = image_rgba.copy()
-        final_img.putalpha(Image.fromarray(new_alpha))
-        bbox = Image.fromarray(new_alpha).getbbox()
-        if not bbox:
-            return image_rgba.convert("RGB"), "legacy_empty_blob"
-        cropped = final_img.crop(bbox)
+        bbox = (minc, minr, maxc, maxr)
+        cropped = image_rgba.crop(bbox)
+        if cropped.mode != "RGBA":
+            cropped = cropped.convert("RGBA")
         bg = Image.new("RGB", cropped.size, (255, 255, 255))
-        bg.paste(cropped, mask=cropped.split()[-1])
+        bg.paste(cropped, mask=cropped.getchannel("A"))
         return bg, mode
 
     def _predict_with_torch(self, im_rgb: Image.Image) -> tuple[str, float]:
         import torch
 
-        inputs = self._torch_processor(images=im_rgb, return_tensors="pt").to(self._torch_device)
-        with torch.no_grad():
-            outputs = self._torch_model(**inputs)
-        probs = torch.nn.functional.softmax(outputs.logits, dim=-1)[0]
-        idx = int(torch.argmax(probs).item())
-        conf = float(probs[idx].item())
+        inputs = self._torch_processor(images=im_rgb, return_tensors="pt")
+        inputs = {k: v.to(self._torch_device) for k, v in inputs.items()}
+        try:
+            with torch.no_grad():
+                outputs = self._torch_model(**inputs)
+                probs = torch.nn.functional.softmax(outputs.logits, dim=-1)[0]
+                idx = int(torch.argmax(probs).item())
+                conf = float(probs[idx].item())
+        finally:
+            del inputs
+            try:
+                del outputs, probs
+            except Exception:
+                pass
+            if str(self._torch_device).startswith("cuda"):
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
         label = self.LABELS[idx] if idx < len(self.LABELS) else ""
         return label, conf
+
+    def release_resources(self) -> None:
+        """Drop rembg / ORT / torch handles to reclaim RAM after indexing."""
+        try:
+            sess = self._rembg_session
+            self._rembg_session = None
+            if sess is not None:
+                close = getattr(sess, "close", None)
+                if callable(close):
+                    close()
+        except Exception:
+            pass
+        try:
+            self._session = None
+        except Exception:
+            pass
+        try:
+            import torch
+
+            self._torch_model = None
+            self._torch_processor = None
+            if self._torch_device is not None and str(self._torch_device).startswith("cuda"):
+                torch.cuda.empty_cache()
+            self._torch_device = None
+        except Exception:
+            self._torch_model = None
+            self._torch_processor = None
+            self._torch_device = None
 
     def _export_checkpoint_to_onnx(self, progress_callback=None) -> bool:
         if not self._local_checkpoint_dir:
@@ -1594,11 +1771,12 @@ class MilitaryAircraftClassifier:
         Load source RGB, rembg RGBA, and classifier crop in one pass (avoids duplicate rembg).
 
         Returns (src_rgb, rgba, cropped_rgb). ``cropped_rgb`` is None if crop is too small.
+        Source load is capped by ``max_source_size`` and rembg's own max so we do not
+        decode/paint larger pixels than rembg will use.
         """
         try:
-            src = _load_index_source_image(
-                file_path, max_size=max(256, int(max_source_size))
-            ).convert("RGB")
+            load_max = max(256, min(int(max_source_size), _aircraft_rembg_max_size()))
+            src = _load_index_source_image(file_path, max_size=load_max).convert("RGB")
             rgba = self._legacy_bg_remove(src)
             cropped_rgb, _mode = self._legacy_focus_blob_crop(file_path, rgba)
             if self._crop_below_classify_minimum(cropped_rgb, src.size, file_path):
@@ -1860,10 +2038,13 @@ class MilitaryAircraftClassifier:
             if max_source_size is None:
                 try:
                     max_source_size = int(
-                        os.environ.get("SkySpotter_CLASSIFY_MAX_SIZE", "2048")
+                        os.environ.get(
+                            "SkySpotter_CLASSIFY_MAX_SIZE",
+                            str(_aircraft_index_max_size()),
+                        )
                     )
                 except (TypeError, ValueError):
-                    max_source_size = 2048
+                    max_source_size = _aircraft_index_max_size()
             max_sz = int(max_source_size)
             if prefer_directml_classifier():
                 label = self._classify_onnx_pipeline(
@@ -1885,126 +2066,10 @@ class MilitaryAircraftClassifier:
             return self.classify_from_subject_crop(
                 cropped_rgb, file_path, progress_callback
             )
-
-            import onnxruntime as ort
-            if self._session is None:
-                so = ort.SessionOptions()
-                so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                # Prioritize high-performance providers and keep only available
-                # runtime providers to avoid noisy ORT warnings on Windows.
-                providers = [
-                    "CoreMLExecutionProvider",
-                    "CUDAExecutionProvider", 
-                    "TensorrtExecutionProvider", 
-                    "DmlExecutionProvider", 
-                    "AzureExecutionProvider", 
-                    "CPUExecutionProvider"
-                ]
-                available = ort.get_available_providers()
-                selected = [p for p in providers if p in available]
-                if not selected:
-                    selected = ["CPUExecutionProvider"]
-                try:
-                    self._session = ort.InferenceSession(
-                        self.onnx_path, sess_options=so, providers=selected
-                    )
-                    active_p = self._session.get_providers()
-                    import logging
-                    logging.getLogger(__name__).warning(f"[AVIATION AI] Specialist Session initialized with: {active_p[0] if active_p else 'Unknown'}")
-                except Exception as e:
-                    import logging
-                    logging.getLogger(__name__).error(f"[AVIATION AI] Specialist GPU init failed ({e}), falling back to CPU")
-                    self._session = ort.InferenceSession(self.onnx_path, sess_options=so, providers=["CPUExecutionProvider"])
-                try:
-                    shape = list(self._session.get_inputs()[0].shape)
-                    h_dim = shape[2] if len(shape) > 2 else None
-                    w_dim = shape[3] if len(shape) > 3 else None
-                    if isinstance(h_dim, int) and isinstance(w_dim, int) and h_dim == w_dim:
-                        self._input_size = int(h_dim)
-                    else:
-                        self._input_size = 384
-                except Exception:
-                    self._input_size = 384
-                try:
-                    import logging
-                    active_p = self._session.get_providers()
-                    logging.getLogger(__name__).warning(
-                        "[MODEL] Classifier ONNX='%s' checkpoint='%s' input_size=%s provider=%s",
-                        self.onnx_path,
-                        self._local_checkpoint_dir or "none",
-                        self._input_size,
-                        active_p[0] if active_p else "Unknown",
-                    )
-                except Exception:
-                    pass
-            
-            # Preprocess: Letterbox (Maintain Aspect Ratio) + Padding to 384x384
-            # Attempt to get focus hint first to decide load resolution
-            # Note: We don't know dimensions yet, so we'll load a 2048px preview if possible to be safe for cropping
-            orig_im = _load_index_source_image(file_path, max_size=2048).convert("RGB")
-            
-            # --- BACKGROUND REMOVAL ---
-            try:
-                from background_removal import get_background_remover
-                remover = get_background_remover()
-                orig_im = remover.remove_background(orig_im)
-                import logging
-                logging.getLogger(__name__).info(f"[AVIATION AI] Background removed for {os.path.basename(file_path)}")
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(f"[AVIATION AI] Background removal failed/skipped for {os.path.basename(file_path)}: {e}")
-            
-            # Pass 1: Global inference
-            label, conf, _ = self._predict_im(orig_im)
-            
-            # Pass 2: Attention Adjusted Crop (if hint available)
-            try:
-                focus_hint = pixmap_ltwh_focus_hint(file_path, orig_im.width, orig_im.height)
-                if focus_hint:
-                    ltwh, source = focus_hint
-                    # center point of the focus area
-                    cx = ltwh[0] + ltwh[2] // 2
-                    cy = ltwh[1] + ltwh[3] // 2
-                    
-                    # Context window: increase to 70% of shorter dimension
-                    # This ensures the whole aircraft is captured even if AF point was just on cockpit/tail
-                    crop_size = int(min(orig_im.width, orig_im.height) * 0.7)
-                    crop_size = max(int(getattr(self, "_input_size", 384) or 384), crop_size)
-                    
-                    left = max(0, cx - crop_size // 2)
-                    top = max(0, cy - crop_size // 2)
-                    right = min(orig_im.width, left + crop_size)
-                    bottom = min(orig_im.height, top + crop_size)
-                    
-                    # Re-center if we hit edges
-                    if right - left < crop_size: left = max(0, right - crop_size)
-                    if bottom - top < crop_size: top = max(0, bottom - crop_size)
-                    
-                    crop_im = orig_im.crop((left, top, right, bottom))
-                    label_crop, conf_crop, _ = self._predict_im(crop_im)
-                    
-                    # Merge logic: Prefer crop if it's more confident or if global is ambiguous
-                    if (conf_crop > conf) or (conf < 0.45 and conf_crop > 0.35):
-                        logger.info(f"[AVIATION AI] {os.path.basename(file_path)}: Attention-adjusted crop ({label_crop} @ {conf_crop:.2f} via {source}) preferred over global ({label} @ {conf:.2f})")
-                        label, conf = label_crop, conf_crop
-            except Exception as ce:
-                # Silently continue if focus hint or crop fails; global result is already available
-                pass
-
-            if label:
-                # Confidence thresholding (Combine knowledge logic)
-                # If confidence is too low, we return empty so the caller can fallback to SigLIP Zero-Shot
-                if conf < 0.40:
-                    logger.warning(f"[AVIATION AI] {os.path.basename(file_path)}: Ambiguous classification ({label} @ {conf:.2f}). Leaving unidentified.")
-                    return ""
-                    
-                logger.info(f"[AVIATION AI] {os.path.basename(file_path)} identified as {label} (Conf: {conf:.2f})")
-                return label
         except Exception as e:
             import traceback
             logger.error(f"[AVIATION AI] Error classifying {file_path}: {e}")
             logger.error(traceback.format_exc())
-            pass
         return ""
 
 class MobileCLIPCoreMLBackend:
@@ -5647,99 +5712,287 @@ class SemanticImageIndex:
         return filtered_paths, skipped_raw
 
 
+    def release_aviation_resources(self) -> None:
+        """Free rembg / ViT sessions after aircraft indexing."""
+        clf = self._aviation_classifier
+        self._aviation_classifier = None
+        if clf is not None:
+            try:
+                clf.release_resources()
+            except Exception:
+                pass
+        # Drop any thread-local classifier on the calling thread.
+        try:
+            local = getattr(_AVIATION_THREAD_LOCAL, "classifier", None)
+            if local is not None and local is not clf:
+                local.release_resources()
+            _AVIATION_THREAD_LOCAL.classifier = None
+        except Exception:
+            pass
+
     def _run_aircraft_classification_pass(
         self,
         pending: list,
         conn,
         progress_callback=None,
+        *,
+        progress_album_total: int = 0,
+        progress_indexed_base: int = 0,
     ) -> dict:
         """Classify aircraft labels without MobileCLIP embeddings (SkySpotter default)."""
-        import logging
-        logger = logging.getLogger(__name__)
         indexed = skipped = failed = 0
         total = len(pending)
         if total <= 0:
             return {"indexed": 0, "skipped": 0, "failed": 0, "total": 0}
+
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(semantic_index)").fetchall()}
+        has_blur = "blur_score" in cols
+        has_aircraft_col = "detected_aircraft" in cols
+        model_name = self.model_name
+        empty_blob = _empty_embedding_blob()
+
+        # Skip files that already have a non-empty aircraft label for this model.
+        work: list[tuple[str, os.stat_result]] = []
+        if has_aircraft_col and pending:
+            paths = [p for p, _ in pending]
+            existing: dict[str, str] = {}
+            chunk = 900
+            for i in range(0, len(paths), chunk):
+                part = paths[i : i + chunk]
+                qs = ",".join("?" for _ in part)
+                rows = conn.execute(
+                    f"SELECT file_path, COALESCE(detected_aircraft, '') "
+                    f"FROM semantic_index WHERE model_name = ? AND file_path IN ({qs})",
+                    [model_name, *part],
+                ).fetchall()
+                for fp, lab in rows:
+                    existing[str(fp)] = str(lab or "").strip()
+            for fp, st in pending:
+                lab = existing.get(fp, "")
+                if lab and lab.lower() not in {"unknown", "unidentified", "n/a", "none"}:
+                    skipped += 1
+                    # Ensure semantic_ready so search treats the row as complete.
+                    try:
+                        conn.execute(
+                            """
+                            UPDATE semantic_index
+                            SET semantic_ready = 1, dim = 0, embedding = ?, updated_at = ?
+                            WHERE file_path = ? AND model_name = ?
+                            """,
+                            (empty_blob, float(time.time()), fp, model_name),
+                        )
+                    except Exception:
+                        pass
+                else:
+                    work.append((fp, st))
+            conn.commit()
+        else:
+            work = list(pending)
+
+        if not work:
+            logger.info(
+                "[INDEX] Aircraft pass: nothing to classify (%d already labeled / %d pending)",
+                skipped,
+                total,
+            )
+            return {"indexed": 0, "skipped": skipped, "failed": 0, "total": total}
+
+        warm_paths = [fp for fp, _ in work]
+        try:
+            self._ensure_index_thumbnails_cached(
+                warm_paths,
+                progress_callback,
+                progress_album_total=progress_album_total or total,
+                progress_indexed_base=progress_indexed_base,
+                purpose="aircraft",
+            )
+        except Exception as e:
+            logger.debug("[INDEX] Aircraft thumbnail warm skipped: %s", e)
+
         try:
             if self._aviation_classifier is None:
                 self._aviation_classifier = MilitaryAircraftClassifier()
         except Exception as e:
             logger.error("[AVIATION AI] Classifier unavailable: %s", e)
-            return {"indexed": 0, "skipped": 0, "failed": total, "total": total}
+            return {
+                "indexed": 0,
+                "skipped": skipped,
+                "failed": len(work),
+                "total": total,
+            }
 
-        for i, (canonical_fp, st) in enumerate(pending, start=1):
+        index_max = _aircraft_index_max_size()
+        workers = suggested_aircraft_classify_workers()
+        # DirectML rembg sessions are not safely re-entrant across threads.
+        if rembg_uses_directml():
+            workers = 1
+        workers = max(1, min(workers, len(work)))
+        logger.info(
+            "[INDEX] Aircraft classify: %d files, workers=%d rembg_max=%d index_max=%d",
+            len(work),
+            workers,
+            _aircraft_rembg_max_size(),
+            index_max,
+        )
+
+        write_lock = threading.Lock()
+        registry_lock = threading.Lock()
+        done_count = 0
+        worker_classifiers: list = []
+        album_total = progress_album_total or len(work)
+        album_base = progress_indexed_base
+
+        def _report(done: int) -> None:
+            if not progress_callback:
+                return
+            if done <= 2 or done >= len(work) or (done % 12 == 0):
+                if progress_album_total > 0:
+                    progress_callback(
+                        album_base + done,
+                        album_total,
+                        format_index_progress(
+                            "Aircraft", album_base + done, album_total
+                        ),
+                    )
+                else:
+                    progress_callback(done, len(work), "Classifying aircraft...")
+
+        def _worker_clf() -> "MilitaryAircraftClassifier":
+            clf = getattr(_AVIATION_THREAD_LOCAL, "classifier", None)
+            if clf is None:
+                clf = MilitaryAircraftClassifier()
+                _AVIATION_THREAD_LOCAL.classifier = clf
+                with registry_lock:
+                    worker_classifiers.append(clf)
+            return clf
+
+        def _classify_one(item: tuple[str, os.stat_result]) -> tuple[str, str, object | None, str]:
+            """Returns (path, detected, blur_score, status) status in ok|fail|skip."""
+            canonical_fp, _st = item
             if self._abort_requested:
-                break
+                return canonical_fp, "", None, "skip"
             while self._paused and not self._abort_requested:
                 time.sleep(0.05)
-            if progress_callback and (i <= 2 or i >= total or (i % 12 == 0)):
-                progress_callback(i, total, "Classifying aircraft...")
+            if self._abort_requested:
+                return canonical_fp, "", None, "skip"
             try:
-                try:
-                    index_max = int(os.environ.get("SkySpotter_INDEX_MAX_SIZE", "1280"))
-                except (TypeError, ValueError):
-                    index_max = 1280
-                prog = (
-                    (lambda m, _i=i, _t=total: progress_callback(_i, _t, m))
-                    if progress_callback
-                    else None
+                clf = (
+                    self._aviation_classifier
+                    if workers <= 1
+                    else _worker_clf()
                 )
                 detected = ""
                 blur_score_val = None
-                prepare = getattr(self._aviation_classifier, "prepare_subject_pipeline", None)
-                classify_crop = getattr(self._aviation_classifier, "classify_from_subject_crop", None)
-                if callable(prepare) and callable(classify_crop):
-                    _src, _rgba, subject_crop = prepare(
-                        canonical_fp, index_max, progress_callback=prog
+                _src, _rgba, subject_crop = clf.prepare_subject_pipeline(
+                    canonical_fp, index_max, progress_callback=None
+                )
+                try:
+                    from blur_score import (
+                        blur_score_enabled,
+                        compute_blur_score_for_index,
                     )
-                    try:
-                        from blur_score import blur_score_enabled, compute_blur_score_for_index
-                        if blur_score_enabled() and _src is not None and _rgba is not None:
-                            blur_score_val, _ = compute_blur_score_for_index(
-                                canonical_fp, _src, rgba_for_bbox=_rgba
-                            )
-                    except Exception:
-                        pass
-                    if subject_crop is not None:
-                        detected = classify_crop(subject_crop, canonical_fp, progress_callback=prog) or ""
-                else:
-                    detected = self._aviation_classifier.classify(canonical_fp, progress_callback=prog) or ""
 
-                # Keep embedding empty; mark ready so gallery search can use labels.
-                blob = self._to_blob(np.zeros(0, dtype=np.float32))
-                cols = {r[1] for r in conn.execute("PRAGMA table_info(semantic_index)").fetchall()}
-                if "blur_score" in cols:
-                    conn.execute(
-                        """
-                        UPDATE semantic_index
-                        SET dim = 0, embedding = ?, semantic_ready = 1,
-                            detected_aircraft = ?, blur_score = ?, updated_at = ?
-                        WHERE file_path = ? AND model_name = ?
-                        """,
-                        (blob, detected, blur_score_val, float(time.time()), canonical_fp, self.model_name),
+                    if (
+                        blur_score_enabled()
+                        and _src is not None
+                        and _rgba is not None
+                    ):
+                        blur_score_val, _ = compute_blur_score_for_index(
+                            canonical_fp, _src, rgba_for_bbox=_rgba
+                        )
+                except Exception:
+                    pass
+                if subject_crop is not None:
+                    detected = (
+                        clf.classify_from_subject_crop(
+                            subject_crop, canonical_fp, progress_callback=None
+                        )
+                        or ""
                     )
-                else:
-                    conn.execute(
-                        """
-                        UPDATE semantic_index
-                        SET dim = 0, embedding = ?, semantic_ready = 1,
-                            detected_aircraft = ?, updated_at = ?
-                        WHERE file_path = ? AND model_name = ?
-                        """,
-                        (blob, detected, float(time.time()), canonical_fp, self.model_name),
-                    )
-                indexed += 1
-                if indexed % 20 == 0:
-                    conn.commit()
+                del _src, _rgba, subject_crop
+                return canonical_fp, detected, blur_score_val, "ok"
             except Exception as e:
-                failed += 1
                 logger.error(
                     "[AVIATION AI] Classification failed for %s: %s",
                     os.path.basename(canonical_fp),
                     e,
                 )
+                return canonical_fp, "", None, "fail"
+
+        def _write_row(canonical_fp: str, detected: str, blur_score_val) -> None:
+            now = float(time.time())
+            if has_blur:
+                conn.execute(
+                    """
+                    UPDATE semantic_index
+                    SET dim = 0, embedding = ?, semantic_ready = 1,
+                        detected_aircraft = ?, blur_score = ?, updated_at = ?
+                    WHERE file_path = ? AND model_name = ?
+                    """,
+                    (
+                        empty_blob,
+                        detected,
+                        blur_score_val,
+                        now,
+                        canonical_fp,
+                        model_name,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE semantic_index
+                    SET dim = 0, embedding = ?, semantic_ready = 1,
+                        detected_aircraft = ?, updated_at = ?
+                    WHERE file_path = ? AND model_name = ?
+                    """,
+                    (empty_blob, detected, now, canonical_fp, model_name),
+                )
+
+        if workers <= 1:
+            for i, item in enumerate(work, start=1):
+                canonical_fp, detected, blur_score_val, status = _classify_one(item)
+                if status == "ok":
+                    _write_row(canonical_fp, detected, blur_score_val)
+                    indexed += 1
+                    if indexed % 20 == 0:
+                        conn.commit()
+                elif status == "fail":
+                    failed += 1
+                _report(i)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="aircraft-clf"
+            ) as pool:
+                futures = [pool.submit(_classify_one, item) for item in work]
+                for fut in concurrent.futures.as_completed(futures):
+                    canonical_fp, detected, blur_score_val, status = fut.result()
+                    with write_lock:
+                        if status == "ok":
+                            _write_row(canonical_fp, detected, blur_score_val)
+                            indexed += 1
+                            if indexed % 20 == 0:
+                                conn.commit()
+                        elif status == "fail":
+                            failed += 1
+                        done_count += 1
+                        _report(done_count)
+
         conn.commit()
-        return {"indexed": indexed, "skipped": skipped, "failed": failed, "total": total}
+        # Drop parallel worker sessions (main classifier released by build_index).
+        for clf in worker_classifiers:
+            try:
+                if clf is not self._aviation_classifier:
+                    clf.release_resources()
+            except Exception:
+                pass
+        worker_classifiers.clear()
+        return {
+            "indexed": indexed,
+            "skipped": skipped,
+            "failed": failed,
+            "total": total,
+        }
 
     def build_index(
         self,
@@ -5997,9 +6250,17 @@ class SemanticImageIndex:
                             pending_for_semantic,
                             conn,
                             progress_callback=progress_callback,
+                            progress_album_total=progress_album_total,
+                            progress_indexed_base=progress_indexed_base,
                         )
                         indexed += int(av_stats.get("indexed", 0))
                         failed += int(av_stats.get("failed", 0))
+                        # Reclaim rembg / ViT sessions after the pass so gallery
+                        # browsing does not keep ISNet+ViT resident forever.
+                        try:
+                            self.release_aviation_resources()
+                        except Exception:
+                            pass
                     finally:
                         self._release_load_throttle()
                 elif run_semantic_embeddings:
