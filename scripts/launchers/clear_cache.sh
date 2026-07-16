@@ -1,6 +1,6 @@
 ﻿#!/usr/bin/env bash
 # Full cache + session wipe for SkySpotter (dev and installed builds).
-# Removes ~/.skyspotter_cache, ~/.rawviewer_cache (legacy), logs, macOS QSettings.
+# Removes ~/.skyspotter_cache, ~/.skyspotter_cache (legacy), logs, macOS QSettings.
 # Does NOT remove the app bundle or bundled models.
 
 set -u
@@ -20,7 +20,7 @@ echo
 kill_app() {
     echo "Closing SkySpotter if running..."
     killall SkySpotter 2>/dev/null || true
-    killall RAWviewer 2>/dev/null || true
+    killall SkySpotter 2>/dev/null || true
     pkill -f "[p]ython.*main\.py" 2>/dev/null || true
     pkill -f "[p]ython.*SkySpotter" 2>/dev/null || true
     sleep 2
@@ -54,8 +54,8 @@ clear_qsettings() {
     local plists=(
         "${HOME}/Library/Preferences/com.SkySpotter.SkySpotter.plist"
         "${HOME}/Library/Preferences/SkySpotter.plist"
-        "${HOME}/Library/Preferences/com.RAWviewer.RAWviewer.plist"
-        "${HOME}/Library/Preferences/RAWviewer.plist"
+        "${HOME}/Library/Preferences/com.SkySpotter.SkySpotter.plist"
+        "${HOME}/Library/Preferences/SkySpotter.plist"
     )
     for plist in "${plists[@]}"; do
         if [ -f "$plist" ]; then
@@ -79,7 +79,7 @@ clear_qsettings() {
 kill_app
 
 remove_tree "${HOME}/.skyspotter_cache" "SkySpotter cache"
-remove_tree "${HOME}/.rawviewer_cache" "legacy RAWviewer cache"
+remove_tree "${HOME}/.skyspotter_cache" "legacy SkySpotter cache"
 remove_tree "${HOME}/Library/Application Support/SkySpotter/logs" "SkySpotter logs (Application Support)"
 remove_tree "${HOME}/Library/Logs/SkySpotter" "SkySpotter logs (Library/Logs)"
 remove_tree "${ROOT}/src/logs" "repository dev logs (src/logs)"

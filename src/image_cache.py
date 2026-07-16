@@ -6,6 +6,9 @@ to dramatically improve browsing performance.
 """
 
 import os
+import logging
+import platform
+import subprocess
 import time
 import threading
 import sqlite3
@@ -14,17 +17,128 @@ import pickle
 import shutil
 import numpy as np
 from collections import OrderedDict
-from typing import Optional, Tuple, Dict, Any, Union, List
+from typing import Optional, Tuple, Dict, Any, Union, List, Sequence
 import psutil
 from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from skyspotter_runtime import cache_root, env_flag, env_get, legacy_cache_root
+logger = logging.getLogger(__name__)
+
+_psutil_vm_fallback_logged = False
+
+
+def _sysctl_hw_memsize_bytes() -> Optional[int]:
+    """Physical RAM via sysctl (macOS fallback when psutil virtual_memory fails)."""
+    if platform.system() != "Darwin":
+        return None
+    try:
+        out = subprocess.check_output(
+            ["sysctl", "-n", "hw.memsize"],
+            text=True,
+            timeout=2,
+        ).strip()
+        return int(out)
+    except Exception:
+        return None
+
+
+def _darwin_page_size_bytes() -> int:
+    if platform.system() != "Darwin":
+        return 4096
+    try:
+        out = subprocess.check_output(["pagesize"], text=True, timeout=2).strip()
+        return max(4096, int(out))
+    except Exception:
+        return 4096
+
+
+def _parse_vm_stat_page_count(vm_stat_output: str, label: str) -> int:
+    prefix = f"{label}:"
+    for line in vm_stat_output.splitlines():
+        if not line.startswith(prefix):
+            continue
+        raw = line.split(":", 1)[1].strip().rstrip(".")
+        try:
+            return int(raw.replace(",", ""))
+        except ValueError:
+            return 0
+    return 0
+
+
+def _darwin_memory_stats_from_vm_stat() -> Optional[Tuple[int, int, float]]:
+    """Installed RAM, available bytes, and percent used via sysctl + vm_stat."""
+    if platform.system() != "Darwin":
+        return None
+    total = _sysctl_hw_memsize_bytes()
+    if not total:
+        return None
+    try:
+        vm_out = subprocess.check_output(["vm_stat"], text=True, timeout=2)
+    except Exception:
+        return None
+
+    page_size = _darwin_page_size_bytes()
+    free_pages = _parse_vm_stat_page_count(vm_out, "Pages free")
+    inactive_pages = _parse_vm_stat_page_count(vm_out, "Pages inactive")
+    speculative_pages = _parse_vm_stat_page_count(vm_out, "Pages speculative")
+    available_pages = free_pages + inactive_pages + speculative_pages
+    available = min(total, available_pages * page_size)
+    used = max(0, total - available)
+    percent = min(100.0, max(0.0, (used / total) * 100.0))
+    return total, available, percent
+
+
+def system_memory_total_bytes() -> Optional[int]:
+    """Total installed RAM in bytes (sysctl on macOS, then psutil)."""
+    if platform.system() == "Darwin":
+        total = _sysctl_hw_memsize_bytes()
+        if total:
+            return int(total)
+    try:
+        return int(psutil.virtual_memory().total)
+    except Exception:
+        return _sysctl_hw_memsize_bytes()
+
+
+def _safe_virtual_memory():
+    """Memory stats with macOS sysctl/vm_stat first (avoids psutil HOST_VM_INFO64 issues)."""
+    global _psutil_vm_fallback_logged
+    if platform.system() == "Darwin":
+        fallback = _darwin_memory_stats_from_vm_stat()
+        if fallback is not None:
+            from types import SimpleNamespace
+
+            total, available, percent = fallback
+            return SimpleNamespace(total=total, available=available, percent=percent)
+
+    try:
+        return psutil.virtual_memory()
+    except Exception as exc:
+        if not _psutil_vm_fallback_logged:
+            logger.debug(
+                "psutil.virtual_memory() unavailable (%s); using fallback memory stats",
+                exc,
+            )
+            _psutil_vm_fallback_logged = True
+        fallback = _darwin_memory_stats_from_vm_stat()
+        from types import SimpleNamespace
+
+        if fallback is not None:
+            total, available, percent = fallback
+            return SimpleNamespace(total=total, available=available, percent=percent)
+
+        total = _sysctl_hw_memsize_bytes() or (8 * 1024**3)
+        available = total // 4
+        return SimpleNamespace(
+            total=total,
+            available=available,
+            percent=min(100.0, max(0.0, ((total - available) / total) * 100.0)),
+        )
 
 
 def disk_preview_max_edge() -> int:
     """Max long edge for JPEG files under ~/.skyspotter_cache/previews (grid tier is separate)."""
-    raw = env_get("DISK_PREVIEW_MAX", "512")
+    raw = os.environ.get("RAWVIEWER_DISK_PREVIEW_MAX", "512").strip()
     try:
         v = int(raw)
     except Exception:
@@ -34,7 +148,7 @@ def disk_preview_max_edge() -> int:
 
 def memory_preview_max_edge() -> int:
     """Max in-memory preview for progressive single-image RAW display (not disk size)."""
-    raw = env_get("MEMORY_PREVIEW_MAX", "1920")
+    raw = os.environ.get("RAWVIEWER_MEMORY_PREVIEW_MAX", "1920").strip()
     try:
         v = int(raw)
     except Exception:
@@ -98,12 +212,11 @@ def _exif_sql_path_expr(column: str = "file_path") -> str:
 
 
 def _exif_sql_folder_like_pattern(folder_path: str) -> str:
-    """LIKE prefix for all files under folder_path (must match _exif_sql_path_expr slashes)."""
+    """LIKE prefix for all files under folder_path (matches stored canonical keys)."""
     root = _exif_cache_path_key(os.path.abspath(folder_path)).rstrip("\\/")
-    root_lower = root.lower()
     if os.sep == "\\":
-        return root_lower + "\\%"
-    return root_lower.replace("\\", "/") + "/%"
+        return root + "\\%"
+    return root.replace("\\", "/") + "/%"
 
 
 def _exif_sql_folder_like_patterns(folder_path: str) -> List[str]:
@@ -170,6 +283,13 @@ class LRUCache:
         self.hits = 0
         self.misses = 0
 
+    def shrink_to_size(self, new_max_size: int) -> None:
+        """Update max_size and remove excess items thread-safely."""
+        with self.lock:
+            self.max_size = new_max_size
+            while len(self.cache) > self.max_size:
+                self.cache.popitem(last=False)
+
     def __contains__(self, key: str) -> bool:
         with self.lock:
             return key in self.cache
@@ -183,6 +303,17 @@ class LRUCache:
                 return self.cache[key]
             self.misses += 1
             return None
+
+    def peek(self, key: str) -> Optional[Any]:
+        """Non-mutating lookup: no recency promotion, no hit/miss accounting.
+
+        For "is this warm?" scans (e.g. filmstrip prefetch decisions) that
+        must not distort LRU eviction order -- get() would promote entries
+        that are merely checked, never displayed, pushing genuinely
+        recently-used entries out first.
+        """
+        with self.lock:
+            return self.cache.get(key)
 
     def put(self, key: str, value: Any) -> None:
         with self.lock:
@@ -251,7 +382,14 @@ class MemoryOnlyPersistentCache:
     def get_capture_times_for_folder(self, folder_path: str) -> Dict[str, str]:
         return {}
 
-    def put(self, file_path: str, value: Any) -> bool:
+    def put(self, file_path: str, value: Any, *args, **kwargs) -> bool:
+        # Signature-tolerant: the real persistent caches grow keyword args
+        # (file_size, mtime, ...) over time and callers pass them through;
+        # a no-op stand-in must absorb whatever the real one accepts, or
+        # memory-only mode crashes on every EXIF put (seen with file_size).
+        return False
+
+    def has_valid(self, file_path: str) -> bool:
         return False
 
     def remove(self, file_path: str) -> bool:
@@ -272,19 +410,25 @@ class PersistentEXIFCache:
 
     def __init__(self, cache_dir: str = None):
         if cache_dir is None:
-            cache_dir = cache_root()
+            cache_dir = os.path.expanduser("~/.skyspotter_cache")
         os.makedirs(cache_dir, exist_ok=True)
 
         self.db_path = os.path.join(cache_dir, "exif_cache.db")
         self.lock = threading.RLock()
         
-        # Use thread-local storage for database connections
+        # Reads: thread-local connections. Writes: single writer connection (WAL).
         self._local = threading.local()
+        self._writer_conn: Optional[sqlite3.Connection] = None
+        self._pending_writes: List[tuple] = []
+        self._commit_every = max(
+            1,
+            int(os.environ.get("RAWVIEWER_EXIF_CACHE_COMMIT_EVERY", "40")),
+        )
         
         self._init_db()
 
     def _get_connection(self):
-        """Get thread-local database connection."""
+        """Get thread-local database connection (read-optimized)."""
         if not hasattr(self._local, 'conn'):
             conn = sqlite3.connect(
                 self.db_path,
@@ -294,9 +438,93 @@ class PersistentEXIFCache:
             # Enable WAL mode for better concurrent performance
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA cache_size=1000")
+            conn.execute("PRAGMA cache_size=-65536")
             self._local.conn = conn
         return self._local.conn
+
+    def _get_writer_connection(self) -> sqlite3.Connection:
+        """Dedicated writer connection for index/backfill batches (separate from readers)."""
+        if self._writer_conn is None:
+            conn = sqlite3.connect(
+                self.db_path,
+                check_same_thread=False,
+                timeout=30.0,
+            )
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA cache_size=-65536")
+            self._writer_conn = conn
+        return self._writer_conn
+
+    def _prepare_put_row(
+        self,
+        file_path: str,
+        exif_info: Dict[str, Any],
+        *,
+        file_size: Optional[int] = None,
+        file_mtime: Optional[float] = None,
+    ) -> Optional[tuple]:
+        if file_size is None or file_mtime is None:
+            file_size, file_mtime = self._get_file_hash(file_path)
+        if file_size == 0:
+            return None
+
+        storage_path = _exif_cache_path_key(file_path)
+        exif_blob = pickle.dumps(exif_info.get('exif_data', {}))
+
+        capture_time = exif_info.get('capture_time')
+        if not capture_time:
+            exif_dict = exif_info.get('exif_data', {})
+            if isinstance(exif_dict, dict):
+                capture_time = exif_dict.get('capture_time')
+
+        width = exif_info.get('original_width')
+        height = exif_info.get('original_height')
+        if not width or not height:
+            exif_dict = exif_info.get('exif_data', {})
+            if isinstance(exif_dict, dict):
+                if not width:
+                    width = exif_dict.get('original_width')
+                if not height:
+                    height = exif_dict.get('original_height')
+
+        sensor_meta_ver = exif_info.get('raw_exif_sensor_meta_ver')
+        if sensor_meta_ver is None:
+            sensor_meta_ver = 0
+
+        return (
+            storage_path,
+            file_size,
+            file_mtime,
+            exif_info.get('orientation', 1),
+            exif_info.get('camera_make', ''),
+            exif_info.get('camera_model', ''),
+            exif_blob,
+            time.time(),
+            capture_time,
+            width,
+            height,
+            int(sensor_meta_ver),
+        )
+
+    def _flush_pending_writes(self) -> None:
+        if not self._pending_writes:
+            return
+        writer = self._get_writer_connection()
+        writer.executemany(
+            "INSERT OR REPLACE INTO exif_cache "
+            "(file_path, file_size, file_mtime, orientation, camera_make, camera_model, exif_data, "
+            "cached_time, capture_time, original_width, original_height, sensor_meta_ver) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            self._pending_writes,
+        )
+        writer.commit()
+        self._pending_writes.clear()
+
+    def flush(self) -> None:
+        """Commit any batched EXIF writes (call after indexing batches)."""
+        with self.lock:
+            self._flush_pending_writes()
 
     def _init_db(self):
         """Initialize the SQLite database."""
@@ -355,52 +583,74 @@ class PersistentEXIFCache:
             return 0, 0
 
     def get(self, file_path: str) -> Optional[Dict[str, Any]]:
-        """Get cached EXIF data if still valid."""
+        """Get cached EXIF data if still valid.
+
+        Deliberately NOT under self.lock: this reads via the calling
+        thread's own thread-local connection (_get_connection()), and
+        SQLite WAL mode already lets multiple readers proceed concurrently
+        without blocking each other or a writer -- that's the entire reason
+        get_multiple() has a connection-per-thread design in the first
+        place. Wrapping this in the same process-wide lock used by
+        put()/flush() (which do need it, for the shared writer connection
+        and _pending_writes list) serialized every single-file EXIF read
+        across every thread in the app -- including background semantic
+        indexing's per-file extraction racing single-view navigation for
+        the same lock, which measured as multi-second navigation stalls on
+        real folders. timeout=30.0 on connection open already covers the
+        rare genuine SQLite-level WAL contention case.
+        """
         file_size, file_mtime = self._get_file_hash(file_path)
         if file_size == 0:
             return None
         cache_key = _exif_cache_path_key(file_path)
 
-        with self.lock:
-            try:
-                conn = self._get_connection()
-                cursor = conn.execute(
-                    "SELECT file_size, file_mtime, orientation, camera_make, camera_model, exif_data, "
-                    "capture_time, original_width, original_height, sensor_meta_ver "
-                    "FROM exif_cache WHERE lower(file_path) = lower(?)",
-                    (cache_key,),
-                )
-                row = cursor.fetchone()
+        try:
+            conn = self._get_connection()
+            cursor = conn.execute(
+                "SELECT file_size, file_mtime, orientation, camera_make, camera_model, exif_data, "
+                "capture_time, original_width, original_height, sensor_meta_ver "
+                "FROM exif_cache WHERE file_path = ?",
+                (cache_key,),
+            )
+            row = cursor.fetchone()
 
-                if row and row[0] == file_size and row[1] == file_mtime:
-                    # Cache is valid
-                    exif_data = pickle.loads(row[5]) if row[5] else {}
-                    
-                    # Ensure consistent data (DB columns override/augment blob)
-                    result_capture_time = row[6]
-                    if result_capture_time and 'capture_time' not in exif_data:
-                         exif_data['capture_time'] = result_capture_time
-                    
-                    result_width = row[7]
-                    result_height = row[8]
-                    sensor_meta_ver = row[9] if len(row) > 9 else 0
-                    if sensor_meta_ver is None:
-                        sensor_meta_ver = 0
-                    if result_width: exif_data['original_width'] = result_width
-                    if result_height: exif_data['original_height'] = result_height
-                    
-                    return {
-                        'orientation': row[2],
-                        'camera_make': row[3],
-                        'camera_model': row[4],
-                        'exif_data': exif_data,
-                        'capture_time': result_capture_time,
-                        'original_width': result_width if result_width else exif_data.get('original_width'),
-                        'original_height': result_height if result_height else exif_data.get('original_height'),
-                        'raw_exif_sensor_meta_ver': int(sensor_meta_ver),
-                    }
-            except Exception:
-                pass
+            if row and row[0] == file_size and row[1] == file_mtime:
+                # Cache is valid
+                exif_data = pickle.loads(row[5]) if row[5] else {}
+
+                # Ensure consistent data (DB columns override/augment blob)
+                result_capture_time = row[6]
+                if result_capture_time and 'capture_time' not in exif_data:
+                     exif_data['capture_time'] = result_capture_time
+
+                result_width = row[7]
+                result_height = row[8]
+                sensor_meta_ver = row[9] if len(row) > 9 else 0
+                if sensor_meta_ver is None:
+                    sensor_meta_ver = 0
+                if result_width: exif_data['original_width'] = result_width
+                if result_height: exif_data['original_height'] = result_height
+
+                return {
+                    'orientation': row[2],
+                    'camera_make': row[3],
+                    'camera_model': row[4],
+                    'exif_data': exif_data,
+                    'capture_time': result_capture_time,
+                    'original_width': result_width if result_width else exif_data.get('original_width'),
+                    'original_height': result_height if result_height else exif_data.get('original_height'),
+                    'raw_exif_sensor_meta_ver': int(sensor_meta_ver),
+                    # rating is stored inside the pickled exif_data blob (see
+                    # _prepare_put_row/rate_current_image), not its own column --
+                    # promote it to the top level so callers doing exif.get('rating')
+                    # (the same shape put_exif() was called with) see it. Without
+                    # this a rating survived to disk fine but read back as 0 on
+                    # every app restart, since only the in-memory cache (which
+                    # stores the dict as-passed) ever had the top-level key.
+                    'rating': exif_data.get('rating', 0),
+                }
+        except Exception:
+            pass
 
         return None
 
@@ -409,12 +659,13 @@ class PersistentEXIFCache:
         cache_key = _exif_cache_path_key(file_path)
         with self.lock:
             try:
-                conn = self._get_connection()
-                cursor = conn.execute(
-                    "DELETE FROM exif_cache WHERE lower(file_path) = lower(?)",
+                self._flush_pending_writes()
+                writer = self._get_writer_connection()
+                cursor = writer.execute(
+                    "DELETE FROM exif_cache WHERE file_path = ?",
                     (cache_key,),
                 )
-                conn.commit()
+                writer.commit()
                 return cursor.rowcount > 0
             except Exception:
                 return False
@@ -426,62 +677,47 @@ class PersistentEXIFCache:
         *,
         file_size: Optional[int] = None,
         file_mtime: Optional[float] = None,
+        commit: bool = False,
     ) -> None:
         """Cache EXIF data. Pass file_size/file_mtime when already known (avoids stat under lock)."""
-        if file_size is None or file_mtime is None:
-            file_size, file_mtime = self._get_file_hash(file_path)
-        if file_size == 0:
+        row = self._prepare_put_row(
+            file_path, exif_info, file_size=file_size, file_mtime=file_mtime
+        )
+        if row is None:
             return
-
-        storage_path = _exif_cache_path_key(file_path)
 
         with self.lock:
             try:
-                conn = self._get_connection()
-                exif_blob = pickle.dumps(exif_info.get('exif_data', {}))
-                
-                # Extract capture_time for separate column
-                capture_time = exif_info.get('capture_time')
-                if not capture_time:
-                    # Try to extract from exif_data dict if not at top level
-                    exif_dict = exif_info.get('exif_data', {})
-                    if isinstance(exif_dict, dict):
-                         capture_time = exif_dict.get('capture_time')
-                
-                # Extract dimensions for separate columns
-                width = exif_info.get('original_width')
-                height = exif_info.get('original_height')
-                if not width or not height:
-                    exif_dict = exif_info.get('exif_data', {})
-                    if isinstance(exif_dict, dict):
-                         if not width: width = exif_dict.get('original_width')
-                         if not height: height = exif_dict.get('original_height')
+                self._pending_writes.append(row)
+                if commit or len(self._pending_writes) >= self._commit_every:
+                    self._flush_pending_writes()
+            except Exception:
+                pass
 
-                sensor_meta_ver = exif_info.get('raw_exif_sensor_meta_ver')
-                if sensor_meta_ver is None:
-                    sensor_meta_ver = 0
-                
-                conn.execute(
-                    "INSERT OR REPLACE INTO exif_cache "
-                    "(file_path, file_size, file_mtime, orientation, camera_make, camera_model, exif_data, "
-                    "cached_time, capture_time, original_width, original_height, sensor_meta_ver) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        storage_path,
-                        file_size,
-                        file_mtime,
-                        exif_info.get('orientation', 1),
-                        exif_info.get('camera_make', ''),
-                        exif_info.get('camera_model', ''),
-                        exif_blob,
-                        time.time(),
-                        capture_time,
-                        width,
-                        height,
-                        int(sensor_meta_ver),
-                    )
-                )
-                conn.commit()
+    def put_many(
+        self,
+        items: Sequence[tuple[str, Dict[str, Any], Optional[int], Optional[float]]],
+        *,
+        commit: bool = True,
+    ) -> None:
+        """Batch EXIF writes (file_path, exif_info, file_size, file_mtime)."""
+        rows: List[tuple] = []
+        for file_path, exif_info, file_size, file_mtime in items:
+            row = self._prepare_put_row(
+                file_path,
+                exif_info,
+                file_size=file_size,
+                file_mtime=file_mtime,
+            )
+            if row is not None:
+                rows.append(row)
+        if not rows:
+            return
+        with self.lock:
+            try:
+                self._pending_writes.extend(rows)
+                if commit or len(self._pending_writes) >= self._commit_every:
+                    self._flush_pending_writes()
             except Exception:
                 pass
 
@@ -491,10 +727,12 @@ class PersistentEXIFCache:
 
         with self.lock:
             try:
-                conn = self._get_connection()
-                conn.execute(
-                    "DELETE FROM exif_cache WHERE cached_time < ?", (cutoff_time,))
-                conn.commit()
+                self._flush_pending_writes()
+                writer = self._get_writer_connection()
+                writer.execute(
+                    "DELETE FROM exif_cache WHERE cached_time < ?", (cutoff_time,)
+                )
+                writer.commit()
             except Exception:
                 pass
 
@@ -502,9 +740,10 @@ class PersistentEXIFCache:
         """Remove all cached EXIF entries."""
         with self.lock:
             try:
-                conn = self._get_connection()
-                conn.execute("DELETE FROM exif_cache")
-                conn.commit()
+                self._pending_writes.clear()
+                writer = self._get_writer_connection()
+                writer.execute("DELETE FROM exif_cache")
+                writer.commit()
             except Exception:
                 pass
 
@@ -520,8 +759,11 @@ class PersistentEXIFCache:
         results = {}
         try:
             conn = self._get_connection()
-            # sqlite has a limit on the number of variables in a query
-            # Process in chunks of 500; do not hold lock across entire folder (6889+ files).
+            # sqlite has a limit on the number of variables in a query.
+            # Process in chunks of 450; no lock needed here (see get()'s
+            # docstring) -- this is a read-only query on the calling
+            # thread's own connection, and SQLite WAL mode already permits
+            # concurrent readers.
             for i in range(0, len(file_paths), 450):
                 chunk = file_paths[i : i + 450]
                 lookup: Dict[str, str] = {}
@@ -532,15 +774,13 @@ class PersistentEXIFCache:
                     norm_keys.append(nk)
                 placeholders = ",".join(["?"] * len(norm_keys))
 
-                path_expr = _exif_sql_path_expr("file_path")
                 query = (
                     f"SELECT file_path, file_size, file_mtime, orientation, camera_make, camera_model, "
                     f"exif_data, capture_time, original_width, original_height, sensor_meta_ver "
-                    f"FROM exif_cache WHERE {path_expr} IN ({placeholders})"
+                    f"FROM exif_cache WHERE file_path IN ({placeholders})"
                 )
-                with self.lock:
-                    cursor = conn.execute(query, norm_keys)
-                    rows = cursor.fetchall()
+                cursor = conn.execute(query, norm_keys)
+                rows = cursor.fetchall()
 
                 for row in rows:
                     db_path = row[0]
@@ -640,6 +880,10 @@ class PersistentEXIFCache:
                         "original_width": result_width,
                         "original_height": result_height,
                         "raw_exif_sensor_meta_ver": sensor_meta_ver,
+                        # See get()'s 'rating' comment -- only recoverable when the
+                        # blob was actually unpickled (not the fast_mode/has_fast_data
+                        # shortcut above, which skips it for bulk-scan speed).
+                        "rating": exif_data.get("rating", 0) if exif_data else 0,
                     }
         except Exception:
             pass
@@ -652,7 +896,6 @@ class PersistentEXIFCache:
         out: Dict[str, str] = {}
         try:
             conn = self._get_connection()
-            path_expr = _exif_sql_path_expr("file_path")
             # SQLite default max bind variables is 999; one key per path only.
             for i in range(0, len(file_paths), 450):
                 chunk = file_paths[i : i + 450]
@@ -665,7 +908,7 @@ class PersistentEXIFCache:
                 placeholders = ",".join(["?"] * len(query_keys))
                 query = (
                     f"SELECT file_path, capture_time, exif_data FROM exif_cache "
-                    f"WHERE {path_expr} IN ({placeholders})"
+                    f"WHERE file_path IN ({placeholders})"
                 )
                 with self.lock:
                     rows = conn.execute(query, query_keys).fetchall()
@@ -687,6 +930,58 @@ class PersistentEXIFCache:
             pass
         return out
 
+    def update_capture_time_bulk(self, timestamps: Dict[str, str]) -> None:
+        """Persist probed capture_time values without touching any other cached
+        EXIF field. UPDATE-only for rows that already have one (never overwrites
+        an existing value); a bare row is INSERTed only for paths with no row at
+        all yet, so a later full EXIF extraction's INSERT OR REPLACE still wins.
+        This lets the sort-time capture-time probe (main.py's
+        _parallel_probe_capture_times, which uses a cheap exifread-only read, not
+        a RAW decode) survive to the next folder open instead of re-probing every
+        uncached file every time — without any risk of clobbering width/height/
+        orientation data a row might hold under a stale sensor_meta_ver.
+        """
+        if not timestamps:
+            return
+        rows = [
+            (str(ct), _exif_cache_path_key(p)) for p, ct in timestamps.items() if ct
+        ]
+        if not rows:
+            return
+        try:
+            writer = self._get_writer_connection()
+            with self.lock:
+                for i in range(0, len(rows), 450):
+                    chunk = rows[i : i + 450]
+                    writer.executemany(
+                        "UPDATE exif_cache SET capture_time = ? "
+                        "WHERE file_path = ? AND (capture_time IS NULL OR capture_time = '')",
+                        chunk,
+                    )
+                    path_keys = [pk for _, pk in chunk]
+                    placeholders = ",".join(["?"] * len(path_keys))
+                    cursor = writer.execute(
+                        f"SELECT file_path FROM exif_cache WHERE file_path IN ({placeholders})",
+                        path_keys,
+                    )
+                    existing = {row[0] for row in cursor.fetchall()}
+                    insert_rows = [
+                        (pk, None, None, 1, "", "", pickle.dumps({}), time.time(), ct, None, None, 0)
+                        for ct, pk in chunk
+                        if pk not in existing
+                    ]
+                    if insert_rows:
+                        writer.executemany(
+                            "INSERT OR IGNORE INTO exif_cache "
+                            "(file_path, file_size, file_mtime, orientation, camera_make, camera_model, "
+                            "exif_data, cached_time, capture_time, original_width, original_height, sensor_meta_ver) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            insert_rows,
+                        )
+                writer.commit()
+        except Exception:
+            pass
+
     def get_capture_times_for_folder(self, folder_path: str) -> Dict[str, str]:
         """All cached capture_time entries under folder_path (slash-agnostic LIKE)."""
         if not folder_path:
@@ -694,16 +989,15 @@ class PersistentEXIFCache:
         patterns = _exif_sql_folder_like_patterns(folder_path)
         if not patterns:
             return {}
-        path_expr = _exif_sql_path_expr("file_path")
         out: Dict[str, str] = {}
         try:
             conn = self._get_connection()
             for pattern in patterns:
                 with self.lock:
                     rows = conn.execute(
-                        f"SELECT file_path, capture_time FROM exif_cache "
-                        f"WHERE {path_expr} LIKE ? "
-                        f"AND capture_time IS NOT NULL AND capture_time != ''",
+                        "SELECT file_path, capture_time FROM exif_cache "
+                        "WHERE file_path LIKE ? "
+                        "AND capture_time IS NOT NULL AND capture_time != ''",
                         (pattern,),
                     ).fetchall()
                 for db_path, ct_col in rows:
@@ -717,8 +1011,8 @@ class PersistentEXIFCache:
                 for pattern in patterns:
                     with self.lock:
                         rows = conn.execute(
-                            f"SELECT file_path, exif_data FROM exif_cache "
-                            f"WHERE {path_expr} LIKE ? AND exif_data IS NOT NULL",
+                            "SELECT file_path, exif_data FROM exif_cache "
+                            "WHERE file_path LIKE ? AND exif_data IS NOT NULL",
                             (pattern,),
                         ).fetchall()
                     for db_path, blob in rows:
@@ -746,7 +1040,17 @@ class PersistentEXIFCache:
         return out
     
     def close(self):
-        """Close the database connection for the current thread."""
+        """Close the database connection for the current thread.
+
+        Flushes batched writes first -- without this, any EXIF update that
+        didn't happen to hit the 40-write commit threshold (e.g. a single
+        star rating set near the end of a session) sat in _pending_writes
+        and was silently dropped on quit, never reaching disk.
+        """
+        try:
+            self.flush()
+        except Exception:
+            pass
         try:
             if hasattr(self, '_local') and hasattr(self._local, 'conn'):
                 self._local.conn.close()
@@ -760,7 +1064,7 @@ class PersistentThumbnailCache:
     
     def __init__(self, cache_dir: str = None):
         if cache_dir is None:
-            cache_dir = cache_root()
+            cache_dir = os.path.expanduser("~/.skyspotter_cache")
         os.makedirs(cache_dir, exist_ok=True)
         
         self.cache_dir = os.path.join(cache_dir, "thumbnails")
@@ -848,6 +1152,26 @@ class PersistentThumbnailCache:
         path_hash = hashlib.md5(_cache_path_key(file_path).encode('utf-8')).hexdigest()
         return os.path.join(self.cache_dir, f"{path_hash}.jpg")
     
+    def has_valid(self, file_path: str) -> bool:
+        """True if a valid on-disk entry exists (metadata + file path only, no JPEG read)."""
+        key = _cache_path_key(file_path)
+        file_size, file_mtime = self._get_file_hash(file_path)
+        if file_size == 0:
+            return False
+        try:
+            conn = self._get_connection()
+            cursor = conn.execute(
+                "SELECT file_size, file_mtime, cache_file FROM thumbnail_cache WHERE file_path = ?",
+                (key,),
+            )
+            row = cursor.fetchone()
+            if row and row[0] == file_size and row[1] == file_mtime:
+                cache_file = row[2]
+                return bool(cache_file) and os.path.exists(cache_file)
+        except Exception:
+            pass
+        return False
+
     def get(self, file_path: str) -> Optional[bytes]:
         """Get cached JPEG thumbnail if still valid."""
         key = _cache_path_key(file_path)
@@ -967,6 +1291,62 @@ class PersistentThumbnailCache:
             except Exception:
                 pass
 
+    def get_disk_usage_bytes(self) -> int:
+        """Best-effort total bytes of on-disk cache files. Stat-based (no size column
+        is tracked in the DB), so only call from a background/startup pass, never a
+        per-request hot path."""
+        total = 0
+        with self.lock:
+            try:
+                conn = self._get_connection()
+                cursor = conn.execute("SELECT cache_file FROM thumbnail_cache")
+                for (cache_file,) in cursor.fetchall():
+                    try:
+                        total += os.path.getsize(cache_file)
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+        return total
+
+    def evict_lru(self, bytes_to_free: int) -> int:
+        """Evict oldest-cached entries (by cached_time) until bytes_to_free is freed
+        or the cache is exhausted. Returns bytes actually freed."""
+        if bytes_to_free <= 0:
+            return 0
+        freed = 0
+        with self.lock:
+            try:
+                conn = self._get_connection()
+                cursor = conn.execute(
+                    "SELECT file_path, cache_file FROM thumbnail_cache ORDER BY cached_time ASC"
+                )
+                rows = cursor.fetchall()
+                evicted_paths: List[str] = []
+                for file_path, cache_file in rows:
+                    if freed >= bytes_to_free:
+                        break
+                    try:
+                        freed += os.path.getsize(cache_file)
+                    except OSError:
+                        pass
+                    try:
+                        if os.path.exists(cache_file):
+                            os.remove(cache_file)
+                    except Exception:
+                        pass
+                    evicted_paths.append(file_path)
+                if evicted_paths:
+                    placeholders = ",".join(["?"] * len(evicted_paths))
+                    conn.execute(
+                        f"DELETE FROM thumbnail_cache WHERE file_path IN ({placeholders})",
+                        evicted_paths,
+                    )
+                    conn.commit()
+            except Exception:
+                pass
+        return freed
+
     def clear(self) -> None:
         """Remove all disk thumbnail cache files and database rows."""
         with self.lock:
@@ -1004,7 +1384,7 @@ class PersistentGridCache(PersistentThumbnailCache):
     
     def __init__(self, cache_dir: str = None):
         if cache_dir is None:
-            cache_dir = cache_root()
+            cache_dir = os.path.expanduser("~/.skyspotter_cache")
         # Use 'grid' subdirectory
         self.base_cache_dir = cache_dir 
         super().__init__(cache_dir) # Init with base dir, will setup 'thumbnails'
@@ -1048,7 +1428,7 @@ class PersistentPreviewCache(PersistentThumbnailCache):
     
     def __init__(self, cache_dir: str = None):
         if cache_dir is None:
-            cache_dir = cache_root()
+            cache_dir = os.path.expanduser("~/.skyspotter_cache")
         # Use 'previews' subdirectory
         self.base_cache_dir = cache_dir 
         super().__init__(cache_dir) # Init with base dir, will setup 'thumbnails'
@@ -1087,6 +1467,84 @@ class PersistentPreviewCache(PersistentThumbnailCache):
 
 
 
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if raw:
+        try:
+            return max(minimum, min(int(raw), maximum))
+        except ValueError:
+            pass
+    return max(minimum, min(default, maximum))
+
+
+def _env_float(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if raw:
+        try:
+            return max(minimum, min(float(raw), maximum))
+        except ValueError:
+            pass
+    return max(minimum, min(default, maximum))
+
+
+def _preview_cache_adaptive_enabled() -> bool:
+    raw = os.environ.get("RAWVIEWER_PREVIEW_CACHE_ADAPTIVE", "1").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def recommended_preview_cache_items(available_gb: float | None = None) -> int:
+    """Preview LRU capacity from free RAM, preview resolution, and build profile."""
+    explicit = os.environ.get("RAWVIEWER_PREVIEW_CACHE_ITEMS", "").strip()
+    if explicit:
+        return _env_int("RAWVIEWER_PREVIEW_CACHE_ITEMS", 10, minimum=6, maximum=64)
+
+    if not _preview_cache_adaptive_enabled():
+        return 10
+
+    if available_gb is None:
+        try:
+            available_gb = float(_safe_virtual_memory().available) / (1024**3)
+        except Exception:
+            return 10
+
+    edge = memory_preview_max_edge()
+    preview_mb = max(6.0, (edge / 1920.0) ** 2 * 12.0)
+
+    budget_fraction = 0.08
+    budget_cap_mb = 1200.0
+    try:
+        from skyspotter_profile import indexing_loads_compete, is_lite_build
+
+        if not indexing_loads_compete():
+            budget_fraction = 0.12
+            budget_cap_mb = 1600.0
+        if is_lite_build():
+            budget_fraction = max(budget_fraction, 0.14)
+            budget_cap_mb = 1800.0
+    except Exception:
+        pass
+
+    budget_mb = min(float(available_gb) * 1024.0 * budget_fraction, budget_cap_mb)
+    items = int(budget_mb / preview_mb)
+
+    if available_gb >= 24:
+        floor = 20
+    elif available_gb >= 16:
+        floor = 16
+    elif available_gb >= 10:
+        floor = 14
+    elif available_gb >= 6:
+        floor = 12
+    elif available_gb >= 3:
+        floor = 8
+    else:
+        floor = 6
+
+    min_items = _env_int("RAWVIEWER_PREVIEW_CACHE_ITEMS_MIN", 6, minimum=4, maximum=32)
+    max_items = _env_int("RAWVIEWER_PREVIEW_CACHE_ITEMS_MAX", 64, minimum=8, maximum=128)
+    return max(min_items, min(max(floor, items), max_items))
+
+
 class MemoryMonitor:
     """Monitor system memory usage and provide cache sizing recommendations."""
 
@@ -1095,8 +1553,14 @@ class MemoryMonitor:
 
     def get_memory_info(self) -> Dict[str, float]:
         """Get current memory usage information."""
-        system_memory = psutil.virtual_memory()
-        process_memory = self.process.memory_info()
+        system_memory = _safe_virtual_memory()
+        try:
+            process_memory = self.process.memory_info()
+        except Exception as exc:
+            logger.warning("process.memory_info() failed (%s)", exc)
+            from types import SimpleNamespace
+
+            process_memory = SimpleNamespace(rss=0, vms=0)
 
         return {
             'system_total_gb': system_memory.total / (1024**3),
@@ -1105,6 +1569,39 @@ class MemoryMonitor:
             'process_rss_mb': process_memory.rss / (1024**2),
             'process_vms_mb': process_memory.vms / (1024**2)
         }
+
+    def system_memory_pressure_level(
+        self, memory_info: Dict[str, float] | None = None
+    ) -> str:
+        """Classify system RAM pressure ('critical', 'elevated', 'ok').
+
+        Uses system-wide percent used and available GB only — not process RSS.
+        Large semantic-model footprints are normal on high-RAM machines and must
+        not trigger cache purges while the OS still has headroom.
+        """
+        if memory_info is None:
+            memory_info = self.get_memory_info()
+        percent_used = memory_info['system_percent_used']
+        available_gb = memory_info['system_available_gb']
+
+        crit_pct = _env_float(
+            "RAWVIEWER_MEMORY_PRESSURE_PERCENT_CRITICAL", 90.0, minimum=50.0, maximum=99.0
+        )
+        crit_avail_gb = _env_float(
+            "RAWVIEWER_MEMORY_PRESSURE_AVAILABLE_GB_CRITICAL", 2.0, minimum=0.25, maximum=32.0
+        )
+        elev_pct = _env_float(
+            "RAWVIEWER_MEMORY_PRESSURE_PERCENT_ELEVATED", 85.0, minimum=50.0, maximum=98.0
+        )
+        elev_avail_gb = _env_float(
+            "RAWVIEWER_MEMORY_PRESSURE_AVAILABLE_GB_ELEVATED", 4.0, minimum=0.5, maximum=64.0
+        )
+
+        if percent_used >= crit_pct or available_gb <= crit_avail_gb:
+            return 'critical'
+        if percent_used >= elev_pct or available_gb <= elev_avail_gb:
+            return 'elevated'
+        return 'ok'
 
     def get_recommended_cache_sizes(self) -> Dict[str, int]:
         """Get recommended cache sizes based on available memory."""
@@ -1124,9 +1621,20 @@ class MemoryMonitor:
         max_thumbnails = max(
             50, int((cache_budget_gb * 1024 * 0.2) / thumbnail_mb))
 
+        preview_items = recommended_preview_cache_items(available_gb)
+
         return {
-            'full_images': min(max_full_images, 100),
-            'thumbnails': min(max_thumbnails, 2000),
+            # Opt-in override for zoomed-culling workflows: retaining more
+            # sensor-res buffers makes zoomed A<->B revisits instant, at
+            # ~100-200MB per slot. Default stays conservative for 8GB machines.
+            'full_images': _env_int(
+                "RAWVIEWER_FULL_IMAGE_CACHE_ITEMS",
+                min(max_full_images, 8),
+                minimum=2,
+                maximum=32,
+            ),
+            'thumbnails': min(max_thumbnails, 1000),
+            'preview_images': min(preview_items, 16),
             'cache_budget_mb': int(cache_budget_gb * 1024)
         }
 
@@ -1146,7 +1654,7 @@ class ImageCache(QObject):
         self.persistent_cache_enabled = persistent_cache_enabled
         if self.persistent_cache_enabled:
             if cache_dir is None:
-                cache_dir = cache_root()
+                cache_dir = os.path.expanduser("~/.skyspotter_cache")
             os.makedirs(cache_dir, exist_ok=True)
             self.cache_dir = cache_dir
         else:
@@ -1160,14 +1668,35 @@ class ImageCache(QObject):
         # Initialize caches
         self.thumbnail_cache = LRUCache(max_size=cache_sizes['thumbnails'])
         self.grid_cache = LRUCache(max_size=cache_sizes['thumbnails'] // 2)
-        self.preview_cache = LRUCache(max_size=10) # Keep a few high-res previews in memory
+        self.preview_cache = LRUCache(
+            max_size=cache_sizes['preview_images']
+        )  # High-res preview working set (RAM-adaptive)
         self.full_image_cache = LRUCache(max_size=cache_sizes['full_images'])
         self.pixmap_cache = LRUCache(max_size=cache_sizes['full_images'])
+        self.libraw_preview_paths: set = set()
+        if self.cache_dir:
+            self._libraw_preview_paths_file = os.path.join(self.cache_dir, "libraw_preview_paths.json")
+            self._load_libraw_preview_paths()
+        else:
+            self._libraw_preview_paths_file = None
+        # Session-scoped provenance: full_image_cache keys currently holding an
+        # embedded-JPEG stand-in rather than the app's own RAW-decoded pixels
+        # (see mark_full_image_source). Many camera bodies (Canon CR3, Sony
+        # ARW, ...) embed a JPEG preview whose pixel dimensions reach/exceed
+        # FULL_EMBEDDED_SENSOR_COVERAGE of the true sensor resolution -- by
+        # dimensions alone that stand-in is indistinguishable from a true
+        # decode, which previously caused every "does this already cover
+        # sensor resolution" check (the fit-view display, the cached-full
+        # check, and process_full_image's own cache short-circuit) to
+        # conclude no further work was needed, permanently blocking the real
+        # RAW pipeline from ever running for that file during normal browsing.
+        self.full_image_embedded_jpeg_paths: set = set()
         if self.persistent_cache_enabled:
             self.exif_cache = PersistentEXIFCache(cache_dir)
             self.disk_thumbnail_cache = PersistentThumbnailCache(cache_dir)
             self.disk_grid_cache = PersistentGridCache(cache_dir)
             self.disk_preview_cache = PersistentPreviewCache(cache_dir)
+            self._purge_stale_oriented_pixel_caches(cache_dir)
         else:
             # Trial mode: keep all acceleration in RAM and never create/write local cache files.
             self.exif_cache = MemoryOnlyPersistentCache()
@@ -1190,48 +1719,272 @@ class ImageCache(QObject):
 
         # Memory management
         self.max_memory_mb = cache_sizes['cache_budget_mb']
-        self.memory_check_interval = 60  # seconds
+        self.memory_check_interval = 5  # seconds
         self.last_memory_check = 0
+        self.last_aggressive_purge = 0.0
+        self.last_reduce_cache = 0.0
+
+        # Background memory-pressure polling: get_memory_info() spawns a
+        # `vm_stat` subprocess on macOS (see _darwin_memory_stats_from_vm_stat),
+        # tens of ms per call. _check_memory_pressure() used to call it inline
+        # on whatever thread touched the cache -- during gallery scrolling
+        # that's the main/GUI thread, so every memory_check_interval seconds
+        # of active scrolling paid a synchronous subprocess-spawn cost right
+        # in the scroll path. A lazily-started daemon thread now refreshes a
+        # cached snapshot on that same interval; _check_memory_pressure only
+        # ever reads it.
+        self._mem_poll_lock = threading.Lock()
+        self._mem_poll_info: Optional[Dict[str, float]] = None
+        self._mem_poll_pressure = 'ok'
+        self._mem_poll_thread: Optional[threading.Thread] = None
+
+        # Background RAW-orientation verification (see get_exif): one short
+        # queue drained by a single lazily-started daemon thread, one attempt
+        # per path per session.
+        self._orient_verify_lock = threading.Lock()
+        self._orient_verify_attempted: set = set()
+        # Dedup-only set (never holds a value, just "already tried"), so
+        # capping it is cheap to reason about: a path evicted here that
+        # comes up again just gets re-queued for one more probe, and a
+        # record that already probed clean short-circuits before ever
+        # reaching this set again (get_exif/get_multiple_exif only call
+        # _schedule_orientation_verify when verified_orientation is falsy).
+        # Uncapped, a very large library browsed in one long session grows
+        # this set forever; same clear-when-full convention as
+        # enhanced_raw_processor._embedded_scan_miss_cache.
+        self._orient_verify_attempted_max = 4096
+        self._orient_verify_queue: list = []
+        self._orient_verify_thread: Optional[threading.Thread] = None
+        self._closing = False
+
+    def _purge_stale_oriented_pixel_caches(self, cache_dir: str) -> None:
+        """One-time purge of persisted PIXEL caches when the orientation logic version bumps.
+
+        RAW_EXIF_SENSOR_META_VER invalidates cached EXIF ROWS, but the disk
+        thumbnail/grid/preview JPEGs persist the decoded PIXELS. A version with buggy
+        rotation can write content-rotated pixels at plausible dimensions — invisible to
+        every dimension-based self-heal (they compare width/height, not content). Stamp
+        the orientation version in the cache dir and drop all persisted pixel tiers when
+        it changes, so upgraded users never see stale sideways thumbnails.
+        """
+        try:
+            from enhanced_raw_processor import RAW_EXIF_SENSOR_META_VER
+
+            marker = os.path.join(cache_dir, "orient_pixel_ver.txt")
+            stored = None
+            try:
+                with open(marker, "r", encoding="utf-8") as fh:
+                    stored = int(fh.read().strip() or 0)
+            except Exception:
+                stored = None
+            if stored == int(RAW_EXIF_SENSOR_META_VER):
+                return
+            print(
+                "[CACHE] Orientation version changed "
+                f"({stored} -> {RAW_EXIF_SENSOR_META_VER}); purging persisted pixel caches"
+            )
+            for cache in (
+                self.disk_thumbnail_cache,
+                self.disk_grid_cache,
+                self.disk_preview_cache,
+            ):
+                try:
+                    cache.clear()
+                except Exception:
+                    pass
+            with open(marker, "w", encoding="utf-8") as fh:
+                fh.write(str(int(RAW_EXIF_SENSOR_META_VER)))
+        except Exception:
+            pass
 
     @staticmethod
     def _path_key(file_path: str) -> str:
         return _cache_path_key(file_path)
 
+    def _ensure_mem_poll_thread(self) -> None:
+        """Start the background memory-pressure poller if it isn't already running."""
+        if getattr(self, "_closing", False):
+            return
+        with self._mem_poll_lock:
+            if self._mem_poll_thread is not None and self._mem_poll_thread.is_alive():
+                return
+            self._mem_poll_thread = threading.Thread(
+                target=self._mem_poll_worker,
+                name="mem-pressure-poll",
+                daemon=True,
+            )
+            self._mem_poll_thread.start()
+
+    def _mem_poll_worker(self) -> None:
+        """Refresh the cached memory-info/pressure snapshot every
+        memory_check_interval seconds, off the main/calling thread.
+        """
+        while not getattr(self, "_closing", False):
+            try:
+                info = self.memory_monitor.get_memory_info()
+                level = self.memory_monitor.system_memory_pressure_level(info)
+            except Exception:
+                info, level = None, None
+            if info is not None:
+                with self._mem_poll_lock:
+                    self._mem_poll_info = info
+                    self._mem_poll_pressure = level
+            time.sleep(self.memory_check_interval)
+
     def _check_memory_pressure(self) -> bool:
-        """Check if we're under memory pressure and need to reduce cache sizes."""
+        """Check if we're under memory pressure and need to reduce cache sizes.
+
+        Reads the snapshot the background poller last collected rather than
+        collecting it inline -- get_memory_info() spawns a `vm_stat`
+        subprocess on macOS, and this is called from cache-read paths
+        (get_grid/get_thumbnail/etc.) that run on whatever thread touches
+        the cache, including the main/GUI thread during gallery scrolling.
+        """
         current_time = time.time()
         if current_time - self.last_memory_check < self.memory_check_interval:
             return False
-
         self.last_memory_check = current_time
-        memory_info = self.memory_monitor.get_memory_info()
+        self._ensure_mem_poll_thread()
 
-        # Emit warning if memory usage is high
-        if memory_info['system_percent_used'] > 85:
-            self.memory_warning.emit(memory_info['system_percent_used'])
+        with self._mem_poll_lock:
+            memory_info = self._mem_poll_info
+            pressure_level = self._mem_poll_pressure
 
-            # Reduce cache sizes under memory pressure
+        if memory_info is None:
+            # No snapshot yet (first check(s) after startup) -- the poller
+            # just started; nothing to act on until it reports back.
+            return False
+
+        percent_used = memory_info['system_percent_used']
+        available_gb = memory_info['system_available_gb']
+        rss_mb = memory_info['process_rss_mb']
+
+        if pressure_level == 'critical':
+            if current_time - getattr(self, 'last_aggressive_purge', 0.0) < 60.0:
+                # Under cooldown to prevent app freeze / infinite loop of purging
+                return False
+            self.last_aggressive_purge = current_time
+            logger.warning(
+                "CRITICAL system memory pressure (system: %.1f%% used, %.1f GB free, process RSS: %.1f MB). Aggressively purging caches.",
+                percent_used,
+                available_gb,
+                rss_mb,
+            )
+            self.memory_warning.emit(percent_used)
+            self._aggressive_purge()
+            return True
+
+        if pressure_level == 'elevated':
+            if current_time - getattr(self, 'last_reduce_cache', 0.0) < 20.0:
+                # Under cooldown
+                return False
+            self.last_reduce_cache = current_time
+            logger.warning(
+                "Elevated system memory pressure (system: %.1f%% used, %.1f GB free, process RSS: %.1f MB). Reducing cache sizes.",
+                percent_used,
+                available_gb,
+                rss_mb,
+            )
+            self.memory_warning.emit(percent_used)
             self._reduce_cache_sizes()
             return True
 
         return False
 
+    def _aggressive_purge(self) -> None:
+        """Aggressively clear heavy caches and drop their capacities to a minimum under critical pressure."""
+        logger.info("Performing aggressive cache purge...")
+        
+        # Clear heavy caches entirely
+        self.full_image_cache.clear()
+        self.pixmap_cache.clear()
+        
+        # Aggressively drop capacities to 3 thread-safely
+        self.full_image_cache.shrink_to_size(3)
+        self.pixmap_cache.shrink_to_size(3)
+        
+        # Reduce and clear other caches aggressively thread-safely
+        new_thumbnail_size = max(10, int(self.thumbnail_cache.max_size * 0.5))
+        new_grid_size = max(5, int(self.grid_cache.max_size * 0.5))
+        new_preview_size = max(4, int(self.preview_cache.max_size * 0.5))
+        
+        self.thumbnail_cache.shrink_to_size(new_thumbnail_size)
+        self.grid_cache.shrink_to_size(new_grid_size)
+        self.preview_cache.shrink_to_size(new_preview_size)
+
+        self._release_gpu_memory()
+
+        import gc
+        gc.collect()
+
     def _reduce_cache_sizes(self) -> None:
         """Reduce cache sizes when under memory pressure."""
         # Reduce by 25%
         new_full_size = max(5, int(self.full_image_cache.max_size * 0.75))
+        new_pixmap_size = max(5, int(self.pixmap_cache.max_size * 0.75))
         new_thumbnail_size = max(20, int(self.thumbnail_cache.max_size * 0.75))
+        new_grid_size = max(10, int(self.grid_cache.max_size * 0.75))
+        min_preview = _env_int(
+            "RAWVIEWER_PREVIEW_CACHE_ITEMS_MIN", 6, minimum=4, maximum=32
+        )
+        new_preview_size = max(
+            min_preview, int(self.preview_cache.max_size * 0.75)
+        )
 
-        # Clear excess items
-        while len(self.full_image_cache.cache) > new_full_size:
-            self.full_image_cache.cache.popitem(last=False)
+        # Clear excess items thread-safely and update max sizes
+        self.full_image_cache.shrink_to_size(new_full_size)
+        self.pixmap_cache.shrink_to_size(new_pixmap_size)
+        self.thumbnail_cache.shrink_to_size(new_thumbnail_size)
+        self.grid_cache.shrink_to_size(new_grid_size)
+        self.preview_cache.shrink_to_size(new_preview_size)
 
-        while len(self.thumbnail_cache.cache) > new_thumbnail_size:
-            self.thumbnail_cache.cache.popitem(last=False)
+        self._release_gpu_memory()
 
-        # Update max sizes
-        self.full_image_cache.max_size = new_full_size
-        self.thumbnail_cache.max_size = new_thumbnail_size
+    def _release_gpu_memory(self) -> None:
+        """Return the GPU/unified-memory caching allocator's pool to the OS.
+
+        On Apple Silicon, PyTorch's MPS allocator caches freed device buffers
+        in UNIFIED memory (shared with system RAM) rather than releasing them
+        -- that pool is invisible to gc/tracemalloc but shows up directly as
+        process RSS, and nothing in this codebase ever called
+        torch.mps.empty_cache() before this. v2.5 had no GPU decode path at
+        all and doesn't have this cost; this build's GPU-accelerated decode
+        (gpu_raw_processor.py) does. Piggyback on the existing cache-pressure
+        cadence rather than calling it every decode (that would defeat the
+        allocator's whole point -- reuse without re-requesting from the OS).
+        """
+        try:
+            from gpu_raw_processor import release_cached_gpu_memory
+
+            release_cached_gpu_memory()
+        except Exception:
+            logger.debug("GPU memory release failed", exc_info=True)
+
+    def _heal_raw_orientation(self, file_path: str, arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """Self-heal: return arr already in EXIF display orientation, re-orienting if not.
+
+        Every cache tier (thumbnail, grid, preview) must return display-oriented pixels so
+        the gallery/single-view never render a stale, wrongly-rotated buffer. Uses the same
+        make-independent authority as extraction (finalize_index_thumbnail_array), which is
+        idempotent, so calling this on already-correct pixels is a no-op.
+        """
+        if arr is None:
+            return None
+        try:
+            from common_image_loader import (
+                finalize_index_thumbnail_array,
+                index_thumbnail_needs_orient_fix,
+                is_raw_file,
+            )
+
+            if not is_raw_file(file_path):
+                return arr
+            if not index_thumbnail_needs_orient_fix(file_path, arr, cache=self):
+                return arr
+            repaired = finalize_index_thumbnail_array(file_path, arr, cache=self)
+            return repaired if repaired is not None else arr
+        except Exception:
+            return arr
 
     def get_thumbnail(self, file_path: str) -> Optional[np.ndarray]:
         """Get cached thumbnail or return None if not cached."""
@@ -1239,11 +1992,19 @@ class ImageCache(QObject):
         self._check_memory_pressure()
 
         key = self._path_key(file_path)
+
+        def _validate_raw_thumbnail(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+            return self._heal_raw_orientation(file_path, arr)
+
         # Check in-memory cache first
         thumbnail = self.thumbnail_cache.get(key)
         if thumbnail is not None:
+            validated = _validate_raw_thumbnail(thumbnail)
+            if validated is not thumbnail:
+                self.thumbnail_cache.put(key, validated.copy())
+                self.disk_thumbnail_cache.remove(file_path)
             self.cache_hit.emit(file_path, 'thumbnail')
-            return thumbnail
+            return validated
         
         # Check disk cache for JPEG thumbnails
         jpeg_data = self.disk_thumbnail_cache.get(file_path)
@@ -1254,6 +2015,9 @@ class ImageCache(QObject):
                 thumbnail = decode_embedded_jpeg_bytes(jpeg_data, max_size=0)
                 if thumbnail is None:
                     raise ValueError("decode_embedded_jpeg_bytes failed")
+                thumbnail = _validate_raw_thumbnail(thumbnail)
+                if thumbnail is None:
+                    raise ValueError("thumbnail orientation validation failed")
                 # Also cache in memory for faster subsequent access
                 self.thumbnail_cache.put(key, thumbnail.copy())
                 self.cache_hit.emit(file_path, 'thumbnail')
@@ -1292,16 +2056,16 @@ class ImageCache(QObject):
                 new_h = max(1, int(h * scale))
                 thumb_pil = pil_img.resize((new_w, new_h), Image.Resampling.HAMMING)
                 thumbnail = np.array(thumb_pil)
-                
+
                 # Compress and store in disk/memory caches
-                buffer = io.BytesIO()
-                thumb_pil.save(buffer, format='JPEG', quality=85)
-                t_jpeg = buffer.getvalue()
+                from common_image_loader import encode_tile_bytes
+
+                t_jpeg = encode_tile_bytes(thumb_pil)
                 self.put_thumbnail(file_path, thumbnail, t_jpeg)
                 return thumbnail
             except Exception:
                 pass
-                
+
         # 2. Downsample from preview cache (memory or disk, up to ~512px) if available
         preview = self.preview_cache.get(key)
         if preview is None:
@@ -1331,11 +2095,11 @@ class ImageCache(QObject):
                 new_h = max(1, int(h * scale))
                 thumb_pil = pil_img.resize((new_w, new_h), Image.Resampling.HAMMING)
                 thumbnail = np.array(thumb_pil)
-                
+
                 # Compress and store in disk/memory caches
-                buffer = io.BytesIO()
-                thumb_pil.save(buffer, format='JPEG', quality=85)
-                t_jpeg = buffer.getvalue()
+                from common_image_loader import encode_tile_bytes
+
+                t_jpeg = encode_tile_bytes(thumb_pil)
                 self.put_thumbnail(file_path, thumbnail, t_jpeg)
                 return thumbnail
             except Exception:
@@ -1359,6 +2123,44 @@ class ImageCache(QObject):
             if jpeg_data is not None:
                 self.disk_thumbnail_cache.put(file_path, jpeg_data)
 
+    def get_preview_memory_only(self, file_path: str) -> Optional[np.ndarray]:
+        """In-memory preview only -- never decodes disk tier on the calling thread."""
+        key = self._path_key(file_path)
+        return self.preview_cache.peek(key)
+
+    def get_grid_memory_only(self, file_path: str) -> Optional[np.ndarray]:
+        """In-memory grid only -- never decodes disk tier on the calling thread."""
+        key = self._path_key(file_path)
+        return self.grid_cache.peek(key)
+
+    def get_thumbnail_memory_only(self, file_path: str) -> Optional[np.ndarray]:
+        """In-memory thumbnail only -- never decodes disk tier on the calling thread."""
+        key = self._path_key(file_path)
+        return self.thumbnail_cache.peek(key)
+
+    def has_warm_thumbnail_in_memory(self, file_path: str) -> bool:
+        """True if a grid/thumbnail tier is already in the fast in-memory
+        cache -- no disk read, no decode, unlike get_grid()/get_thumbnail().
+
+        Those two fall through to a disk-cache read + synchronous PIL decode
+        + EXIF transpose on an in-memory miss. Callers that only want to know
+        "is this warm, should I skip prefetching it" (filmstrip prefetch scan
+        over dozens of neighbor files) were using get_grid()/get_thumbnail()
+        for that check and paying the decode cost as a side effect -- on a
+        long session, once the small in-memory tier evicts entries the disk
+        tier still has, every such "check" becomes a real synchronous decode.
+        Measured via faulthandler stack dumps during a 250+ navigation
+        stress test: multi-second main-thread stalls with the current frame
+        inside PIL's WebP/JPEG decode, called from exactly this "just
+        checking" path.
+        """
+        key = self._path_key(file_path)
+        # peek(): a warmth CHECK must not promote never-displayed entries to MRU.
+        return (
+            self.grid_cache.peek(key) is not None
+            or self.thumbnail_cache.peek(key) is not None
+        )
+
     def get_grid(self, file_path: str) -> Optional[np.ndarray]:
         """Get cached grid image (max 512px) or return None if not cached."""
         if 'grid_requests' not in self.stats:
@@ -1370,8 +2172,12 @@ class ImageCache(QObject):
         # 1. Check in-memory grid cache
         grid = self.grid_cache.get(key)
         if grid is not None:
+            healed = self._heal_raw_orientation(file_path, grid)
+            if healed is not grid:
+                self.grid_cache.put(key, healed.copy())
+                self.disk_grid_cache.remove(file_path)
             self.cache_hit.emit(file_path, 'grid')
-            return grid
+            return healed
 
         # 2. Check disk grid cache
         jpeg_data = self.disk_grid_cache.get(file_path)
@@ -1384,6 +2190,7 @@ class ImageCache(QObject):
                 if pil_image.mode != 'RGB':
                     pil_image = pil_image.convert('RGB')
                 grid = np.array(pil_image)
+                grid = self._heal_raw_orientation(file_path, grid)
                 self.grid_cache.put(key, grid.copy())
                 self.cache_hit.emit(file_path, 'grid')
                 return grid
@@ -1419,11 +2226,11 @@ class ImageCache(QObject):
                 new_h = max(1, int(h * scale))
                 grid_pil = pil_img.resize((new_w, new_h), Image.Resampling.HAMMING)
                 grid = np.array(grid_pil)
-                
+
                 # Compress and store in disk/memory caches
-                buffer = io.BytesIO()
-                grid_pil.save(buffer, format='JPEG', quality=85)
-                g_jpeg = buffer.getvalue()
+                from common_image_loader import encode_tile_bytes
+
+                g_jpeg = encode_tile_bytes(grid_pil)
                 self.put_grid(file_path, grid, g_jpeg)
                 return grid
             except Exception:
@@ -1482,13 +2289,12 @@ class ImageCache(QObject):
                 else:
                     try:
                         from PIL import Image
-                        import io
+                        from common_image_loader import encode_tile_bytes
+
                         if grid.dtype != np.uint8:
                             grid = grid.astype(np.uint8)
                         pil_image = Image.fromarray(grid)
-                        buffer = io.BytesIO()
-                        pil_image.save(buffer, format='JPEG', quality=85)
-                        self.disk_grid_cache.put(file_path, buffer.getvalue())
+                        self.disk_grid_cache.put(file_path, encode_tile_bytes(pil_image))
                     except Exception:
                         pass
 
@@ -1510,15 +2316,24 @@ class ImageCache(QObject):
             jpeg_data = self.disk_grid_cache.get(file_path)
         if jpeg_data is not None:
              try:
-                from PIL import Image, ImageOps
-                import io
-                pil_image = Image.open(io.BytesIO(jpeg_data))
-                pil_image = ImageOps.exif_transpose(pil_image)
-                if pil_image.mode != 'RGB':
-                    pil_image = pil_image.convert('RGB')
-                preview = np.array(pil_image)
+                # cv2.imdecode over PIL: several times faster on the
+                # 1280-1536px entries here, and this path runs on the
+                # CALLING thread -- navigation paints call get_preview()
+                # from the UI thread, so every ms is a paint stall. EXIF
+                # transpose is intentionally absent: disk preview entries
+                # are re-encoded from already-oriented pixels with EXIF
+                # stripped (_jpeg_bytes_max_edge), and grid tiles are
+                # encoded from oriented arrays.
+                import cv2
+
+                arr = cv2.imdecode(
+                    np.frombuffer(jpeg_data, np.uint8), cv2.IMREAD_COLOR
+                )
+                if arr is None:
+                    raise ValueError("imdecode failed")
+                preview = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
                 # Also cache in memory
-                self.preview_cache.put(key, preview.copy())
+                self.preview_cache.put(key, preview)
                 self.cache_hit.emit(file_path, 'preview')
                 return preview
              except Exception:
@@ -1527,15 +2342,63 @@ class ImageCache(QObject):
         self.cache_miss.emit(file_path, 'preview')
         return None
 
-    def put_preview(self, file_path: str, preview: np.ndarray, jpeg_data: bytes = None) -> None:
-        """Cache a preview image (memory); optional disk JPEG clamped to disk_preview_max_edge()."""
+    def put_preview(
+        self,
+        file_path: str,
+        preview: np.ndarray,
+        jpeg_data: bytes = None,
+        *,
+        libraw_rendered: bool = False,
+    ) -> None:
+        """Cache a preview image (memory); optional disk JPEG clamped to disk_preview_max_edge().
+
+        ``libraw_rendered`` marks the preview as LibRaw-pipeline pixels (vs
+        embedded-JPEG-derived) so the RAW workflow can refuse to paint
+        camera-JPEG interim tiers (session-scoped provenance).
+        """
         if preview is not None:
             key = self._path_key(file_path)
             self.preview_cache.put(key, preview.copy())
+            if libraw_rendered:
+                self.libraw_preview_paths.add(key)
+                self._prune_libraw_preview_paths()
+                self._save_libraw_preview_paths()
+            else:
+                if key in self.libraw_preview_paths:
+                    self.libraw_preview_paths.discard(key)
+                    self._save_libraw_preview_paths()
             if jpeg_data is not None:
                 cap = disk_preview_max_edge()
                 jpeg_data = _jpeg_bytes_max_edge(jpeg_data, cap)
                 self.disk_preview_cache.put(file_path, jpeg_data)
+            self._enforce_numpy_cache_byte_budget(
+                self.preview_cache,
+                fraction=0.25,
+                min_keep=2,
+                label="preview",
+            )
+
+    def is_libraw_preview(self, file_path: str) -> bool:
+        """True when the cached preview holds LibRaw-rendered pixels (this session)."""
+        return self._path_key(file_path) in self.libraw_preview_paths
+
+    def _prune_libraw_preview_paths(self, max_paths: int = 2048) -> None:
+        """Bound session provenance set (paths only)."""
+        n = len(self.libraw_preview_paths)
+        if n <= max_paths:
+            return
+        # Discard arbitrary surplus (set has no order); prefer keeping keys still in preview.
+        excess = n - max_paths
+        drop = []
+        for k in self.libraw_preview_paths:
+            if self.preview_cache.peek(k) is None:
+                drop.append(k)
+            if len(drop) >= excess:
+                break
+        for k in drop:
+            self.libraw_preview_paths.discard(k)
+        while len(self.libraw_preview_paths) > max_paths:
+            self.libraw_preview_paths.pop()
 
     def get_full_image(self, file_path: str) -> Optional[np.ndarray]:
         """Get cached full image or return None if not cached."""
@@ -1553,7 +2416,110 @@ class ImageCache(QObject):
     def put_full_image(self, file_path: str, image: np.ndarray) -> None:
         """Cache a full processed image."""
         if image is not None:
-            self.full_image_cache.put(file_path, image.copy())
+            img_copy = image.copy()
+            self.full_image_cache.put(file_path, img_copy)
+            self._enforce_numpy_cache_byte_budget(
+                self.full_image_cache,
+                fraction=0.55,
+                min_keep=2,
+                label="full-image",
+            )
+
+    def mark_full_image_source(self, file_path: str, *, is_embedded_jpeg: bool) -> None:
+        """Track whether the cached full_image entry is an embedded-JPEG
+        stand-in rather than the app's own RAW-decoded pixels -- see
+        full_image_embedded_jpeg_paths. Call alongside every put_full_image()
+        so the flag never goes stale: mark True from the embedded-preview
+        shortcut, False once a true decode overwrites that same key.
+        """
+        if not file_path:
+            return
+        key = self._path_key(file_path)
+        if is_embedded_jpeg:
+            self.full_image_embedded_jpeg_paths.add(key)
+            self._prune_full_image_embedded_jpeg_paths()
+        else:
+            self.full_image_embedded_jpeg_paths.discard(key)
+
+    def full_image_is_embedded_jpeg(self, file_path: str) -> bool:
+        """True when the currently cached full_image for this path is an
+        embedded-JPEG stand-in (see mark_full_image_source)."""
+        if not file_path:
+            return False
+        return self._path_key(file_path) in self.full_image_embedded_jpeg_paths
+
+    def _prune_full_image_embedded_jpeg_paths(self, max_paths: int = 2048) -> None:
+        """Bound session provenance set (paths only); same shape as
+        _prune_libraw_preview_paths."""
+        n = len(self.full_image_embedded_jpeg_paths)
+        if n <= max_paths:
+            return
+        excess = n - max_paths
+        drop = []
+        for k in self.full_image_embedded_jpeg_paths:
+            if self.full_image_cache.peek(k) is None:
+                drop.append(k)
+            if len(drop) >= excess:
+                break
+        for k in drop:
+            self.full_image_embedded_jpeg_paths.discard(k)
+        while len(self.full_image_embedded_jpeg_paths) > max_paths:
+            self.full_image_embedded_jpeg_paths.pop()
+
+    def _estimate_entry_bytes(self, value: Any) -> int:
+        try:
+            if hasattr(value, "nbytes"):
+                return int(value.nbytes)
+            # QPixmap / QImage
+            if hasattr(value, "width") and hasattr(value, "height") and callable(value.width):
+                w, h = int(value.width()), int(value.height())
+                # Assume up to 4 bytes/pixel (RGBA) for budget purposes.
+                return max(0, w * h * 4)
+        except Exception:
+            pass
+        return 0
+
+    def _enforce_numpy_cache_byte_budget(
+        self,
+        lru: "LRUCache",
+        *,
+        fraction: float,
+        min_keep: int = 2,
+        label: str = "cache",
+    ) -> None:
+        """Evict LRU entries until sum(nbytes) fits fraction of max_memory_mb."""
+        try:
+            budget_bytes = float(self.max_memory_mb) * 1024 * 1024 * float(fraction)
+            cache = lru.cache
+            with lru.lock:
+                total = sum(self._estimate_entry_bytes(v) for v in cache.values())
+                if total <= budget_bytes:
+                    return
+                evicted = 0
+                while total > budget_bytes and len(cache) > max(1, min_keep):
+                    _, oldest = cache.popitem(last=False)
+                    total -= self._estimate_entry_bytes(oldest)
+                    evicted += 1
+            if evicted:
+                logger.info(
+                    "%s cache: evicted %d oldest (budget ~%.0fMB, now ~%.0fMB, %d left)",
+                    label,
+                    evicted,
+                    budget_bytes / 1e6,
+                    total / 1e6,
+                    len(cache),
+                )
+        except Exception:
+            logger.warning("%s byte-budget enforcement failed", label, exc_info=True)
+
+    def _enforce_full_image_byte_budget(self) -> None:
+        """Backward-compatible alias for full-image RAM budget."""
+        self._enforce_numpy_cache_byte_budget(
+            self.full_image_cache,
+            fraction=0.55,
+            min_keep=2,
+            label="full-image",
+        )
 
     def get_pixmap(self, file_path: str) -> Optional[QPixmap]:
         """Get cached QPixmap or return None if not cached."""
@@ -1571,13 +2537,87 @@ class ImageCache(QObject):
         """Cache a QPixmap."""
         if pixmap is not None and not pixmap.isNull():
             self.pixmap_cache.put(file_path, pixmap)
+            self._enforce_numpy_cache_byte_budget(
+                self.pixmap_cache,
+                fraction=0.20,
+                min_keep=2,
+                label="pixmap",
+            )
+
+    def clear_heavy_memory_tiers(self, keep_path: Optional[str] = None) -> None:
+        """Drop full/preview/pixmap RAM tiers (keep grid/thumb for gallery scroll).
+
+        Call on folder change. Optional keep_path retains that file's heavy entries
+        when still navigating within open flow.
+        """
+        keep_key = self._path_key(keep_path) if keep_path else None
+        keep_full = None
+        keep_preview = None
+        keep_pixmap = None
+        keep_full_is_embedded_jpeg = False
+        if keep_path:
+            keep_full = self.full_image_cache.get(keep_path)
+            keep_preview = self.preview_cache.get(keep_key)
+            keep_pixmap = self.pixmap_cache.get(keep_path)
+            keep_full_is_embedded_jpeg = self.full_image_is_embedded_jpeg(keep_path)
+
+        self.full_image_cache.clear()
+        self.preview_cache.clear()
+        self.pixmap_cache.clear()
+        self.libraw_preview_paths.clear()
+        self.full_image_embedded_jpeg_paths.clear()
+
+        if keep_path and keep_full is not None:
+            self.full_image_cache.put(keep_path, keep_full)
+            # Preserve provenance across the clear -- otherwise a kept
+            # embedded-JPEG stand-in would look like a true decode afterward
+            # and never get upgraded to the real RAW pixels.
+            self.mark_full_image_source(keep_path, is_embedded_jpeg=keep_full_is_embedded_jpeg)
+        if keep_path and keep_preview is not None and keep_key:
+            self.preview_cache.put(keep_key, keep_preview)
+        if keep_path and keep_pixmap is not None:
+            self.pixmap_cache.put(keep_path, keep_pixmap)
+
+    def on_folder_changed(self, keep_path: Optional[str] = None) -> None:
+        """Folder scope changed: free heavy RAM; leave disk thumbs for warm reopen."""
+        self.clear_heavy_memory_tiers(keep_path=keep_path)
+        try:
+            from unified_image_processor import prune_libraw_unsupported_paths
+
+            prune_libraw_unsupported_paths(clear_all=False, max_keep=512)
+        except Exception:
+            pass
 
     def get_exif_memory_only(self, file_path: str) -> Optional[Dict[str, Any]]:
         """In-memory EXIF only (no SQLite) — for cache-hit emit during preview-first."""
         return self.exif_memory_cache.get(file_path)
 
-    def get_exif(self, file_path: str) -> Optional[Dict[str, Any]]:
-        """Get cached EXIF data or return None if not cached."""
+    def get_exif_for_ui(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """UI hot path: never blocks (see get_exif's verify=False default)."""
+        return self.get_exif(file_path)
+
+    def get_exif(
+        self, file_path: str, *, verify: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Get cached EXIF data or return None if not cached.
+
+        RAW orientation trustworthiness: records lacking ``verified_orientation``
+        used to be re-checked synchronously on EVERY call via
+        cached_raw_exif_orientation_trustworthy() -> rawpy.imread() -- a real
+        file open that stalled whatever thread called this (including the Qt
+        main thread: status bar, HUD, prefetch decisions), and whose
+        successful result was never memoized, so the same file re-paid the
+        probe on every subsequent call too.
+
+        Now: ``verify=False`` (default) returns the record optimistically and
+        schedules the probe on a background thread; every pixel-rotation path
+        re-derives orientation at decode time, so a briefly-unverified record
+        can't rotate pixels wrongly, and the background result either stamps
+        verified_orientation=True or evicts the bad record so the next fetch
+        re-extracts fresh. ``verify=True`` (decode paths that gate orientation
+        decisions on this record, e.g. image_load_manager's deferred-EXIF
+        emits) keeps the synchronous probe but now memoizes success.
+        """
         self.stats['exif_requests'] += 1
 
         # 1. Check in-memory cache first
@@ -1588,12 +2628,102 @@ class ImageCache(QObject):
             if exif_data is not None:
                 self.exif_memory_cache.put(file_path, exif_data)
 
-        if exif_data is not None:
-            self.cache_hit.emit(file_path, 'exif')
-            return exif_data
-        else:
+        if exif_data is None:
             self.cache_miss.emit(file_path, 'exif')
             return None
+
+        try:
+            from enhanced_raw_processor import (
+                RAW_EXIF_SENSOR_META_VER,
+                cached_raw_exif_orientation_trustworthy,
+            )
+            cached_ver = exif_data.get('raw_exif_sensor_meta_ver', 0)
+            if cached_ver < RAW_EXIF_SENSOR_META_VER:
+                self.cache_miss.emit(file_path, 'exif')
+                return None
+            if not exif_data.get("verified_orientation"):
+                if verify:
+                    if not cached_raw_exif_orientation_trustworthy(
+                        file_path, exif_data
+                    ):
+                        self.cache_miss.emit(file_path, 'exif')
+                        return None
+                    # Memoize the successful probe so no caller ever re-pays it.
+                    exif_data = dict(exif_data)
+                    exif_data["verified_orientation"] = True
+                    self.put_exif(file_path, exif_data)
+                else:
+                    self._schedule_orientation_verify(file_path, exif_data)
+        except Exception:
+            pass
+
+        self.cache_hit.emit(file_path, 'exif')
+        return exif_data
+
+    def _schedule_orientation_verify(
+        self, file_path: str, exif_data: Dict[str, Any]
+    ) -> None:
+        """Queue a background trustworthiness probe for an unverified RAW record.
+
+        One attempt per path per session; a single lazily-started daemon
+        thread drains the queue (probes serialize on the rawpy global lock
+        anyway, so more workers would only pile up blocked threads).
+        """
+        try:
+            import common_image_loader
+
+            if not common_image_loader.is_raw_file(file_path):
+                return
+        except Exception:
+            return
+        with self._orient_verify_lock:
+            if getattr(self, "_closing", False):
+                return
+            if file_path in self._orient_verify_attempted:
+                return
+            if len(self._orient_verify_attempted) >= self._orient_verify_attempted_max:
+                self._orient_verify_attempted.clear()
+            self._orient_verify_attempted.add(file_path)
+            self._orient_verify_queue.append((file_path, dict(exif_data)))
+            if (
+                self._orient_verify_thread is None
+                or not self._orient_verify_thread.is_alive()
+            ):
+                self._orient_verify_thread = threading.Thread(
+                    target=self._orientation_verify_worker,
+                    name="exif-orient-verify",
+                    daemon=True,
+                )
+                self._orient_verify_thread.start()
+
+    def _orientation_verify_worker(self) -> None:
+        while True:
+            with self._orient_verify_lock:
+                if not self._orient_verify_queue or getattr(self, "_closing", False):
+                    self._orient_verify_thread = None
+                    return
+                path, cached = self._orient_verify_queue.pop(0)
+            try:
+                from enhanced_raw_processor import (
+                    cached_raw_exif_orientation_trustworthy,
+                )
+
+                if cached_raw_exif_orientation_trustworthy(path, cached):
+                    cached["verified_orientation"] = True
+                    if not getattr(self, "_closing", False):
+                        self.put_exif(path, cached)
+                else:
+                    # Cached orientation is wrong: drop the record so the next
+                    # fetch re-extracts fresh (extraction writes a verified one).
+                    if not getattr(self, "_closing", False):
+                        self.exif_memory_cache.remove(path)
+                    try:
+                        self.exif_cache.remove(path)
+                    except Exception:
+                        pass
+                    self.cache_miss.emit(path, 'exif')
+            except Exception:
+                pass
 
     def put_exif(
         self,
@@ -1615,37 +2745,103 @@ class ImageCache(QObject):
                     file_mtime=file_mtime,
                 )
 
+    def flush_exif_disk_cache(self) -> None:
+        """Commit batched EXIF disk writes (call after indexing batches)."""
+        if hasattr(self.exif_cache, "flush"):
+            self.exif_cache.flush()
+
     def get_capture_times_for_sort(self, file_paths: list) -> Dict[str, str]:
         """capture_time only, for folder sort (ignores stale mtime on network folders)."""
         return self.exif_cache.get_capture_times_bulk(file_paths)
+
+    def record_probed_capture_times(self, timestamps: Dict[str, float]) -> None:
+        """Persist sort-probe capture times so the next folder open skips re-probing.
+
+        timestamps values are epoch floats (from probe_capture_timestamp_from_file);
+        stored as ISO strings to match the capture_time column's existing format.
+        """
+        if not timestamps or not hasattr(self.exif_cache, "update_capture_time_bulk"):
+            return
+        import datetime
+
+        iso_times: Dict[str, str] = {}
+        for path, ts in timestamps.items():
+            if not ts or ts <= 0:
+                continue
+            try:
+                iso_times[path] = datetime.datetime.fromtimestamp(ts).strftime(
+                    "%Y:%m:%d %H:%M:%S"
+                )
+            except Exception:
+                continue
+        self.exif_cache.update_capture_time_bulk(iso_times)
 
     def get_capture_times_for_folder_sort(self, folder_path: str) -> Dict[str, str]:
         """All capture_time rows under folder_path (normalized path keys)."""
         return self.exif_cache.get_capture_times_for_folder(folder_path)
 
     def get_multiple_exif(self, file_paths: list, file_stats: Optional[Dict[str, Tuple[int, float]]] = None, fast_mode: bool = True) -> Dict[str, Dict[str, Any]]:
-        """Get cached EXIF data for multiple files at once."""
+        """Get cached EXIF data for multiple files at once.
+
+        Orientation trust for unverified RAW records is optimistic + deferred
+        to a background probe, same as get_exif's verify=False default --
+        NOT the old synchronous cached_raw_exif_orientation_trustworthy() ->
+        rawpy.imread() call per file. That call, run for every file in a
+        folder on the caller's thread (e.g. the main-thread instant-sort
+        fast path in main.py's _on_quick_folder_index_ready), turned a large
+        folder's sort into a serial rawpy-open storm that froze the UI for
+        the whole scan -- get_exif itself was already fixed for this; this
+        bulk sibling had the same synchronous check duplicated inline and
+        was missed.
+        """
         self.stats['exif_requests'] += len(file_paths)
-        
+
         results = {}
         missing_paths = []
-        
+
+        try:
+            from enhanced_raw_processor import RAW_EXIF_SENSOR_META_VER
+            has_ver = True
+        except Exception:
+            has_ver = False
+            RAW_EXIF_SENSOR_META_VER = 0
+
         # Check memory cache first
         for path in file_paths:
             exif = self.exif_memory_cache.get(path)
             if exif:
+                if has_ver:
+                    cached_ver = exif.get('raw_exif_sensor_meta_ver', 0)
+                    if cached_ver < RAW_EXIF_SENSOR_META_VER:
+                        missing_paths.append(path)
+                        continue
+                    if not exif.get('verified_orientation'):
+                        self._schedule_orientation_verify(path, exif)
                 results[path] = exif
             else:
                 missing_paths.append(path)
-        
+
         if missing_paths:
             # Fetch missing from persistent cache
             db_results = self.exif_cache.get_multiple(missing_paths, file_stats, fast_mode)
             for path, exif in db_results.items():
+                if has_ver:
+                    cached_ver = exif.get('raw_exif_sensor_meta_ver', 0)
+                    if cached_ver < RAW_EXIF_SENSOR_META_VER:
+                        continue
+                    if not exif.get('verified_orientation'):
+                        self._schedule_orientation_verify(path, exif)
                 self.exif_memory_cache.put(path, exif)
                 results[path] = exif
-                
+
         return results
+
+    def release_full_image_memory(self, file_path: Optional[str]) -> None:
+        """Drop in-memory full-res / pixmap tiers; keep preview/grid/thumbnail on disk."""
+        if not file_path:
+            return
+        self.full_image_cache.remove(file_path)
+        self.pixmap_cache.remove(file_path)
 
     def invalidate_file(self, file_path: str) -> None:
         """Remove all cached data for a specific file."""
@@ -1659,7 +2855,8 @@ class ImageCache(QObject):
         self.disk_grid_cache.remove(file_path)
         self.disk_preview_cache.remove(file_path)
         self.exif_memory_cache.remove(file_path)
-        # Note: EXIF persistent cache handles file modification time automatically
+        self.exif_cache.remove(file_path)
+        self.full_image_embedded_jpeg_paths.discard(key)
 
     def clear_all(self) -> None:
         """Clear all caches."""
@@ -1668,6 +2865,13 @@ class ImageCache(QObject):
         self.preview_cache.clear()
         self.full_image_cache.clear()
         self.pixmap_cache.clear()
+        self.libraw_preview_paths.clear()
+        if self._libraw_preview_paths_file and os.path.isfile(self._libraw_preview_paths_file):
+            try:
+                os.remove(self._libraw_preview_paths_file)
+            except Exception:
+                pass
+        self.full_image_embedded_jpeg_paths.clear()
         self.exif_cache.clear()
         self.exif_memory_cache.clear()
         self.disk_thumbnail_cache.clear()
@@ -1696,8 +2900,97 @@ class ImageCache(QObject):
         self.disk_grid_cache.cleanup_old_entries()
         self.disk_preview_cache.cleanup_old_entries()
 
+    def enforce_disk_cache_budget(self, max_mb: Optional[int] = None) -> Dict[str, float]:
+        """Evict oldest-cached thumbnail/grid/preview disk entries when total usage
+        exceeds a budget (RAWVIEWER_DISK_CACHE_MAX_MB, default 4096 MB).
+
+        Age-based cleanup_old_cache() only removes entries older than 30 days --
+        nothing previously capped total disk usage, so a long-lived install could
+        grow unbounded across every folder ever browsed. This is stat-based (no
+        size column is tracked in the DB) and evicts down to 90% of budget
+        (hysteresis) so it doesn't re-trigger on every startup right at the
+        boundary -- call from a background/startup pass only, never a hot path.
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+        if max_mb is None:
+            max_mb = _env_int(
+                "RAWVIEWER_DISK_CACHE_MAX_MB", 4096, minimum=256, maximum=1024 * 1024
+            )
+        max_bytes = max_mb * 1024 * 1024
+        target_bytes = int(max_bytes * 0.9)
+
+        tiers = {
+            "thumbnail": self.disk_thumbnail_cache,
+            "grid": self.disk_grid_cache,
+            "preview": self.disk_preview_cache,
+        }
+        usage: Dict[str, int] = {}
+        for name, cache in tiers.items():
+            try:
+                usage[name] = cache.get_disk_usage_bytes()
+            except Exception:
+                usage[name] = 0
+
+        total = sum(usage.values())
+        usage_mb = {f"{k}_mb": v / (1024 * 1024) for k, v in usage.items()}
+        if total <= max_bytes:
+            return usage_mb
+
+        to_free = total - target_bytes
+        freed_total = 0
+        for name, cache in tiers.items():
+            tier_usage = usage.get(name, 0)
+            if tier_usage <= 0 or total <= 0:
+                continue
+            # Evict proportionally to this tier's share of total usage.
+            share = int(to_free * (tier_usage / total))
+            try:
+                freed_total += cache.evict_lru(share)
+            except Exception:
+                pass
+
+        logger.info(
+            "[CACHE] Disk cache budget exceeded (%.1f MB > %d MB); evicted %.1f MB "
+            "(thumbnail=%.1fMB grid=%.1fMB preview=%.1fMB before eviction)",
+            total / (1024 * 1024),
+            max_mb,
+            freed_total / (1024 * 1024),
+            usage_mb.get("thumbnail_mb", 0.0),
+            usage_mb.get("grid_mb", 0.0),
+            usage_mb.get("preview_mb", 0.0),
+        )
+        return usage_mb
+
+    def _load_libraw_preview_paths(self) -> None:
+        try:
+            if self._libraw_preview_paths_file and os.path.isfile(self._libraw_preview_paths_file):
+                import json
+                with open(self._libraw_preview_paths_file, "r", encoding="utf-8") as f:
+                    self.libraw_preview_paths = set(json.load(f))
+        except Exception:
+            self.libraw_preview_paths = set()
+
+    def _save_libraw_preview_paths(self) -> None:
+        try:
+            if self._libraw_preview_paths_file:
+                import json
+                with open(self._libraw_preview_paths_file, "w", encoding="utf-8") as f:
+                    json.dump(list(self.libraw_preview_paths), f)
+        except Exception:
+            pass
+
     def close(self):
         """Close all persistent cache connections."""
+        self._closing = True
+        self._save_libraw_preview_paths()
+        
+        with self._orient_verify_lock:
+            self._orient_verify_queue.clear()
+        if self._orient_verify_thread is not None and self._orient_verify_thread.is_alive():
+            self._orient_verify_thread.join(timeout=2.0)
+            
         if hasattr(self, 'exif_cache'):
             self.exif_cache.close()
         if hasattr(self, 'disk_thumbnail_cache'):
@@ -1720,7 +3013,7 @@ def _cleanup_legacy_disk_cache_once() -> None:
         return
     _legacy_cache_cleanup_done = True
 
-    legacy_dir = legacy_cache_root()
+    legacy_dir = os.path.expanduser("~/.skyspotter_cache")
     if not os.path.isdir(legacy_dir):
         return
 
@@ -1759,14 +3052,36 @@ def _cleanup_legacy_disk_cache_once() -> None:
             pass
 
 
+_exif_cache_atexit_registered = False
+
+
+def _register_exif_cache_atexit() -> None:
+    global _exif_cache_atexit_registered
+    if _exif_cache_atexit_registered:
+        return
+    _exif_cache_atexit_registered = True
+    import atexit
+
+    def _flush_exif_on_exit() -> None:
+        try:
+            global _global_cache
+            if _global_cache is not None and hasattr(_global_cache, "flush_exif_disk_cache"):
+                _global_cache.flush_exif_disk_cache()
+        except Exception:
+            pass
+
+    atexit.register(_flush_exif_on_exit)
+
+
 def get_image_cache() -> ImageCache:
     """Get the global image cache instance."""
     global _global_cache
     if _global_cache is None:
-        persistent = env_flag("PERSISTENT_CACHE", default=True)
+        persistent = os.environ.get("RAWVIEWER_PERSISTENT_CACHE", "1").lower() in {"1", "true", "yes", "on"}
         if not persistent:
             _cleanup_legacy_disk_cache_once()
         _global_cache = ImageCache(persistent_cache_enabled=persistent)
+        _register_exif_cache_atexit()
     return _global_cache
 
 

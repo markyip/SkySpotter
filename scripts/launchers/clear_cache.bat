@@ -1,8 +1,8 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 REM Full cache + session wipe for SkySpotter (dev and installed builds).
-REM Removes: ~/.skyspotter_cache + ~/.rawviewer_cache (legacy), logs, dev logs,
-REM and QSettings under HKCU\Software\SkySpotter + HKCU\Software\RAWviewer (legacy).
+REM Removes: ~/.skyspotter_cache + ~/.skyspotter_cache (legacy), logs, dev logs,
+REM and QSettings under HKCU\Software\SkySpotter + HKCU\Software\SkySpotter (legacy).
 REM Does NOT remove: %%LOCALAPPDATA%%\SkySpotter app install (SkySpotter.exe, bundled models).
 cd /d "%~dp0..\..\.."
 
@@ -19,22 +19,22 @@ set "CLEARED=0"
 set "FAILED=0"
 
 call :RemoveTree "%USERPROFILE%\.skyspotter_cache" "image/EXIF/semantic/thumbnail cache (SkySpotter)"
-call :RemoveTree "%USERPROFILE%\.rawviewer_cache" "legacy image/EXIF/semantic/thumbnail cache (RAWviewer)"
+call :RemoveTree "%USERPROFILE%\.skyspotter_cache" "legacy image/EXIF/semantic/thumbnail cache (SkySpotter)"
 call :RemoveTree "%LOCALAPPDATA%\SkySpotter\logs" "runtime logs (%%LOCALAPPDATA%%\SkySpotter\logs)"
 call :RemoveTree "%APPDATA%\SkySpotter\logs" "roaming logs (%%APPDATA%%\SkySpotter\logs)"
-call :RemoveTree "%LOCALAPPDATA%\RAWviewer\logs" "legacy runtime logs (%%LOCALAPPDATA%%\RAWviewer\logs)"
-call :RemoveTree "%APPDATA%\RAWviewer\logs" "legacy roaming logs (%%APPDATA%%\RAWviewer\logs)"
+call :RemoveTree "%LOCALAPPDATA%\SkySpotter\logs" "legacy runtime logs (%%LOCALAPPDATA%%\SkySpotter\logs)"
+call :RemoveTree "%APPDATA%\SkySpotter\logs" "legacy roaming logs (%%APPDATA%%\SkySpotter\logs)"
 call :RemoveTree "src\logs" "repository dev logs (src\logs)"
 
 REM Optional cache subfolders under the install root (if present).
 call :RemoveTree "%LOCALAPPDATA%\SkySpotter\cache" "install cache folder (SkySpotter)"
 call :RemoveTree "%LOCALAPPDATA%\SkySpotter\CrashDumps" "crash dumps (SkySpotter)"
-call :RemoveTree "%LOCALAPPDATA%\RAWviewer\cache" "legacy install cache folder (RAWviewer)"
-call :RemoveTree "%LOCALAPPDATA%\RAWviewer\CrashDumps" "legacy crash dumps (RAWviewer)"
+call :RemoveTree "%LOCALAPPDATA%\SkySpotter\cache" "legacy install cache folder (SkySpotter)"
+call :RemoveTree "%LOCALAPPDATA%\SkySpotter\CrashDumps" "legacy crash dumps (SkySpotter)"
 
 echo Clearing QSettings / session registry (window, sort, last folder, rotations, semantic flags)...
 call :RemoveRegistryKey "HKCU\Software\SkySpotter"
-call :RemoveRegistryKey "HKCU\Software\RAWviewer"
+call :RemoveRegistryKey "HKCU\Software\SkySpotter"
 
 echo.
 if "!FAILED!"=="1" (
@@ -54,7 +54,7 @@ exit /b 0
 :KillApp
 echo Closing SkySpotter if running...
 taskkill /IM SkySpotter.exe /F >nul 2>&1
-taskkill /IM RAWviewer.exe /F >nul 2>&1
+taskkill /IM SkySpotter.exe /F >nul 2>&1
 REM Dev runs via python main.py — stop common launcher patterns.
 for /f "tokens=2" %%P in ('wmic process where "name='python.exe' and CommandLine like '%%main.py%%'" get ProcessId 2^>nul ^| findstr /r "[0-9]"') do (
     taskkill /PID %%P /F >nul 2>&1
@@ -62,7 +62,7 @@ for /f "tokens=2" %%P in ('wmic process where "name='python.exe' and CommandLine
 for /f "tokens=2" %%P in ('wmic process where "name='python.exe' and CommandLine like '%%SkySpotter%%'" get ProcessId 2^>nul ^| findstr /r "[0-9]"') do (
     taskkill /PID %%P /F >nul 2>&1
 )
-for /f "tokens=2" %%P in ('wmic process where "name='python.exe' and CommandLine like '%%RAWviewer%%'" get ProcessId 2^>nul ^| findstr /r "[0-9]"') do (
+for /f "tokens=2" %%P in ('wmic process where "name='python.exe' and CommandLine like '%%SkySpotter%%'" get ProcessId 2^>nul ^| findstr /r "[0-9]"') do (
     taskkill /PID %%P /F >nul 2>&1
 )
 exit /b 0

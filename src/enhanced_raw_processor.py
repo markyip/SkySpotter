@@ -40,7 +40,34 @@ from raw_file_extensions import RAW_FILE_EXTENSIONS
 
 # Cached EXIF rows without this version used embedded-JPEG dimensions as "original" (e.g. 1920×1080).
 # Cached EXIF rows without this version used buggy orientation logic (e.g. LibRaw 5 mis-mapped, Sony MakerNote missing, or Silent Failures).
-RAW_EXIF_SENSOR_META_VER = 7
+# v9: invalidate rows that stored orientation=1 for Canon CR2/CR3 while LibRaw flip / embedded JPEG said otherwise.
+# v10: unified make-independent orientation authority (removed make-gated skips that left
+#      non-Sony pre-rotated cameras sideways); force re-extraction so cache self-heal has
+#      correct sensor dims/orientation to re-orient any stale wrongly-rotated thumbnails.
+# v11: added nef_he_compressed (proactive Nikon HE/HE* detection); force re-extraction so
+#      already-cached NEF rows pick up the new field instead of staying permanently unknown.
+RAW_EXIF_SENSOR_META_VER = 11
+
+from image_load_manager import yield_if_current_task_active
+
+_rawpy_global_lock = threading.Lock()
+_heavy_fallback_semaphore = threading.Semaphore(8)
+
+# RAW formats where the lock-free byte-scan extractor reliably yields a correctly
+# oriented embedded preview (finalize_index_thumbnail_array heals container EXIF).
+# Verified vs LibRaw: Sony ARW 15/15, Nikon NEF 36/36, Canon CR3 23/23 (BMFF uuid
+# box JPEG scan). Other formats (DNG, ORF, RAF, RW2, Hasselblad 3FR) still return
+# None from byte-scan and fall through to LibRaw. Canon CR2 is not listed — its
+# TIFF-parse previews can lack the orientation tag. LibRaw stays first for
+# everything not listed here.
+_BYTESCAN_FIRST_EXTS = frozenset({".arw", ".nef", ".cr3"})
+
+
+def _bytescan_first_enabled() -> bool:
+    """Default ON. Set RAWVIEWER_GALLERY_BYTESCAN_FIRST=0 to force the old LibRaw-first path."""
+    return os.environ.get(
+        "RAWVIEWER_GALLERY_BYTESCAN_FIRST", "1"
+    ).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _qimage_to_rgb_array(image: QImage) -> Optional[np.ndarray]:
@@ -75,6 +102,10 @@ def _qimage_to_rgb_array(image: QImage) -> Optional[np.ndarray]:
 _embedded_scan_miss_cache = set()
 _embedded_scan_miss_lock = threading.Lock()
 _embedded_scan_miss_cache_max = 4096
+_embedded_scan_inflight: dict[tuple, threading.Event] = {}
+_embedded_scan_results: dict[tuple, Optional[np.ndarray]] = {}
+_embedded_scan_coalesce_lock = threading.Lock()
+_embedded_scan_results_max = 512
 
 
 def get_jpeg_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
@@ -128,47 +159,163 @@ def get_jpeg_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
 
 
 def _largest_jpeg_from_blob(blob: bytes, max_size: int) -> Optional[np.ndarray]:
-    """Find the largest decodable JPEG segment inside a byte blob using fast header parsing."""
-    best_offset = -1
-    best_area = 0
-    best_end_offset = -1
-    
+    """Find a decodable JPEG segment inside a byte blob using fast header
+    parsing -- the smallest one that still covers max_size (0 = full
+    quality, i.e. the largest available), not always the largest.
+
+    Canon CR3 (the caller, _extract_bmff_uuid_embedded_jpeg) embeds a
+    near-sensor-resolution JPEG (20-40MP) alongside much smaller ones;
+    decoding the huge one for a 512px gallery tile wastes ~10x the CPU for
+    an identical downsampled result. Mirrors the equivalent fix already
+    applied to the TIFF-based preview path (extract_previews_via_tiff_parse)
+    for ARW/NEF -- this is the same bug, just never ported to CR3's BMFF
+    parsing since it's a structurally different container format.
+    """
+    candidates: list[tuple[int, int, int, int, int]] = []  # (area, w, h, start, end)
     start = 0
     blob_len = len(blob)
     while True:
         idx = blob.find(b"\xff\xd8\xff", start)
         if idx < 0:
             break
-            
+
         # Parse JPEG header from the next 64KB (or up to the end of the blob)
         header_chunk = blob[idx : min(blob_len, idx + 65536)]
         dims = get_jpeg_dimensions(header_chunk)
         if dims is not None:
             w, h = dims
-            area = w * h
-            if area > best_area and w >= 32 and h >= 32:
-                # Find the EOI marker \xff\xd9 for this JPEG
+            if w >= 32 and h >= 32:
                 end_marker = blob.find(b"\xff\xd9", idx + 3)
-                best_area = area
-                best_offset = idx
-                best_end_offset = end_marker + 2 if end_marker >= 0 else -1
-                
+                end_offset = end_marker + 2 if end_marker >= 0 else blob_len
+                candidates.append((w * h, w, h, idx, end_offset))
+
         start = idx + 3
-        
-    if best_offset >= 0:
-        # Extract the segment
-        if best_end_offset >= 0:
-            segment = blob[best_offset : best_end_offset]
-        else:
-            segment = blob[best_offset:]
-            
-        # Decode only the selected best JPEG segment
-        try:
-            return decode_embedded_jpeg_bytes(segment, max_size)
-        except Exception:
-            pass
-            
-    return None
+
+    if not candidates:
+        return None
+
+    if max_size > 0:
+        sufficient = [c for c in candidates if max(c[1], c[2]) >= max_size]
+        chosen = min(sufficient, key=lambda c: c[0]) if sufficient else max(candidates, key=lambda c: c[0])
+    else:
+        chosen = max(candidates, key=lambda c: c[0])
+
+    _, _, _, best_offset, best_end_offset = chosen
+    segment = blob[best_offset:best_end_offset]
+
+    # Decode only the selected segment.
+    try:
+        return decode_embedded_jpeg_bytes(segment, max_size)
+    except Exception:
+        return None
+
+
+def _extract_bmff_uuid_embedded_jpeg(file_path: str, max_size: int) -> Optional[np.ndarray]:
+    """Canon CR3 stores grid/preview JPEG inside BMFF uuid boxes (ftyp crx), not TIFF IFD.
+
+    All real preview content lives in the small ftyp/moov/uuid boxes at the
+    START of the file (measured ~366KB on a real 40MB CR3); the sensor RAW
+    data (mdat, the rest of the file) follows and is never touched by this
+    function. Reads incrementally in chunks instead of loading the whole
+    file upfront -- avoids ~40MB+ of unnecessary I/O per thumbnail/preview
+    request on every CR3 file.
+    """
+    import struct
+
+    CHUNK = 1 << 20  # 1MB steps; ftyp+moov+uuid boxes are typically well under this
+
+    try:
+        with open(file_path, "rb") as f:
+            data = f.read(CHUNK)
+            if len(data) < 12 or data[4:8] != b"ftyp":
+                return None
+
+            best: Optional[np.ndarray] = None
+            best_area = 0
+            off, n = 0, len(data)
+            while True:
+                if off + 8 > n:
+                    more = f.read(CHUNK)
+                    if not more:
+                        break
+                    data += more
+                    n = len(data)
+                    if off + 8 > n:
+                        break
+                size = struct.unpack(">I", data[off : off + 4])[0]
+                typ = data[off + 4 : off + 8]
+                if size < 8:
+                    # size==1 (64-bit extended size -- always mdat/the sensor
+                    # payload in practice) or a malformed box: nothing past
+                    # here is a preview, so stop without reading the rest of
+                    # the (often huge) file.
+                    break
+                if off + size > n:
+                    more = f.read(off + size - n)
+                    if more:
+                        data += more
+                        n = len(data)
+                end = min(off + size, n)
+                if typ == b"uuid":
+                    arr = _largest_jpeg_from_blob(data[off:end], max_size)
+                    if arr is not None and hasattr(arr, "shape") and len(arr.shape) >= 2:
+                        h, w = arr.shape[:2]
+                        area = w * h
+                        if area > best_area:
+                            best_area = area
+                            best = arr
+                off = end
+            return best
+    except Exception:
+        return None
+
+
+def probe_effective_raw_orientation(
+    file_path: str, raw_object: Optional[rawpy.RawPy] = None
+) -> int:
+    """LibRaw flip + embedded-JPEG orientation when container EXIF is missing/wrong."""
+    orientation = 1
+    try:
+        if raw_object is not None:
+            flip = int(getattr(raw_object.sizes, "flip", 0) or 0)
+            if flip != 0:
+                flip_map = {0: 1, 3: 3, 5: 8, 6: 6}
+                orientation = int(flip_map.get(flip, flip))
+            if orientation <= 1:
+                embedded_o = _orientation_from_embedded_preview(file_path, raw_object)
+                if embedded_o not in (1, orientation):
+                    orientation = embedded_o
+            return int(orientation or 1)
+        yield_if_current_task_active()
+        with _rawpy_global_lock:
+            with rawpy.imread(file_path) as raw:
+                return probe_effective_raw_orientation(file_path, raw)
+    except Exception:
+        if orientation <= 1:
+            try:
+                embedded_o = _orientation_from_embedded_preview(file_path, raw_object)
+                if embedded_o not in (1, orientation):
+                    orientation = embedded_o
+            except Exception:
+                pass
+    return int(orientation or 1)
+
+
+def cached_raw_exif_orientation_trustworthy(
+    file_path: str, cached: Dict[str, Any]
+) -> bool:
+    """False when persisted EXIF orientation disagrees with LibRaw / embedded preview."""
+    import common_image_loader
+
+    if not common_image_loader.is_raw_file(file_path):
+        return True
+    if cached.get("verified_orientation"):
+        return True
+    cached_o = int(cached.get("orientation", 1) or 1)
+    effective = probe_effective_raw_orientation(file_path)
+    if effective <= 1:
+        return True
+    return cached_o == effective
 
 
 def _orientation_from_embedded_preview(
@@ -179,8 +326,10 @@ def _orientation_from_embedded_preview(
         if raw_object is not None:
             thumb = raw_object.extract_thumb()
         else:
-            with rawpy.imread(file_path) as raw:
-                thumb = raw.extract_thumb()
+            yield_if_current_task_active()
+            with _rawpy_global_lock:
+                with rawpy.imread(file_path) as raw:
+                    thumb = raw.extract_thumb()
         if thumb is None or thumb.format != rawpy.ThumbFormat.JPEG:
             return 1
         return orientation_from_embedded_jpeg_bytes(thumb.data)
@@ -216,10 +365,21 @@ def _thumbnail_via_qimage_reader(file_path: str, max_size: int, auto_transform: 
         return None
 
 
-def extract_previews_via_tiff_parse(file_path: str) -> list[bytes]:
-    """Parse TIFF structure to find all JPEG preview offsets and lengths accurately."""
+def extract_previews_via_tiff_parse(file_path: str, max_size: int = 0) -> list[bytes]:
+    """Parse TIFF structure to find embedded JPEG previews and return the one
+    to use for `max_size` (0 = full quality, i.e. the largest available).
+
+    Many RAW formats (e.g. Sony ARW) embed 2-3 previews of very different
+    sizes (thumb / medium / near-full-sensor). Reading and decoding the
+    largest one (often 20-40MP, several MB) to produce a 512px gallery tile
+    wastes ~10x the decode time and several MB of I/O for no visual benefit
+    -- it gets downsampled either way. So this only *fully* reads the JPEG
+    segment it actually intends to return; every other candidate is sized
+    up from a cheap <=64KB header read (JPEG SOF marker is always near the
+    start of the segment).
+    """
     import struct
-    previews = []
+    candidates: list[tuple[int, int, int, int, int, bytes]] = []
     try:
         with open(file_path, "rb") as f:
             header = f.read(8)
@@ -296,21 +456,181 @@ def extract_previews_via_tiff_parse(file_path: str) -> list[bytes]:
                                     sub_ifd_offsets.extend(offsets)
                                 f.seek(current_pos)
                 
-                if jpeg_offset is not None and jpeg_length is not None:
-                    # Read the JPEG bytes
+                if jpeg_offset is not None and jpeg_length is not None and jpeg_length > 0:
+                    # Cheap sizing read only -- the full segment is read once,
+                    # below, for whichever single candidate is actually chosen.
+                    current_pos = f.tell()
                     f.seek(jpeg_offset)
-                    jpeg_bytes = f.read(jpeg_length)
-                    if len(jpeg_bytes) == jpeg_length:
-                        previews.append(jpeg_bytes)
-                
+                    header_chunk = f.read(min(jpeg_length, 65536))
+                    f.seek(current_pos)
+                    dims = get_jpeg_dimensions(header_chunk)
+                    if dims is not None:
+                        w, h = dims
+                        candidates.append((w * h, w, h, jpeg_offset, jpeg_length, header_chunk))
+
                 # Add sub-IFDs to visit list
                 for sub_offset in sub_ifd_offsets:
                     if sub_offset != 0 and sub_offset not in visited_offsets:
                         ifds_to_visit.append(sub_offset)
-                        
+
+            if not candidates:
+                return []
+
+            # max_size>0: cheapest preview that still covers the request (no
+            # point decoding a 32MP preview for a 512px tile). max_size==0:
+            # caller wants the best quality available (e.g. full single-image
+            # preview), so keep the old "largest wins" behavior.
+            if max_size > 0:
+                sufficient = [c for c in candidates if max(c[1], c[2]) >= max_size]
+                chosen = min(sufficient, key=lambda c: c[0]) if sufficient else max(candidates, key=lambda c: c[0])
+            else:
+                chosen = max(candidates, key=lambda c: c[0])
+
+            _, _, _, jpeg_offset, jpeg_length, header_chunk = chosen
+            if len(header_chunk) >= jpeg_length:
+                return [header_chunk[:jpeg_length]]
+            f.seek(jpeg_offset)
+            jpeg_bytes = f.read(jpeg_length)
+            if len(jpeg_bytes) == jpeg_length:
+                return [jpeg_bytes]
+            return []
     except Exception:
         pass
-    return previews
+    return []
+
+
+def _detect_nef_he_compression(file_path: str) -> Optional[bool]:
+    """True if this NEF's NEFCompression value says High Efficiency (13) or
+    High Efficiency* (14) -- the Nikon Z8/Z9/Z6III/Z50II codec LibRaw cannot
+    decode (no upstream ETA). False if a compression value is found and it's
+    something else. None if undetectable (non-Nikon, older maker-note
+    format, parse failure) -- callers should treat that as "unknown, try the
+    normal decode path," never as a hard error.
+
+    Hand-rolled rather than using the `exifread` library's full maker-note
+    parse (already a dependency, used elsewhere for AF regions) because
+    that path was benchmarked at ~136ms/file -- too slow to run on every
+    NEF. This walks IFD0 -> Exif IFD pointer 0x8769 -> MakerNote tag 0x927C
+    -> Nikon's inner "TIFF-within-TIFF" (magic `Nikon\\0` + 2 version bytes
+    + 2 padding bytes, then a second TIFF header at makernote_offset+10
+    whose own IFD offsets are relative to that +10 base -- a well-
+    documented Nikon quirk, not guesswork), then checks two locations for
+    the compression value, in order:
+
+    1. Tag 0x0093 (NEFCompression), a plain top-level int16u -- used by
+       older/non-Z9-generation bodies.
+    2. Tag 0x0051 (an opaque binary sub-block Nikon introduced for the
+       Z8/Z9/Z6III generation, "MakerNotes0x51" per exiftool's Nikon.pm),
+       byte offset 10 within that block's own data, also an int16u --
+       exiftool's source notes NEFCompression was "relocated to
+       MakerNotes_0x51 at offset x'0a (Z9)". Verified against 21 real
+       Z8/Z9/Z6III NEF files (13 HE/HE*, 8 Lossless): matches LibRaw's own
+       decode success/failure on every file, cross-checked directly against
+       rawpy (HE/HE* raise LibRawFileUnsupportedError, Lossless decodes).
+
+    Benchmarked at ~0.05ms/file (tag 0x0093 path) / ~0.1ms/file (tag 0x0051
+    path) against real files -- both cheap enough to run unconditionally.
+    """
+    import struct
+
+    try:
+        with open(file_path, "rb") as f:
+            header = f.read(8)
+            if len(header) < 8:
+                return None
+            if header[:2] == b"II":
+                e = "<"
+            elif header[:2] == b"MM":
+                e = ">"
+            else:
+                return None
+            if struct.unpack(e + "H", header[2:4])[0] != 42:
+                return None
+            ifd0_offset = struct.unpack(e + "I", header[4:8])[0]
+
+            def read_ifd(offset):
+                f.seek(offset)
+                n = struct.unpack(e + "H", f.read(2))[0]
+                return n, f.read(n * 12)
+
+            n, entries = read_ifd(ifd0_offset)
+            if len(entries) < n * 12:
+                return None
+            exif_ifd_offset = None
+            for i in range(n):
+                ent = entries[i * 12:(i + 1) * 12]
+                if struct.unpack(e + "H", ent[0:2])[0] == 0x8769:  # Exif IFD pointer
+                    exif_ifd_offset = struct.unpack(e + "I", ent[8:12])[0]
+                    break
+            if exif_ifd_offset is None:
+                return None
+
+            n, entries = read_ifd(exif_ifd_offset)
+            if len(entries) < n * 12:
+                return None
+            mn_offset = None
+            for i in range(n):
+                ent = entries[i * 12:(i + 1) * 12]
+                if struct.unpack(e + "H", ent[0:2])[0] == 0x927C:  # MakerNote
+                    mn_offset = struct.unpack(e + "I", ent[8:12])[0]
+                    break
+            if mn_offset is None:
+                return None
+
+            f.seek(mn_offset)
+            blob_header = f.read(10)
+            if len(blob_header) < 10 or blob_header[:6] != b"Nikon\x00":
+                return None  # older-format maker note, not our concern
+
+            inner_base = mn_offset + 10
+            f.seek(inner_base)
+            inner_hdr = f.read(8)
+            if len(inner_hdr) < 8:
+                return None
+            if inner_hdr[:2] == b"II":
+                ie = "<"
+            elif inner_hdr[:2] == b"MM":
+                ie = ">"
+            else:
+                return None
+            if struct.unpack(ie + "H", inner_hdr[2:4])[0] != 42:
+                return None
+            inner_ifd_rel = struct.unpack(ie + "I", inner_hdr[4:8])[0]
+
+            f.seek(inner_base + inner_ifd_rel)
+            n2_bytes = f.read(2)
+            if len(n2_bytes) < 2:
+                return None
+            n2 = struct.unpack(ie + "H", n2_bytes)[0]
+            entries2 = f.read(n2 * 12)
+            if len(entries2) < n2 * 12:
+                return None
+
+            tag51_value_offset = None
+            tag51_count = None
+            for i in range(n2):
+                ent = entries2[i * 12:(i + 1) * 12]
+                tag = struct.unpack(ie + "H", ent[0:2])[0]
+                if tag == 0x0093:  # NEFCompression (older/non-Z9-gen bodies)
+                    val = struct.unpack(ie + "H", ent[8:10])[0]
+                    return val in (13, 14)
+                if tag == 0x0051:  # MakerNotes0x51 (Z8/Z9/Z6III-gen bodies)
+                    tag51_count = struct.unpack(ie + "I", ent[4:8])[0]
+                    tag51_value_offset = struct.unpack(ie + "I", ent[8:12])[0]
+
+            if tag51_value_offset is not None and tag51_count is not None and tag51_count > 4:
+                # Compression int16u lives at byte offset 10 within this
+                # sub-block's own data (see docstring); the block itself is
+                # large enough that its value is stored via offset, not inline.
+                f.seek(inner_base + tag51_value_offset + 10)
+                val_bytes = f.read(2)
+                if len(val_bytes) == 2:
+                    val = struct.unpack(ie + "H", val_bytes)[0]
+                    return val in (13, 14)
+
+            return None
+    except Exception:
+        return None
 
 
 def extract_embedded_jpeg_by_scan(file_path: str, max_size: int) -> Optional[np.ndarray]:
@@ -320,6 +640,43 @@ def extract_embedded_jpeg_by_scan(file_path: str, max_size: int) -> Optional[np.
     """
     try:
         stat = os.stat(file_path)
+        cache_key = (file_path, stat.st_size, stat.st_mtime, max_size)
+    except Exception:
+        return _extract_embedded_jpeg_by_scan_impl(file_path, max_size)
+
+    with _embedded_scan_coalesce_lock:
+        if cache_key in _embedded_scan_results:
+            return _embedded_scan_results[cache_key]
+        if cache_key in _embedded_scan_inflight:
+            event = _embedded_scan_inflight[cache_key]
+            leader = False
+        else:
+            event = threading.Event()
+            _embedded_scan_inflight[cache_key] = event
+            leader = True
+
+    if not leader:
+        event.wait(timeout=120)
+        with _embedded_scan_coalesce_lock:
+            return _embedded_scan_results.get(cache_key)
+
+    try:
+        result = _extract_embedded_jpeg_by_scan_impl(file_path, max_size)
+        with _embedded_scan_coalesce_lock:
+            if len(_embedded_scan_results) >= _embedded_scan_results_max:
+                oldest_key = next(iter(_embedded_scan_results))
+                _embedded_scan_results.pop(oldest_key, None)
+            _embedded_scan_results[cache_key] = result
+        return result
+    finally:
+        with _embedded_scan_coalesce_lock:
+            _embedded_scan_inflight.pop(cache_key, None)
+        event.set()
+
+
+def _extract_embedded_jpeg_by_scan_impl(file_path: str, max_size: int) -> Optional[np.ndarray]:
+    try:
+        stat = os.stat(file_path)
         size = stat.st_size
         miss_key = (file_path, size, stat.st_mtime, max_size)
         with _embedded_scan_miss_lock:
@@ -327,7 +684,7 @@ def extract_embedded_jpeg_by_scan(file_path: str, max_size: int) -> Optional[np.
                 return None
 
         # Try TIFF parsing first
-        tiff_previews = extract_previews_via_tiff_parse(file_path)
+        tiff_previews = extract_previews_via_tiff_parse(file_path, max_size)
         if tiff_previews:
             candidates = []
             for jpeg_bytes in tiff_previews:
@@ -347,159 +704,25 @@ def extract_embedded_jpeg_by_scan(file_path: str, max_size: int) -> Optional[np.
                             w, h, os.path.basename(file_path)
                         )
                         return decoded
-
-        # Fallback to byte scan
-        chunk_size = 4 * 1024 * 1024
-        
-        head = b""
-        tail = b""
-        
-        with open(file_path, "rb") as f:
-            if size <= chunk_size * 2:
-                # Read entire file if it's small enough
-                head = f.read()
-            else:
-                # Read head
-                head = f.read(chunk_size)
-                # Read tail
-                f.seek(size - chunk_size)
-                tail = f.read(chunk_size)
-                
-    # Scan head and tail
-        # We will collect candidate JPEGs: (area, segment_bytes, abs_offset, w, h)
-        candidates = []
-        
-        def scan_chunk(chunk_bytes, base_offset):
-            start = 0
-            chunk_len = len(chunk_bytes)
-            while True:
-                idx = chunk_bytes.find(b"\xff\xd8\xff", start)
-                if idx < 0:
-                    break
-                
-                # Check dimensions
-                header_chunk = chunk_bytes[idx : min(chunk_len, idx + 65536)]
-                dims = get_jpeg_dimensions(header_chunk)
-                if dims is not None:
-                    w, h = dims
-                    area = w * h
-                    if w >= 32 and h >= 32:
-                        end_marker = chunk_bytes.find(b"\xff\xd9", idx + 3)
-                        if end_marker >= 0:
-                            segment = chunk_bytes[idx : end_marker + 2]
-                            candidates.append((area, segment, base_offset + idx, w, h))
-                        else:
-                            # Not fully contained in the chunk (cut off).
-                            # We will read the rest of the file from the start of the JPEG on-demand later.
-                            candidates.append((area, None, base_offset + idx, w, h))
-                start = idx + 3
-
-        scan_chunk(head, 0)
-        if tail:
-            scan_chunk(tail, size - chunk_size)
-            
-        # Select candidate with the largest area
-        import logging
-        logger = logging.getLogger(__name__)
-        
-        if candidates:
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            best_w = candidates[0][3]
-        else:
-            best_w = 0
-
-        logger.info("[SCAN] Initial scan found %d candidates for %s. Best width: %d", len(candidates), os.path.basename(file_path), best_w)
-
-        is_dng = file_path.lower().endswith(".dng")
-        if (not candidates or best_w < 1500) and is_dng:
-            logger.info("[SCAN] Running whole-file scan for %s...", os.path.basename(file_path))
-            # Full file sequential scan in chunks
-            full_scan_candidates = []
-            scan_chunk_size = 8 * 1024 * 1024
-            overlap = 65536
-            offset = 0
-            try:
-                with open(file_path, "rb") as f:
-                    while True:
-                        f.seek(offset)
-                        chunk = f.read(scan_chunk_size + overlap)
-                        if not chunk:
-                            break
-                        
-                        start = 0
-                        chunk_len = len(chunk)
-                        while True:
-                            idx = chunk.find(b"\xff\xd8\xff", start)
-                            if idx < 0:
-                                break
-                            header_chunk = chunk[idx : min(chunk_len, idx + 65536)]
-                            dims = get_jpeg_dimensions(header_chunk)
-                            if dims is not None:
-                                w, h = dims
-                                area = w * h
-                                if w >= 32 and h >= 32:
-                                    end_marker = chunk.find(b"\xff\xd9", idx + 3)
-                                    if end_marker >= 0:
-                                        segment = chunk[idx : end_marker + 2]
-                                        full_scan_candidates.append((area, segment, offset + idx, w, h))
-                                    else:
-                                        full_scan_candidates.append((area, None, offset + idx, w, h))
-                            start = idx + 3
-                        
-                        if len(chunk) < scan_chunk_size + overlap:
-                            break
-                        offset += scan_chunk_size
-            except Exception as scan_e:
-                logger.error("[SCAN] Error scanning %s: %s", file_path, scan_e)
-            
-            if full_scan_candidates:
-                candidates = full_scan_candidates
-                candidates.sort(key=lambda x: x[0], reverse=True)
-                logger.info("[SCAN] Whole-file scan found %d candidates. New best width: %d", len(candidates), candidates[0][3])
-            else:
-                logger.info("[SCAN] Whole-file scan found 0 candidates.")
-
-        if not candidates:
-            # Mark as miss
-            with _embedded_scan_miss_lock:
-                if len(_embedded_scan_miss_cache) >= _embedded_scan_miss_cache_max:
-                    _embedded_scan_miss_cache.clear()
-                _embedded_scan_miss_cache.add(miss_key)
-            return None
-            
-        # Try decoding candidates in order of area size
-        for best_area, best_segment, best_abs_offset, best_w, best_h in candidates:
-            # If the segment was cut off, read it now from the file
-            if best_segment is None:
-                try:
-                    with open(file_path, "rb") as f:
-                        f.seek(best_abs_offset)
-                        # Previews are usually not larger than 8MB, but we read up to 16MB or to the end
-                        remaining = f.read(16 * 1024 * 1024)
-                        end_marker = remaining.find(b"\xff\xd9")
-                        if end_marker >= 0:
-                            best_segment = remaining[:end_marker + 2]
-                        else:
-                            best_segment = remaining
-                except Exception:
-                    continue
-                    
-            if best_segment:
-                best_arr = decode_embedded_jpeg_bytes(best_segment, max_size)
-                if best_arr is not None:
-                    return best_arr
-
-        # Mark as miss if all candidates failed to decode
+        # Canon CR3 (BMFF ftyp crx): preview JPEG lives in uuid boxes, not TIFF IFD.
+        if os.path.splitext(file_path)[1].lower() == ".cr3":
+            cr3_thumb = _extract_bmff_uuid_embedded_jpeg(file_path, max_size)
+            if cr3_thumb is not None:
+                import logging
+                logging.getLogger(__name__).info(
+                    "[BMFF_UUID] Decoded CR3 preview for %s shape=%s",
+                    os.path.basename(file_path),
+                    getattr(cr3_thumb, "shape", cr3_thumb),
+                )
+                return cr3_thumb
+        # TIFF / BMFF parse failed or yielded no decodable preview; cache as miss and return None
         with _embedded_scan_miss_lock:
             if len(_embedded_scan_miss_cache) >= _embedded_scan_miss_cache_max:
                 _embedded_scan_miss_cache.clear()
             _embedded_scan_miss_cache.add(miss_key)
-            
+        return None
     except Exception:
         return None
-
-    return None
-
 
 class ThumbnailExtractor(QObject):
     """Fast thumbnail extractor for immediate display."""
@@ -512,23 +735,50 @@ class ThumbnailExtractor(QObject):
                                    raw_object: Optional[rawpy.RawPy] = None) -> Optional[np.ndarray]:
         """Extract embedded thumbnail from RAW file and resize to max_size."""
         thumb = None
-        
-        # Prioritize reading just the head/tail for the embedded JPEG via fast scan to get an instant preview.
-        if allow_scan_fallback and raw_object is None:
-            scan_max = max_size if max_size > 0 else 8192
-            thumb = extract_embedded_jpeg_by_scan(file_path, scan_max)
-            if thumb is not None:
-                return thumb
 
+        # Gallery grid-tier extraction (max_size <= 1024) for verified formats: try the
+        # lock-free byte-scan (TIFF-parse) FIRST so we skip _rawpy_global_lock. That lock
+        # serializes ALL RAW thumbnail decodes app-wide, so under gallery concurrency it
+        # caps throughput regardless of drive — measured ~7.8 vs ~29 tiles/sec on a slow
+        # external drive, and it also lets one slow-format file stall the whole queue.
+        # Applies on any drive (the lock hurts everywhere); byte-scan is verified correct
+        # + slightly faster than LibRaw for these formats. Byte-scan returns None for
+        # files it cannot handle, so this cleanly falls through to LibRaw below. Single-
+        # view high-res preview (larger max_size) is untouched — keeps LibRaw first for
+        # quality. Avoiding LibRaw here also reduces the concurrent-LibRaw pressure
+        # implicated in the Windows gallery crash.
+        if (
+            raw_object is None
+            and 0 < max_size <= 1024
+            and _bytescan_first_enabled()
+            and os.path.splitext(file_path)[1].lower() in _BYTESCAN_FIRST_EXTS
+        ):
+            try:
+                scanned = extract_embedded_jpeg_by_scan(file_path, max_size)
+            except Exception:
+                scanned = None
+            if scanned is not None:
+                return scanned
+
+        # Prefer LibRaw's embedded JPEG segment (keeps preview EXIF orientation). Byte-scan
+        # previews are faster but often lack orientation tags (Canon CR2/CR3).
         try:
             if raw_object is not None:
                 thumb = self._extract_from_raw_obj(raw_object, file_path, max_size)
             else:
-                with rawpy.imread(file_path) as raw:
-                    thumb = self._extract_from_raw_obj(raw, file_path, max_size)
+                yield_if_current_task_active()
+                with _rawpy_global_lock:
+                    # NEVER call yield_if_current_task_active() while holding
+                    # _rawpy_global_lock: it sleep-loops until no CURRENT task is
+                    # active, so a background (non-CURRENT) worker would sleep here
+                    # forever holding the global lock, blocking every CURRENT gallery
+                    # tile / single-view decode -> total decode-pipeline deadlock.
+                    # The outer yield above (before the lock) is the safe place to
+                    # defer background work to the foreground.
+                    with rawpy.imread(file_path) as raw:
+                        thumb = self._extract_from_raw_obj(raw, file_path, max_size)
         except Exception as e:
             import logging
-            # Expected for some ARW/RAW; fallbacks (embedded JPEG scan, etc.) follow.
             logging.getLogger(__name__).debug(
                 "raw.extract_thumb failed for %s: %s",
                 os.path.basename(file_path),
@@ -546,8 +796,14 @@ class ThumbnailExtractor(QObject):
         # If rawpy fails entirely (e.g. unsupported DNG) or returns None, use non-LibRaw fallbacks.
         is_slow = is_slow_storage_path(file_path)
         if thumb is None and allow_scan_fallback and not is_slow:
-            thumb = extract_embedded_jpeg_by_scan(file_path, max_size)
-        if thumb is None and allow_scan_fallback:
+            yield_if_current_task_active()
+            scan_max = max_size if max_size > 0 else 8192
+            thumb = extract_embedded_jpeg_by_scan(file_path, scan_max)
+            if thumb is not None:
+                return thumb
+        if thumb is None and allow_scan_fallback and not is_slow:
+            yield_if_current_task_active()
+            # Fallback 2: OS decode via Qt (handles DNGs without LibRaw JPEG previews, or weird TIFFs)
             thumb = _thumbnail_via_qimage_reader(file_path, max_size, auto_transform=False)
         if thumb is None and allow_scan_fallback and sys.platform == "darwin":
                 try:
@@ -570,7 +826,7 @@ class ThumbnailExtractor(QObject):
                             jpeg_image.close()
                         else:
                             import logging
-                            logging.getLogger(__name__).warning(f"[SIPS] Failed to generate thumbnail for {file_path}. Exit code: {result.returncode}, Error: {result.stderr.decode('utf-8', 'ignore')}")
+                            logging.getLogger(__name__).debug(f"[SIPS] Failed to generate thumbnail for {file_path}. Exit code: {result.returncode}, Error: {result.stderr.decode('utf-8', 'ignore')}")
                             
                             # Fallback to QuickLook (qlmanage)
                             try:
@@ -604,19 +860,44 @@ class ThumbnailExtractor(QObject):
                     pass
         return thumb
 
+    def _orient_thumb_array_by_flip(self, arr, raw):
+        """Orient a decoded thumb to display orientation using LibRaw's own flip.
+
+        Single orientation step for BOTH JPEG and BITMAP thumbs. raw.sizes.flip is the
+        authoritative, always-fresh orientation (no stale-cache dependency), and the
+        make-independent guard in apply_container_orientation_to_array makes this a no-op
+        when the embedded preview is already display-oriented (so pre-rotated cameras are
+        never double-rotated). This is what keeps the LibRaw path consistent with the
+        byte-scan path, which orients via finalize_index_thumbnail_array.
+        """
+        if arr is None or not hasattr(arr, "shape"):
+            return arr
+        flip = int(getattr(raw.sizes, "flip", 0) or 0)
+        if flip == 0:
+            return arr
+        flip_map = {0: 1, 3: 3, 5: 8, 6: 6}
+        orientation = int(flip_map.get(flip, flip))
+        from common_image_loader import apply_container_orientation_to_array
+
+        oriented = apply_container_orientation_to_array(arr, orientation)
+        return oriented if oriented is not None else arr
+
     def _extract_from_raw_obj(self, raw, file_path, max_size):
         """Internal helper to extract thumb from an open rawpy object."""
         try:
             thumb = raw.extract_thumb()
-            
+
             if thumb.format == rawpy.ThumbFormat.JPEG:
-                return decode_embedded_jpeg_bytes(thumb.data, max_size)
-                
+                arr = decode_embedded_jpeg_bytes(thumb.data, max_size)
+                return self._orient_thumb_array_by_flip(arr, raw)
+
             elif thumb.format == rawpy.ThumbFormat.BITMAP:
                 thumb_array = thumb.data.copy()
                 if thumb_array is None or not hasattr(thumb_array, 'shape'):
                     return None
-                
+
+                thumb_array = self._orient_thumb_array_by_flip(thumb_array, raw)
+
                 h, w = thumb_array.shape[:2]
                 if max_size > 0 and (w > max_size or h > max_size):
                      from PIL import Image
@@ -624,7 +905,7 @@ class ThumbnailExtractor(QObject):
                      pil_thumb.thumbnail((max_size, max_size), Image.Resampling.HAMMING)
                      return np.array(pil_thumb)
                 return thumb_array
-            
+
             return None
         except Exception:
             return None
@@ -682,6 +963,8 @@ class ThumbnailExtractor(QObject):
             
             image = reader.read()
             if not image.isNull():
+                if image.format() != QImage.Format.Format_RGB888:
+                    image = image.convertToFormat(QImage.Format.Format_RGB888)
                 # Perform high-quality final scaling if the loaded image is still larger than needed
                 if target_size is not None and isinstance(target_size, QSize) and target_size.isValid():
                     if image.size().width() > target_size.width() or image.size().height() > target_size.height():
@@ -694,7 +977,9 @@ class ThumbnailExtractor(QObject):
             pass
 
         try:
+            from PIL import Image, ImageOps
             with Image.open(file_path) as img:
+                img = ImageOps.exif_transpose(img)
                 if target_size is not None and isinstance(target_size, QSize):
                     img.thumbnail((target_size.width(), target_size.height()), Image.Resampling.HAMMING)
                 else:
@@ -764,19 +1049,26 @@ class EXIFExtractor(QObject):
 
     def extract_exif_data(self, file_path: str, raw_object: Optional[rawpy.RawPy] = None) -> Optional[Dict[str, Any]]:
         """Extract EXIF data from image file with RAW-specific orientation fallbacks."""
-        # Check SQLite cache first
-        cached = self.cache.get_exif(file_path)
+        # Check SQLite cache first (verify=True: this is the canonical
+        # orientation source for callers that rotate pixels).
+        cached = self.cache.get_exif(file_path, verify=True)
         if cached and not cached.get("minimal_preview_exif"):
             cached_ver = cached.get('raw_exif_sensor_meta_ver', 0)
             if cached_ver < RAW_EXIF_SENSOR_META_VER:
-                if os.environ.get("SkySpotter_VERBOSE_ORIENTATION_LOGS") == "1":
+                if os.environ.get("RAWVIEWER_VERBOSE_ORIENTATION_LOGS") == "1":
                     # print(f"[ORIENTATION] EXIFExtractor: Stale cache version ({cached_ver} < {RAW_EXIF_SENSOR_META_VER}) for {os.path.basename(file_path)}, forcing re-extraction...")
                     pass
-            else:
-                if os.environ.get("SkySpotter_VERBOSE_ORIENTATION_LOGS") == "1":
+            elif cached_raw_exif_orientation_trustworthy(file_path, cached):
+                if os.environ.get("RAWVIEWER_VERBOSE_ORIENTATION_LOGS") == "1":
                     # print(f"[ORIENTATION] EXIFExtractor: Found valid cached orientation={cached.get('orientation')} for {os.path.basename(file_path)}")
                     pass
                 return cached
+            else:
+                try:
+                    self.cache.exif_cache.remove(file_path)
+                    self.cache.exif_memory_cache.remove(file_path)
+                except Exception:
+                    pass
 
         try:
             import metadata_backend
@@ -784,7 +1076,11 @@ class EXIFExtractor(QObject):
             tags = metadata_backend.process_file_from_path(file_path, details=False)
         except Exception as e:
             import logging
+            from common_image_loader import is_emfile_error, note_emfile_pressure
+
             logging.getLogger(__name__).warning(f"metadata_backend failed on {file_path}: {e}")
+            if is_emfile_error(e):
+                note_emfile_pressure()
             tags = {}
 
         try:
@@ -793,7 +1089,7 @@ class EXIFExtractor(QObject):
             orientation_tag_found = None
             
             # DEBUG: Log all potential orientation tags to help troubleshoot
-            if os.environ.get("SkySpotter_VERBOSE_ORIENTATION_LOGS") == "1":
+            if os.environ.get("RAWVIEWER_VERBOSE_ORIENTATION_LOGS") == "1":
                 orient_tags = {k: v for k, v in tags.items() if 'orient' in k.lower()}
                 if orient_tags:
                     # print(f"[ORIENTATION] EXIFExtractor debug for {os.path.basename(file_path)}: Found orientation-like tags: {orient_tags}")
@@ -829,7 +1125,7 @@ class EXIFExtractor(QObject):
                         orientation_tag_found = tag_name
                         break
             
-            if os.environ.get("SkySpotter_VERBOSE_ORIENTATION_LOGS") == "1" and orientation != 1:
+            if os.environ.get("RAWVIEWER_VERBOSE_ORIENTATION_LOGS") == "1" and orientation != 1:
                 # print(f"[ORIENTATION] EXIFExtractor: Found orientation={orientation} via tag '{orientation_tag_found}' for {os.path.basename(file_path)}")
                 pass
             
@@ -881,7 +1177,13 @@ class EXIFExtractor(QObject):
                             break
                         except: pass
 
-            # Second pass: If it's a RAW file, use rawpy to verify dimensions and orientation (flip)
+            # Second pass: If it's a RAW file, use rawpy to verify dimensions and
+            # orientation (flip), and -- while the file is already open -- also
+            # resolve the embedded-preview orientation fallback in the SAME
+            # rawpy.imread() call. These used to be two separate opens (one here,
+            # one in the block below), and each rawpy.imread() on a RAW file is a
+            # full LibRaw parse (tens of ms even for embedded-preview-only use) --
+            # doubling that cost on every cold gallery thumbnail for no reason.
             import common_image_loader
             if common_image_loader.is_raw_file(file_path):
                 try:
@@ -895,25 +1197,26 @@ class EXIFExtractor(QObject):
                             # EXIF Orient: 1=0, 3=180, 8=90CCW, 6=90CW
                             flip_map = {0: 1, 3: 3, 5: 8, 6: 6}
                             orientation = flip_map.get(sizes.flip, sizes.flip)
-                            if os.environ.get("SkySpotter_VERBOSE_ORIENTATION_LOGS") == "1":
-                                # print(f"[ORIENTATION] EXIFExtractor: Falling back to LibRaw flip={sizes.flip} -> Orientation {orientation} for {os.path.basename(file_path)}")
-                                pass
+                        if orientation <= 1:
+                            embedded_o = _orientation_from_embedded_preview(file_path, raw_object)
+                            if embedded_o not in (1, orientation):
+                                orientation = embedded_o
                     else:
-                        with rawpy.imread(file_path) as raw:
-                            sizes = raw.sizes
-                            original_width = sizes.width
-                            original_height = sizes.height
-                            if orientation == 1 and sizes.flip != 0:
-                                flip_map = {0: 1, 3: 3, 5: 8, 6: 6}
-                                orientation = flip_map.get(sizes.flip, sizes.flip)
+                        yield_if_current_task_active()
+                        with _rawpy_global_lock:
+                            with rawpy.imread(file_path) as raw:
+                                sizes = raw.sizes
+                                original_width = sizes.width
+                                original_height = sizes.height
+                                if orientation == 1 and sizes.flip != 0:
+                                    flip_map = {0: 1, 3: 3, 5: 8, 6: 6}
+                                    orientation = flip_map.get(sizes.flip, sizes.flip)
+                                if orientation <= 1:
+                                    embedded_o = _orientation_from_embedded_preview(file_path, raw)
+                                    if embedded_o not in (1, orientation):
+                                        orientation = embedded_o
                 except Exception:
                     pass
-
-            # When container EXIF lacks orientation, read it from the embedded JPEG preview (Sony ARW, etc.).
-            if common_image_loader.is_raw_file(file_path) and orientation <= 1:
-                embedded_o = _orientation_from_embedded_preview(file_path, raw_object)
-                if embedded_o not in (1, orientation):
-                    orientation = embedded_o
 
             # Third pass: If dimensions are still 0 (e.g. non-RAW missing tags), use QImageReader (fast header read)
             if original_width <= 0 or original_height <= 0:
@@ -930,8 +1233,8 @@ class EXIFExtractor(QObject):
                 except:
                     pass
 
-            # Fourth pass: If on macOS and missing dimensions or orientation, fallback to native sips
-            if (original_width <= 0 or original_height <= 0 or orientation == 1) and sys.platform == 'darwin':
+            # Fourth pass: If on macOS and missing dimensions, fallback to native sips
+            if (original_width <= 0 or original_height <= 0) and sys.platform == 'darwin':
                 try:
                     import subprocess
                     result = subprocess.run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', '-g', 'orientation', file_path], 
@@ -997,6 +1300,34 @@ class EXIFExtractor(QObject):
                         break
                     except: pass
 
+            rating = 0
+            for tag in ('XMP-xmp:Rating', 'XMP Rating', 'Rating', 'EXIF Rating'):
+                if tag in tags:
+                    try:
+                        from raw_adjustments import _parse_rating_value
+
+                        rating = _parse_rating_value(tags[tag])
+                        if rating:
+                            break
+                    except Exception:
+                        pass
+                if tag in exif_dict:
+                    try:
+                        from raw_adjustments import _parse_rating_value
+
+                        rating = _parse_rating_value(exif_dict[tag])
+                        if rating:
+                            break
+                    except Exception:
+                        pass
+            if not rating:
+                try:
+                    from raw_adjustments import load_rating_for_file
+
+                    rating = load_rating_for_file(file_path)
+                except Exception:
+                    pass
+
             # Build return dict
             result = {
                 'orientation': orientation,
@@ -1015,11 +1346,18 @@ class EXIFExtractor(QObject):
                 'focal_length': focal_length,
                 'aperture': aperture,
                 'iso': iso,
+                'rating': rating,
                 'verified_orientation': True,
                 'raw_exif_sensor_meta_ver': RAW_EXIF_SENSOR_META_VER,
             }
+
+            if file_path.lower().endswith(".nef"):
+                # Proactive Nikon HE/HE* detection (see _detect_nef_he_compression):
+                # lets callers route straight to the embedded-JPEG fallback instead
+                # of paying for one failed LibRaw decode attempt per file.
+                result['nef_he_compressed'] = _detect_nef_he_compression(file_path)
             
-            if os.environ.get("SkySpotter_VERBOSE_ORIENTATION_LOGS") == "1":
+            if os.environ.get("RAWVIEWER_VERBOSE_ORIENTATION_LOGS") == "1":
                 # print(f"[ORIENTATION] EXIFExtractor: Successfully returning metadata with orientation={orientation} for {os.path.basename(file_path)}")
                 pass
 
@@ -1027,7 +1365,7 @@ class EXIFExtractor(QObject):
             return result
             
         except Exception as e:
-            if os.environ.get("SkySpotter_VERBOSE_ORIENTATION_LOGS") == "1":
+            if os.environ.get("RAWVIEWER_VERBOSE_ORIENTATION_LOGS") == "1":
                 # print(f"[ORIENTATION] EXIFExtractor error for {os.path.basename(file_path)}: {e}")
                 pass
             pass
@@ -1143,14 +1481,15 @@ class OptimizedRAWProcessor(QObject):
     def process_raw_fast(self, file_path: str, exif_data: Dict[str, Any] = None) -> Optional[np.ndarray]:
         """Process RAW file with optimized parameters for speed."""
         try:
-            with rawpy.imread(file_path) as raw:
-                params = self.get_optimized_processing_params(
-                    file_path, exif_data)
+            yield_if_current_task_active()
+            with _rawpy_global_lock:
+                raw_ctx = rawpy.imread(file_path)
+            with raw_ctx as raw:
+                params = self.get_optimized_processing_params(file_path, exif_data)
+                with _heavy_fallback_semaphore:
+                    rgb_image = raw.postprocess(**params)
 
-                # Process with optimized parameters
-                rgb_image = raw.postprocess(**params)
-
-                return rgb_image
+                    return rgb_image
 
         except Exception as e:
             # Log the actual error for debugging
@@ -1161,7 +1500,10 @@ class OptimizedRAWProcessor(QObject):
     def process_raw_quality(self, file_path: str, exif_data: Dict[str, Any] = None) -> Optional[np.ndarray]:
         """Process RAW file with quality parameters (slower)."""
         try:
-            with rawpy.imread(file_path) as raw:
+            yield_if_current_task_active()
+            with _rawpy_global_lock:
+                raw_ctx = rawpy.imread(file_path)
+            with raw_ctx as raw:
                 # Quality processing parameters
                 params = {
                     'use_camera_wb': True,
@@ -1183,7 +1525,8 @@ class OptimizedRAWProcessor(QObject):
                         'fbdd_noise_reduction': rawpy.FBDDNoiseReductionMode.Full
                     })
 
-                rgb_image = raw.postprocess(**params)
+                with _heavy_fallback_semaphore:
+                    rgb_image = raw.postprocess(**params)
 
                 # Convert 16-bit to 8-bit for display
                 if rgb_image is not None and hasattr(rgb_image, 'dtype') and rgb_image.dtype == np.uint16:
@@ -1393,35 +1736,14 @@ class EnhancedRAWProcessor(QThread):
         """Apply orientation correction to image array."""
         if image_array is None:
             return None
-            
-        # Check if camera stores data pre-rotated
-        if self._is_camera_pre_rotated(exif_data):
-            return image_array
+        from common_image_loader import apply_container_orientation_to_array
 
-        if orientation == 1:
-            return image_array
-        elif orientation == 2:
-            return np.fliplr(image_array)
-        elif orientation == 3:
-            return np.rot90(image_array, 2)
-        elif orientation == 4:
-            return np.flipud(image_array)
-        elif orientation == 5:
-            # Mirrored horizontal + Rotated 270° CW (k=1 CCW)
-            return np.rot90(np.fliplr(image_array), 1)
-        elif orientation == 6:
-            # Orientation 6: Image is rotated 90° CW.
-            # We need to rotate it 90° CW (k=3) to fix it.
-            return np.rot90(image_array, 3)
-        elif orientation == 7:
-            # Mirror LR + rotate 90° CW
-            return np.rot90(np.fliplr(image_array), 3)
-        elif orientation == 8:
-            # Orientation 8: Image is rotated 270° CW (90° CCW).
-            # We need to rotate it 90° CCW (k=1) to fix it.
-            return np.rot90(image_array, 1)
-        else:
-            return image_array
+        # Make-independent: apply_container_orientation_to_array measures the pixels
+        # against the expected display orientation and no-ops when they already match,
+        # so pre-rotated cameras (Sony/Leica/etc.) need no special-case skip here.
+        return apply_container_orientation_to_array(
+            image_array, orientation, exif_data
+        )
 
     def _is_camera_pre_rotated(self, exif_data: Dict[str, Any] = None) -> bool:
         """Check if camera stores data pre-rotated."""

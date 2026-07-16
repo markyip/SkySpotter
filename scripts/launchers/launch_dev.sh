@@ -8,10 +8,10 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
 COLD_START_FLAG="${ROOT}/.skyspotter_cold_start"
-if [ -f "$COLD_START_FLAG" ] || [ -f "${ROOT}/.rawviewer_cold_start" ]; then
+if [ -f "$COLD_START_FLAG" ] || [ -f "${ROOT}/.skyspotter_cold_start" ]; then
     export SkySpotter_DISABLE_SESSION_RESTORE=1
     export RAWVIEWER_DISABLE_SESSION_RESTORE=1
-    rm -f "$COLD_START_FLAG" "${ROOT}/.rawviewer_cold_start"
+    rm -f "$COLD_START_FLAG" "${ROOT}/.skyspotter_cold_start"
     echo "[SkySpotter] Cold start: session restore disabled for this launch (after clear_cache.sh)."
 fi
 

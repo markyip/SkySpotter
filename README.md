@@ -1,725 +1,444 @@
-# SkySpotter
+# SkySpotter v1.0
 
 <p align="center">
-  <img src="icons/appicon.ico" alt="SkySpotter Icon" width="256"><br>
-  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
-  <a href="https://github.com/markyip/SkySpotter"><img src="https://img.shields.io/github/downloads/markyip/SkySpotter/total" alt="Downloads"></a>
-  <a href="https://www.buymeacoffee.com/markyip"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-orange?logo=buy-me-a-coffee" alt="Buy Me a Coffee"></a>
+  <img src="icons/appicon.png" alt="SkySpotter Icon" width="320">
 </p>
 
-## ✈️ Meet SkySpotter
+<p align="center">
+  <img src="https://img.shields.io/badge/version-1.0-blue" alt="Version">
+  <img src="https://img.shields.io/github/downloads/markyip/SkySpotter/total" alt="Downloads">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
+  <a href="https://www.buymeacoffee.com/markyip">
+    <img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-orange?logo=buy-me-a-coffee" alt="Buy Me a Coffee">
+  </a>
+</p>
 
-You're an aviation photographer who just returned from an airshow, a base visit, or a day at the Mach Loop. You've come home with a full memory card and thousands of shots of fast jets, helicopters, and flybys—and now you're facing the real challenge: **sorting through them all**.
+**Language / 語言：** [English](README.md) · [繁體中文](README.zh-TW.md)
 
-SkySpotter is a smart image viewer for Windows and Mac that helps you quickly sort, clean up, and organize massive folders of airplane photos before you start editing.
+**SkySpotter** is an aviation-specialist photo viewer for **Windows and macOS**. Browse airshow RAW/JPEG folders, check focus, cull rejects, rate keepers, and sort by detected aircraft type — **on your computer, no cloud upload.** (Built on the RAWviewer 3.0 engine; free-text MobileCLIP search stays optional/off by default.)
 
-Best of all, it's built entirely around your privacy. All of the AI features—like recognizing aircraft types and auto-sorting them into folders—run 100% locally on your computer. Your photos are never uploaded to the cloud, meaning your files stay completely safe and under your control.
-
-With SkySpotter, you can:
-
-- **See if you nailed focus** — Show where the camera focused on the aircraft before you zoom in to check sharpness.
-- **Know what you shot** — Get AI-driven suggestions for aircraft types across your folder.
-- **Find and sort by type** — Search the gallery by model name, then use the **Magic Wand** to file photos into folders by aircraft.
-- **Work straight from your files** — Open RAW and JPEG with a double-click; no slow import step, built to stay fast even on huge folders.
-
-You still get the usual viewer essentials (zoom, pan, keyboard browsing, discard folder, EXIF info)—but the heart of SkySpotter is **aviation-first organization**, so you spend less time sorting and more time shooting.
-
-**Not an aviation enthusiast?** Try **[RAWviewer](https://github.com/markyip/RAWviewer)** from the same family: the same fast local viewing workflow, aimed at general photography, with **local semantic search** (find images by describing them in words—still on your computer, not in the cloud).
-
-SkySpotter adds aircraft recognition and auto-sort; RAWviewer skips those and focuses on flexible search instead.
+Download: **[GitHub Releases](https://github.com/markyip/SkySpotter/releases/latest)** · Release notes: [`RELEASE_NOTES.md`](RELEASE_NOTES.md)
 
 ---
 
-## ⭐ Highlights
+## Using SkySpotter
 
-### 1. Precision focus area detection
+Open a folder (menu, drag-and-drop, or double-click a photo). Scroll the **gallery**; click a thumbnail for full-screen view.
 
-See **where the camera focused** before you zoom in for sharpness:
+On **large folders** (thousands of photos), the **Gallery** button appears once capture-time (EXIF) sorting finishes, so thumbnails are in shooting order as soon as you open gallery. If metadata is already cached, sort is instant.
 
-- Overlays focus point(s) using manufacturer-specific **MakerNote** data (Canon, Nikon, Sony) plus EXIF **SubjectArea** / **SubjectLocation**
-- **Orientation-aware** mapping and robust coordinate scaling on rotated images
-- Press **`F`** to toggle the overlay
-- Press **Space** to zoom in to the focus point
+In **gallery view**, drag the **size slider** in the bottom bar to change thumbnail size. Rows reflow in a justified grid (full width); scroll stays anchored to the upper-left visible photo while you drag.
 
-### 2. AI aircraft recognition, gallery filters & auto-sort
+| Key | Action |
+|-----|--------|
+| **Space** / **Double-click** | Toggle fit-to-window / 100% zoom |
+| **Pinch** / **Ctrl+scroll** | Zoom in or out |
+| **←** / **→** | Previous / next image |
+| **Scroll wheel** | Previous / next (single view, fit mode) |
+| **↑** | Bookmark / unbookmark |
+| **1–5** / **0** | Set star rating / clear (single view; also clickable stars in the bottom bar) |
+| **↓** | Move to Discard folder |
+| **Delete** | Delete image(s) |
+| **Esc** | Gallery: clear selection → exit bookmark/rating filter · Single view: back to gallery |
+| **Ctrl/Cmd+click** | Gallery: toggle selection |
+| **Shift+click** | Gallery: select range (visible order) |
+| **C** | Toggle Compare mode on/off (requires multiple images selected) |
+| **G** | Cycle composition guide |
+| **H** | Show / hide histogram (hidden by default on launch) |
+| **J** | Toggle highlight/shadow clipping overlay (RAW single view) |
+| **P** | Toggle RAW recovery preview — half-res shadow/highlight recovery (RAW/DNG, session only; fit-only) |
+| **F** | Show / hide focus overlay (supported files) |
+| **M** | Show / hide GPS map overlay (single view, geotagged photos; hidden by default on launch) |
+| **E** | Show / hide Adjust (Develop) panel (single view) |
+| **Ctrl+Z** | Undo last slider adjustment (single view) |
 
-**Core selling points** for organizing an airshow folder. Everything below runs **offline on your machine**—no account, no cloud inference, no sending images to a server.
+**Compare mode shortcuts:**
+* **← / →** — Previous / next candidate image
+* **↑** — Promote candidate (right pane) to selected (left pane)
+* **↓** — Reject candidate and move it to Discard folder (Shift+↓ to reject select)
+* **Delete** — Delete candidate image to Recycle Bin/Trash (Shift+Delete to delete select)
+* **Space** — Toggle synchronized zoom across both panes (with **F** focus overlays on: zoom each pane to its own focus point)
+* **F** — Show / hide focus overlays on both panes (compare mode)
+* **J** — Toggle exposure clipping overlay on both panes
+* **G** — Cycle composition grid guide on both panes
+* **C** / **Esc** — Exit Compare mode
 
-- **Automated aircraft classification**: Custom **Vision Transformer (ViT)** recognizes about **70** military and civil aircraft types (e.g. F-35, AH-64, A400M, Eurofighter Typhoon). Class list: [`labels.txt`](models/gallery-classifier/skyspotter-military-aircraft-vit/labels.txt)
-- **One-click auto-sort**: **Magic Wand** moves images into subfolders by detected aircraft type; images without a label go to **`Unclassified/`**. After sorting, the gallery still shows those files (see folder scope in search section below)
-- **Gallery filters — search by aircraft type**: `aircraft:F-35`, `aircraft:typhoon`, or type a model name after indexing; combine with EXIF (`camera:sony iso<800 aircraft:viper`, `format:raw`, `year>=2024`, and more)
+**Gallery bookmarks & ratings:** Click the outline **bookmark star** (nothing selected) to show bookmarked shots only; gold = filter on. With photos selected, **↑** or the bookmark control toggles bookmarks. Use the gallery **rating filter** for stars ≥ N (combine with bookmarks). Ratings save to **XMP** sidecars.
 
-### 3. Ultra-Fast Viewing & Background Loading
+**Search:** gallery search icon — `camera:sony`, `iso<800`, … (**Full** also accepts `sunset on beach`). **Share:** bottom **Share / Open** button, or drag gallery / film-strip thumbnails out.
 
-Optimized to handle folders containing thousands of heavy camera RAW photos seamlessly:
-
-- **Instant Photo Opening**: Double-click any photo on your computer and the viewer launches it instantly. You can view, zoom, and check your photo immediately without waiting for the rest of the folder to finish scanning.
-- **Silky-Smooth Grid Scrolling**: Browse through massive galleries of large RAW images without stuttering, freezes, or lag.
-- **Reliable 100% Zooming**: Double-clicking or pressing Spacebar to zoom in to check sharpness on DNG and RAW files is perfectly sharp, responsive, and consistent every single time.
-
----
-
-## ✨ Core workflow (fast culling)
-
-- Instant file previewing: no import steps — just drag & drop
-- Zoom in with a single key to check sharpness immediately
-- Stay in zoomed mode while browsing with arrow keys
-- Quickly remove blurry photos from the queue with **`↓`** (moves them to a discard folder)
-- No complex controls to memorize — just the essential keys to move fast
-
-This is a **pre-filtering tool**, letting you go through hundreds of RAW files efficiently **before** committing to editing them in Lightroom or Photoshop.
-
----
-
-## ✨ Features
-
-- **100% Local AI**: All aircraft detection and gallery organizing run entirely offline on your own computer—your photos are never uploaded to the internet or shared.
-- **Automated Aircraft Classification**: Smart recognition for about **70** military and civil aircraft types (see [`labels.txt`](models/gallery-classifier/skyspotter-military-aircraft-vit/labels.txt))
-- **One-Click Auto-Sort**: **Magic Wand** files your photos into neat subfolders by detected aircraft type in a single click.
-- **Precision Focus Area Detection**: See exactly where the camera focused on the aircraft before you zoom in; press **`F`** to toggle.
-- **Smart Film Strip Sync**: The film strip at the bottom of the screen matches your active search filters perfectly. When you browse using the arrow keys, you will only see the filtered photos.
-- **Seamless Search & Navigation**: Clicking a filtered thumbnail keeps your browsing restricted only to those search results.
-- **Quick Send to Editors ("Open with...")**: Send your active photo to Lightroom, Photoshop, or any photo editor on your PC with a single click using the bottom-bar button.
-- **Auto-Session Restore**: Reopens your last viewed folder, active image, and view mode (gallery vs. full screen) automatically when you launch the app.
-- **Powerful Gallery Search**: Filter your grid easily using simple tags like `aircraft:F-35`, `camera:sony`, `iso<800`, or format types (`format:raw`).
-- **Wide Format Support**: Canon (CR2, CR3), Nikon (NEF), Sony (ARW), Adobe DNG, and many more—plus JPEGs, TIFFs, and HEIF.
-- **GPU Acceleration**: Speeds up organizing by automatically utilizing your graphics card, no setup required.
-- **macOS File Association**: Integrates into Finder so you can set it as your default viewer and open files directly.
-- **Intuitive Zoom & Pan**: Easy fit-to-window and 100% zoom modes with smooth dragging, plus native Mac trackpad pinch-to-zoom.
-- **Fast File Management**: Discard bad shots instantly to clean up your folders.
-- **EXIF Data HUD**: Transparent overlay showing camera model, lens, focal length, shutter speed, ISO, and capture time.
-- **Histogram Visualizer**: Press **`H`** to slide out a color histogram when inspecting single images.
-- **Modern UI**: Sleek Material Design 3 interface with beautiful modern icons and clean loading indicators.
-- **Non-Destructive Rotation**: Rotate photos by 90° in the viewer without modifying or corrupting the original files on disk.
+Search syntax → [Advanced reference](#advanced-reference).
 
 ---
 
-## 🚀 Quick Start
+## Lite vs Full
 
-### Download Executable
+Both editions share the same viewer, culling tools, star ratings, bookmarks, metadata search, and the **Adjust** editor (CPU). **Full** adds offline AI search, face filters, and (on Windows with CUDA) GPU demosaic / optional AI denoise export.
 
-#### Windows
-<<<<<<< HEAD
+| | Lite | Full |
+|---|:--:|:--:|
+| Gallery, film strip, zoom, histogram, bookmarks, ratings, culling | ✅ | ✅ |
+| Fast RAW decode (CPU / OpenCV) | ✅ | ✅ |
+| Adjust / Develop editor (tone, lens, export JPEG/TIFF) | ✅ | ✅ |
+| Metadata search (`camera:`, `iso:`, `date:`, …) | ✅ | ✅ |
+| Plain-language search | — | ✅ |
+| Face filters (`has:face`, …) | — | ✅ |
+| GPU demosaic (PyTorch CUDA) / AI denoise export | — | ✅ |
 
-1. Download the latest release from the [Releases Page](https://github.com/markyip/SkySpotter/releases/latest)
-2. Download `SkySpotter.exe` directly (no zip extraction needed)
-3. Double-click `SkySpotter.exe` to initiate the installation process. It will automatically download dependencies and the **gallery classifier** (`models/gallery-classifier/skyspotter-military-aircraft-vit/`). The installer bundles weights when you build after `git lfs pull`; otherwise it uses the GitHub release zip from `manifest.json` or `SkySpotter_APP_MODEL_URL`.
-4. Launch SkySpotter from the Desktop shortcut created during installation! (You can safely delete the original `SkySpotter.exe` installer afterwards).
-=======
-1. Download the appropriate version for your system from the [Releases Page](https://github.com/markyip/RAWviewer/releases/latest):
-   - **`RAWviewer-CUDA.exe`**: Recommended for **NVIDIA GPU** users who have CUDA installed. This provides the fastest indexing and search performance.
-   - **`RAWviewer-DirectML.exe`**: Recommended for **AMD, Intel, or NVIDIA** users who want an out-of-the-box hardware-accelerated experience without installing CUDA.
-2. Run the downloaded installer directly (no zip extraction needed).
-3. Double-click the installer to initiate the installation process. It will automatically set up the dependencies (via Pixi) and download the local AI models to a destination of your choice.
-4. Launch RAWviewer from the Desktop shortcut! (You can safely delete the installer afterwards).
->>>>>>> rawviewer/main
+Pick **Lite** for a smaller install and browse-by-eye workflow (no AI models, no CUDA torch). Pick **Full** to search with everyday words — still 100% offline.
 
-#### macOS
+### AI Denoise (Optional)
 
-> **Minimum supported macOS (official prebuilt release): macOS 13 Ventura or newer.**
-
-1. Download the latest release from the [Releases Page](https://github.com/markyip/SkySpotter/releases/latest)
-2. Download and extract the latest macOS `.zip` release.
-3. Drag `SkySpotter.app` to your **Applications** folder.
-4. **CRITICAL FIRST STEP:** Because this app is not signed with a paid Apple Developer certificate, macOS Gatekeeper may block it. Run this once in Terminal to remove the quarantine flag:
-
-   ```bash
-   xattr -cr /Applications/SkySpotter.app
-   ```
-
-5. You can then launch from Applications or Launchpad.
+**Full** builds support an optional neural denoise model (realPLKSR) for high-quality noise reduction during export (**Lite** omits PyTorch, so these options are unavailable). To enable AI denoise:
+1. **Windows**: The setup installer automatically downloads and installs the denoise model weights (`1xDeNoise_realplksr_otf.safetensors`, model by Philip Hofmann, CC-BY-4.0) during first setup.
+2. **macOS**: The app automatically prompts and handles the model download in-app the first time you attempt to export an image using the "AI denoise" option.
+3. The options "JPEG + AI denoise (realPLKSR)" and "16-bit TIFF + AI denoise" will appear in the export dropdown in the Adjust panel if your system has a compatible GPU (requires a CUDA-compatible GPU on Windows or an Apple Silicon GPU on macOS).
 
 ---
 
-## ⌨️ Navigation & controls
+## GPS map overlay & geotagging
 
-How you move through photos, zoom, and switch views.
+In **single-image view**, press **M** to toggle an interactive tile-based map card. The card opens immediately with a **Loading map…** state while tiles fetch (no popup on photos without GPS). A **coordinate badge** on the map shows lat/lon; click it to open **Google Maps** in your browser.
 
-**Keyboard**
+Bundled offline databases (`cities500.csv.gz` and `landmarks.csv.gz`, 100,000+ locations) are used during **background indexing** to resolve GPS coordinates into city, region, and country names. These power **gallery search** — search `city:tokyo`, `country:jp`, or similar — with no internet required.
 
-- **Space** — Toggle fit-to-window and 100% zoom (check sharpness)
-- **`←` / `→`** — Previous / next image (stays zoomed if you were already zoomed in)
-- **`↓`** — Move the current image to the Discard folder
-- **Delete** — Delete the current image (with confirmation)
-- **`H`** — Show or hide the histogram strip (single-image view)
-- **`F`** — Show or hide the focus/subject overlay (see [Precision focus area detection](#1-precision-focus-area-detection))
-- **`Esc`** — Back to the gallery from full-screen single-image view
-
-**Mouse & trackpad**
-
-- **Double-click** — Zoom in on the point you clicked (from fit), or zoom back out to fit
-- **Pinch** (trackpad) or **Ctrl + scroll** — Zoom in/out; zoom stays anchored near your cursor
-- **Click and drag** — Pan when zoomed in
-- **Drag and drop** — Open a file or folder on the window
-- **Scroll wheel (fit-to-window)** — Previous / next image (down = previous, up = next)
-- **Scroll wheel (while zoomed)** — Pan up/down; tilt wheel pans left/right
-- **Scroll wheel (gallery)** — Scroll the thumbnail grid
-
-**Gallery ↔ single image**
-
-Use the on-screen gallery button or **click a thumbnail** to open a photo full-screen. There is **no `G` keyboard shortcut**. **`Esc`** returns to the gallery.
-
-**When the focus overlay is on (`F`)**
-
-- **Space** from fit-to-window jumps to the focus box; double-click still zooms where you click.
+For a dedicated **cluster map** across an entire album and **geotagging photos missing GPS**, see **[LocateIt](https://github.com/markyip/LocateIt)**: open a folder, see where shots were taken on a map, drag-drop to assign coordinates, and save back to JPEG or RAW.
 
 ---
 
-## 🔎 Gallery search (Gallery view)
+## Download & install
 
-Open the bottom search panel to filter the grid. SkySpotter gallery search is **EXIF/metadata** plus **detected aircraft labels** (written during folder indexing). There is no free-text "describe this photo" semantic search and no face-based search in this app.
+### Windows
 
-**What you can search:**
+1. Download **`RAWviewer_Setup.exe`** from [Releases](https://github.com/markyip/SkySpotter/releases/latest).
+2. Choose **Full (CUDA)**, **Full (DirectML)**, or **Lite** in the wizard. **Full** also downloads AI models (~600 MB).
+3. Launch **`SkySpotter.exe`** or the Desktop shortcut (not the Setup file again).
 
-- **Aircraft type** (after indexing) — `aircraft:F-35`, `aircraft:typhoon`, or a model name such as `Typhoon` or `F-35`
-- **Camera / lens / exposure** — `camera:sony`, `lens:70-200`, `iso<800`, `iso<=800`
-- **Date / place / file** — `year>=2024`, `date:2024-05`, `city:tokyo`, `filename:_dsc`
-- **Format** — `format:jpeg`, `format:raw`, `format:cr3` (`raw` uses the LibRaw set; see [Supported Image Formats](#-supported-image-formats))
-- **GPS** — `has:gps`, `no:gps`
-- **Combine filters** on one line — e.g. `camera:sony iso<800 aircraft:viper`
-- **Clear** the field or use **×** to show the full folder again
+> **v3.0 new:** **Full Editing Functions** integrated (tone curve, lens correction, XMP sidecars); **Fast RAW decode** verified by multiple testing to deliver massive speed improvements vs 2.5; **1–5 star ratings** (keys **0–5**, gallery filter); Nikon **HE/HE*** NEF support; blue aviation chrome. Full changelog: [`RELEASE_NOTES.md`](RELEASE_NOTES.md).
 
-Indexing must finish before aircraft-name filters match; Magic Wand also needs detected labels on your images.
+Registers **Open with** for common photo formats. Uninstall: Settings → Apps, or **`uninstall.bat`** in `%LOCALAPPDATA%\SkySpotter`.
 
-### Indexing behavior (current default)
+### macOS (13+)
 
-- **Aircraft classification** runs during semantic indexing (search-ready when labels are written).
-- **Face detection** is **off by default** in SkySpotter (`"face_scan": false` in [`config/skyspotter_features.json`](config/skyspotter_features.json)). It only powers RAWviewer-style gallery tokens such as `people` and `portrait`; enable it if you need those filters.
-- When face scan is enabled, indexing may run in two passes: metadata + semantic first, then face-count backfill in the background.
-- Advanced face-scan environment switches (only when `face_scan` is on):
-  - `RAWVIEWER_INDEX_DEFER_FACE_SCAN=1` (default): run face scan after the semantic pass
-  - `RAWVIEWER_FACE_SCAN_WARM_THUMBS=0` (default): disable full warm-up prepass
-  - `RAWVIEWER_FACE_SCAN_WARM_MAX_FILES=256` (default): cap warm-up batch size
-  - `RAWVIEWER_FACE_SCAN_WARM_MAX_SECONDS=25` (default): cap warm-up wall time
-
-### Classifier speed vs accuracy (GPU tuning)
-
-Indexing runs **rembg + ViT** per image. ViT inference is fast on CUDA; **rembg and RAW decode** often dominate wall time. Parallel workers help when the GPU has spare VRAM.
-
-| Goal | Setting | Notes |
-| --- | --- | --- |
-| **Faster index** (default auto) | *(no env)* | CUDA ViT + DirectML rembg: **2 workers** on 4070; rembg on CPU allows 4 |
-| **Max throughput** | `SkySpotter_AIRCRAFT_CLASSIFY_WORKERS=3` | Raise only if stable; lower to `1` if ORT/DML crashes |
-| **rembg on CPU** | `SkySpotter_REMBG_CPU=1` | Frees GPU for more ViT workers |
-| **Sharper crops / labels** | `SkySpotter_INDEX_MAX_SIZE=2048` | Larger source before rembg; slower per file |
-| **Fewer false labels** | `SkySpotter_CLASSIFIER_MIN_CONF=0.50` | Higher = stricter (more “unidentified”) |
-| **More labels (riskier)** | `SkySpotter_CLASSIFIER_MIN_CONF=0.30` | Lower = more detections, more mistakes |
-
-Auto defaults (when env vars are unset):
-
-- **Workers:** CUDA ViT + DirectML rembg → **2** on 11+ GiB (`RTX 4070`); set `SkySpotter_REMBG_CPU=1` for up to **4** ViT workers.
-- **Index resolution:** `1920` px long edge on CUDA ≥10 GiB, else `1280`.
-- **Thumbnail warm-up** (before classify, uncached RAW only):
-
-Embedded thumbnails are warmed **during the metadata parallel pass** by default (`SkySpotter_AIRCRAFT_WARM_WITH_METADATA=1`). A short top-up pass before classify covers files that skipped metadata extraction. Set `SkySpotter_AIRCRAFT_WARM_WITH_METADATA=0` to restore a separate warm phase before classify.
-
-| GPU VRAM | Folder (uncached) | max files | time budget |
-| --- | --- | --- | --- |
-| ≥11 GiB | any | all | unlimited |
-| ≥8 GiB | ≤2000 | all | unlimited |
-| ≥8 GiB | >2000 | 1500 | 180s |
-| ≥6 GiB | any | up to 1024 | ~30–120s (scaled) |
-| else | any | up to 384 | ~20–45s (scaled) |
-
-Override: `SkySpotter_AIRCRAFT_WARM_MAX_FILES=-1` (all), `SkySpotter_AIRCRAFT_WARM_MAX_SECONDS=0` (no limit).
-
-Benchmark warm-up vs no warm:
-
-```powershell
-pixi run python scripts/benchmark_thumbnail_warmup.py "K:\Photos\23092025 Mach Loop" --max-images 50
-```
-
-Benchmark classifier throughput:
-
-```powershell
-pixi run benchmark-classifier "K:\Photos\23092025 Mach Loop" --max-images 50
-```
-
-### Gallery search syntax examples
-
-Separate tokens with spaces. Filters use `key:value` or comparison forms.
-
-| Kind | Example |
-| --- | --- |
-| Aircraft label | `aircraft:F-35` or `Typhoon` (indexed `detected_aircraft`) |
-| Filter combo | `camera:sony iso<800 aircraft:viper` |
-| Camera / lens | `camera:canon` · `lens:70-200` |
-| ISO / year | `iso<=800` · `year>=2024` |
-| Place | `city:tokyo` · `country:jp` · `admin:california` |
-| File name | `filename:_dsc` or `name:img_` |
-| File format | `format:cr3` · `type:jpeg` · `format:raw` (see [`src/raw_file_extensions.py`](src/raw_file_extensions.py)) |
-| Date prefix | `date:2024-05` |
-| GPS | `has:gps` · `no:gps` |
-
-<<<<<<< HEAD
----
-
-## Experimental features
-
-These capabilities exist in the codebase but are **off by default**. We tried them in real airshow folders; results were **not reliable enough** for everyday culling (rankings did not always match how sharp a photo looks). You can still enable them to experiment on your own machine.
-=======
-Optional: **stronger semantic models** (advanced). The app default is **MobileCLIP2-S0** (vision: ~43MB) for speed and size. You can choose a stronger model by setting the environment variable **`RAWVIEWER_MOBILECLIP_VARIANT`** to one of the following:
-
-- **`s0`** (Default): Vision model ~43MB, fastest indexing, lower memory usage.
-- **`s2`**: Vision model ~136MB, better accuracy on complex search terms.
-- **`b`**: ViT-B model ~330MB, significantly improved search understanding.
-- **`l14`**: ViT-L/14 model ~1.1GB, highest quality, recommended for heavy/large search applications.
-
-When a different variant is selected, the application will automatically download the correct model assets from Hugging Face (`plhery/mobileclip2-onnx` on Windows/Linux) to a separate cache folder.
-
-*Note for macOS users:* Bundled macOS Core ML models are discovered automatically in common app/resource paths:
-- Apple Hub naming: `mobileclip_s2_image.mlpackage` + `mobileclip_s2_text.mlpackage`
-- App export naming (`--for-app`): `mobileclip2_s0_image.mlpackage` + `mobileclip2_s0_text.mlpackage`
->>>>>>> rawviewer/main
-
-### Blur detection (`sharp` / `blurry` gallery filters)
-
-Laplacian sharpness on a **`subject_rect`** crop of the original image (rembg bounding box, no white compositing), indexed as `blur_score`. Gallery tokens such as `sharp`, `blurry`, and `blur>=N` rank images within the current folder (default: bottom **20%** = blurry).
-
-**Default:** off — see [`config/skyspotter_features.json`](config/skyspotter_features.json) (`"blur_score": false`).
-
-Flags are resolved in order: **environment variable** → **features JSON file** → default (off).
-
-#### Development (Pixi / launchers)
-
-| Method | Command |
-| --- | --- |
-| Normal dev (blur off) | `pixi run start` or `scripts\launchers\launch_dev.bat` |
-| Experimental Pixi env | `pixi run -e experimental start` |
-| Experimental launcher | `scripts\launchers\launch_dev_experimental.bat` (Windows) / `launch_dev_experimental.sh` (macOS) |
-| One-off env override | `$env:SkySpotter_ENABLE_BLUR_SCORE = "1"` then `pixi run start` |
-| Write flags file | `pixi run set-features-experimental` or `pixi run set-features-off` |
-| Show active file | `pixi run features-show` |
-
-After enabling, **re-index** the folder so `blur_score` is written.
-
-#### Building the Windows app
-
-| Build type | How |
-| --- | --- |
-| **Release (blur off)** | `scripts\launchers\build_windows.bat` (writes `"blur_score": false` into the bundled config) |
-| **Experimental build** | `set SkySpotter_BUILD_ENABLE_BLUR_SCORE=1` then `build_windows.bat`, or `python build.py --enable-blur-score` |
-
-The installer bundles `config/skyspotter_features.json`; end users inherit whatever you baked at build time unless they override env vars.
-
-**Optional tuning**
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `SkySpotter_BLUR_MAX_SIZE` | `1920` | Max thumbnail side for blur scoring |
-| `SkySpotter_BLUR_BLURRY_FRACTION` | `0.2` | Fraction ranked as blurry |
-| `SkySpotter_BLUR_SUBJECT_BBOX_PAD` | `0.08` | Padding around rembg bbox |
-| `SkySpotter_INDEX_MAX_SIZE` | `1280` | Classifier load size (independent unless you align with blur) |
-
-**POC scripts (batch validation, not required for normal use)**
-
-```powershell
-pixi run fix-opencv
-pixi run python scripts/poc_blur_detect.py "D:\path\to\photos"
-```
-
-See also `scripts/poc_blur_compare_modes.py` and `scripts/poc_blur_compare_sizes.py`. Implementation: [`src/blur_score.py`](src/blur_score.py).
-
-Treat scores as **reference only**, not ground truth.
-
----
-
-## 📁 Supported Image Formats
-
-Open files directly from disk—no import step. SkySpotter uses [LibRaw](https://www.libraw.org/) for camera RAW and also supports common finished formats.
-
-### RAW formats
-
-- **Canon**: CR2, CR3
-- **Nikon**: NEF
-- **Sony**: ARW
-- **Adobe**: DNG
-- **Olympus**: ORF
-- **Panasonic**: RW2
-- **Fujifilm**: RAF
-- **Hasselblad**: 3FR
-- **Pentax**: PEF
-- **Samsung**: SRW
-- **Sigma**: X3F
-- **And many more** via LibRaw (newer bodies may lag until LibRaw adds support—see [Known Issues](#-known-issues))
-
-### Standard formats
-
-- **JPEG**: JPG, JPEG
-- **TIFF**: TIF, TIFF
-- **HEIF**: HEIF
-
-Gallery `format:raw` / `format:jpeg` filters use the same extension sets as the app (see [`src/raw_file_extensions.py`](src/raw_file_extensions.py)).
-
-<<<<<<< HEAD
----
-=======
-Launch scripts live under [`scripts/Launch/`](scripts/Launch/README.md).
->>>>>>> rawviewer/main
-
-## 🏗️ Building from Source
-
-Launch and build scripts live under [`scripts/launchers/`](scripts/launchers/README.md). Upstream RAWviewer uses `scripts/Launch/`; SkySpotter keeps the `scripts/launchers/` layout instead.
-
-<<<<<<< HEAD
-### Prerequisites
-
-- Install **[Pixi](https://pixi.sh/latest/)** — required for development and building from source
-- **Do not use `pip install` on the project.** Dependencies are pinned in `pixi.toml` / `pixi.lock`; a manual virtualenv often breaks installs (wrong Python version or missing wheels).
-
-### Dev environment (Pixi)
-
-From the project root:
+1. Download **`SkySpotter-v3.0-macOS.zip`** (Full) or **`SkySpotter-v3.0-macOS-Lite.zip`** (Lite) from **[Releases](https://github.com/markyip/SkySpotter/releases/latest)** and extract the zip.
+2. Open **Terminal**, go to the extracted folder (`cd ` then drag the folder onto Terminal), and run:
 
 ```bash
-pixi install
-pixi run start
+bash install_macos_app.sh
 ```
-=======
-**Folder sort (capture time):** Gallery and folder load sort by **EXIF** (`metadata_backend` probe when cold; bulk cache when warm). Default order is **oldest first**; use the gallery **⇅ Oldest / Newest** control to toggle (saved in QSettings). Windows Explorer `DateTaken` via Shell was evaluated and rejected for production (slower than EXIF, no benefit on test folders).
->>>>>>> rawviewer/main
 
-**Local testing from source** (console logs, same on both platforms):
+3. Click **Install**, then **Open** in the dialogs. SkySpotter is copied to **Applications**.
 
-| Platform | Command |
-|----------|---------|
-| **Windows** | `scripts\launchers\launch_dev.bat` |
-| **macOS** | `./scripts/launchers/launch_dev.sh` |
+**Full edition:** The first time you use gallery **Search**, SkySpotter may prompt to download the offline AI models from [Hugging Face](https://huggingface.co/) (~150 MB on macOS, one-time, needs internet). Without a Hugging Face account, that download may take longer. Click **Download** when prompted — progress appears in the search bar as `Downloading... N%`. Windows setup fetches the same models automatically during install.
 
-Train, verify, and build scripts are in the same folder — see `scripts/launchers/README.md`.
+Uninstall: **`uninstall_macos_app.sh`** or **`Uninstall SkySpotter.command`** in the zip (keeps cache cleared; Trash alone does not).
 
-**Virtual environments:** `pixi install` → `pixi run start` uses `.pixi/`. Build/debug batch scripts may create a local `rawviewer_env/` (created automatically). `.venv/` is optional for IDE use only.
+### Requirements
 
-**Optional dev toggles:**
+Windows 10+ · macOS 13+ · 8 GB RAM (16 GB+ recommended for **Full** + large folders) · ~500 MB disk (**Lite**, no AI models / no CUDA torch) or ~1.5 GB+ (**Full** with models; Windows CUDA Full larger due to torch)
+
+To clear thumbnails only: **`scripts\Launch\bat\clear_cache.bat`** (Windows) · **`scripts/Launch/shell/clear_cache.sh`** (Mac)
+
+---
+
+## Supported formats
+
+**RAW:** CR2, CR3, NEF, ARW, DNG, ORF, RW2, RAF, and other LibRaw types · **Standard:** JPEG, TIFF, HEIF, **GIF** (animated), **WebP** (animated)
+
+> [!NOTE]
+> **EDR Support Removed:** macOS EDR (Extended Dynamic Range) support has been removed at this stage. The updated, highly optimized image loading pipeline is not compatible with EDR at this stage; attempting to combine them results in very slow image decoding and loading. To maintain high-speed browsing and editing performance, EDR support has been disabled/removed. All platforms now display images using standard dynamic range (SDR) with high-fidelity tone-mapping.
+
+**Workflow toggle** (single view): switch between **Embedded JPEG (Fast)** and **RAW (High Quality)**.
+
+**Recovery preview (**P**):** half-res shadow/highlight recovery for judging extreme contrast — session only, does not replace full-res view.
+
+---
+
+## Troubleshooting
+
+### All platforms
+
+| Problem | What to do |
+|---------|------------|
+| GPS map not showing | Press **M** in single-image view; the map only appears when the photo has embedded GPS coordinates |
+| HDR HEIC/TIFF looks flat or too dark | **Windows:** HDR stills are tone-mapped to SDR by design. **macOS:** Needs an EDR-capable display (GPU single-image view is on by default); `RAWVIEWER_DISABLE_EDR=1` forces SDR tone mapping |
+| **P** / **J** no effect | **P**/**J** are RAW/DNG single view only; **P** is fit-only half-res preview. **P** recovery also requires scipy + rawpy — check logs if it fails |
+
+### Windows
+
+| Problem | What to do |
+|---------|------------|
+| SmartScreen warning | More info → Run anyway |
+| Slow AI search (**Full**) | Prefer **DirectML** on most PCs; use **CUDA** only with NVIDIA + CUDA |
+| Installer stuck on “Downloading models” (**Full**) | AI models (~600 MB) can take several minutes. Check firewall, VPN, or proxy if it fails — browsing still works; open gallery **Search** later to retry |
+| Opened Setup again instead of the app | Launch **`SkySpotter.exe`** or the Desktop shortcut — not **`RAWviewer_Setup.exe`** |
+| AI search missing after install (**Full**) | Open gallery **Search** → accept the download prompt |
+| SkySpotter not in Open with | Re-run the installer (repair), or reinstall |
+| Leftover cache after uninstall | Run **`uninstall.bat`** again, or delete `%USERPROFILE%\.rawviewer_cache` manually |
+| Out of memory during AI indexing | See [Automatic memory tuning](#automatic-memory-tuning); use **Lite** on 8 GB PCs or set `RAWVIEWER_MEMORY_TIER_AUTO=0` and lower workers manually |
+| App slow or exits after reopening last folder | On 8 GB PCs, use **Lite** or set `RAWVIEWER_DISABLE_SESSION_RESTORE=1` |
+| RAW always shows demosaic, not embedded JPEG | Switch to **Embedded JPEG workflow**; RAW EDR re-decodes from LibRaw and overrides embedded preview when **RAW workflow** is on |
+| Crash | Enable file logging with `RAWVIEWER_FILE_LOG=1`, then check the install folder |
+
+### macOS
+
+| Problem | What to do |
+|---------|------------|
+| macOS blocks the app (“damaged” / won’t open) | In the extracted folder, run `bash install_macos_app.sh` (see install steps above) |
+| `bash: command not found` | Type `cd `, drag the extracted folder onto Terminal, press Return, then run the command again |
+| Can’t read Desktop/Documents | System Settings → Privacy → **Full Disk Access** → add SkySpotter |
+| Search says models missing (**Full**) | Open gallery search and click **Download** when prompted (needs internet once) |
+| Download failed (SSL / certificate error) | On a corporate VPN or proxy, add your organization’s root certificate to **Keychain Access** and set it to **Always Trust** |
+| Need to uninstall completely | Use **`uninstall_macos_app.sh`** or **`Uninstall SkySpotter.command`** from the release zip — not Trash alone |
+| Uninstall scripts missing | Re-download the release zip from [Releases](https://github.com/markyip/SkySpotter/releases/latest); scripts are inside the extracted folder |
+| macOS “out of memory” / heavy swap during indexing | See [Automatic memory tuning](#automatic-memory-tuning). On 8 GB Macs, prefer **Lite** or wait for indexing to finish before opening gallery on huge folders |
+| Killed on relaunch (`Killed: 9` / exit 137 in Terminal) | Try **Lite**, `RAWVIEWER_DISABLE_SESSION_RESTORE=1`, or `RAWVIEWER_ENABLE_SEMANTIC_SEARCH=0` |
+| Gallery still stutters on a huge folder | Run **`clear_cache.sh`** and reopen the folder |
+| Gallery button slow on huge folder (first open) | Normal — waits for EXIF capture-time sort so gallery order is correct; instant when metadata is cached |
+| RAW EDR but want embedded JPEG | Use **Embedded JPEG workflow** toggle, or `RAWVIEWER_RAW_EDR=0` |
+
+More detail: [`scripts/Launch/README.md`](scripts/Launch/README.md)
+
+---
+
+## Advanced reference
+
+*Optional — for search power users and troubleshooting.*
+
+> **Thumbnail cache notice:** To speed up gallery loading, SkySpotter creates a local thumbnail cache on your device. This cache is **never uploaded or shared** — it stays entirely on your machine. Cache files are automatically deleted after **30 days** of inactivity.
+
+### Gallery search syntax
+
+Separate words with spaces. Use `key:value` filters:
+
+| Kind | Example |
+|------|---------|
+| Free text + filter | `jet takeoff camera:sony iso<800` *(Full: free text uses AI)* |
+| Camera / lens | `camera:canon` · `lens:70-200` |
+| ISO / year | `iso<=800` · `year>=2024` |
+| Place | `city:tokyo` · `country:jp` |
+| File name | `filename:_dsc` |
+| Format | `format:raw` · `format:jpeg` · `format:cr3` |
+| Date | `date:2024-05` |
+| GPS / faces | `has:gps` · `has:face` · `no:face` *(face filters: Full only)* |
+
+**Face vs semantic search:** `face`, `people`, `person`, etc. use stored face counts (`has:face`), not the neural search.
+
+**Indexing:** On **Full** builds, semantic search and face counts run in the background on large folders (metadata + AI first, faces after). The **search field stays read-only** until indexing completes for your profile (**Lite:** metadata; **Full:** metadata, embeddings, and face scan when enabled). When you **open a different folder**, indexing and prefetch from the previous folder are cancelled so work does not continue in the background for the old album (**v2.5.0**).
+
+### Automatic memory tuning
+
+On every launch, SkySpotter reads **installed system RAM** (not free RAM at that moment) and applies conservative defaults for load concurrency, preview cache, prefetch, and indexing — **only when you have not already set the same environment variables yourself**.
+
+| Tier | Installed RAM | Typical Mac | What changes (summary) |
+|------|---------------|-------------|-------------------------|
+| **low** | &lt; 10 GB | 8 GB MacBook Air | Face scan off during indexing; fewer parallel workers; smaller preview cache; less idle prefetch |
+| **medium** | 10–14 GB | 12 GB unified | Moderate limits on workers and cache |
+| **balanced** | 14–20 GB | 16 GB | Light tuning (default on many laptops) |
+| **high** | 20–28 GB | 24 GB | Slightly higher cache / worker caps |
+| **ultra** | ≥ 28 GB | 32 GB+ studio machines | Stock app defaults (no overrides) |
+
+**What you might notice**
+
+- Startup log (dev / Terminal): `[PROFILE] memory tier=balanced (16.0 GB RAM)`
+- A note file: `~/.rawviewer_cache/memory_tier.json` (tier, RAM, how many defaults were applied)
+- **Lite** builds still use Lite profile defaults first; RAM tier only fills in gaps
+- **Full** on an 8 GB Mac: semantic AI search can still run, but face indexing is disabled automatically to reduce memory pressure
+- **Relaunch (v2.4.1+):** Session restore staggers full decode and prefetch so reopening the last folder is less likely to OOM; see release notes if fit view stays soft for a few seconds
+
+**Disable auto-tuning** (use only your own env vars or scripts):
+
+```bash
+export RAWVIEWER_MEMORY_TIER_AUTO=0
+```
+
+**Force a specific override** (wins over auto-tuning — examples for low-RAM machines):
+
+```bash
+export RAWVIEWER_ENABLE_FACE_SCAN=0
+export RAWVIEWER_SEMANTIC_PREP_WORKERS=2
+export RAWVIEWER_MEMORY_PREVIEW_MAX=1280
+export RAWVIEWER_IDLE_DISPLAY_PREFETCH=0
+```
+
+Semantic batch/chunk size for AI indexing is **auto-tuned separately** on first index pass (Core ML on macOS, ONNX on Windows); results are cached under `~/.rawviewer_cache/semantic_batch_tuning.json`.
+
+### MobileCLIP models (Full — AI search)
+
+| Platform | When downloaded | Change variant (Windows) |
+|----------|-----------------|--------------------------|
+| **Windows Full** | During setup (~600 MB) | Set `RAWVIEWER_MOBILECLIP_VARIANT` to `s0`, `s2`, `b`, or `l14` |
+| **macOS Full** | First gallery search (~150 MB) | Dev helper: `python scripts/download_mobileclip_coreml.py --out-dir models/mobileclip2_coreml` |
+
+**Lite builds** do not use MobileCLIP models.
+
+### Focus overlay (`F`) by brand
+
+| Brand | Support |
+|-------|---------|
+| Canon CR2/CR3, Nikon NEF, Sony ARW, Olympus ORF, Panasonic RW2 | Yes (maker AF) |
+| JPEG / TIFF / HEIF | Sometimes (EXIF SubjectArea) |
+| Fujifilm RAF, Hasselblad 3FR, Pentax PEF, Samsung SRW, Sigma X3F | No |
+| Typical Adobe DNG | Usually no |
+
+Requires **pyexiv2** for maker-note AF on RAW.
+
+### Environment variables
+
+<details>
+<summary><strong>Click to expand — dev / tuning flags</strong></summary>
 
 | Variable | Effect |
 |----------|--------|
-| `RAWVIEWER_GPU_VIEW=1` | Use the experimental GPU-accelerated single-image viewport (smoother zoom/pan; default remains the classic scroll area) |
-| `RAWVIEWER_GPU_VIEW_NO_GL=1` | Force raster viewport when GPU view is enabled (debug / fallback) |
-| `RAWVIEWER_PERSISTENT_CACHE=1` | Enable disk/SQLite cache persistence (off by default) |
-<<<<<<< HEAD
-=======
-| `RAWVIEWER_EXIF_BACKEND=auto` | EXIF via pyexiv2 (JPEG/TIFF) + exifread (RAW headers); `exifread` or `pyexiv2` to force one backend |
-| `RAWVIEWER_SORT_PROBE_WORKERS` | Parallel EXIF header probes during folder sort (default scales with CPU, up to 12 on local disk; 3 on UNC / `RAWVIEWER_SLOW_STORAGE_PREFIXES`) |
-| `RAWVIEWER_INDEX_METADATA_WORKERS` | Semantic index metadata extraction pool (default 2–6; lower on folders &gt;2000 files) |
-| `RAWVIEWER_RAW_LOAD_LIMIT` | Max concurrent LibRaw decodes in the load manager (default `4`) |
-| `RAWVIEWER_PROCESS_POOL_WORKERS` | LibRaw postprocess process pool size when `RAWVIEWER_USE_PROCESS_POOL=1` |
-| `RAWVIEWER_SLOW_STORAGE_PREFIXES` | Comma-separated path prefixes (e.g. `K:\Photos,N:\`) to cap sort-probe parallelism at 3 |
+| `RAWVIEWER_MEMORY_TIER_AUTO=1` | **Default.** Tune workers, cache, and prefetch from installed RAM at startup |
+| `RAWVIEWER_MEMORY_TIER_AUTO=0` | Disable RAM-tier defaults; only explicit env vars apply |
+| `RAWVIEWER_MOBILECLIP_VARIANT` | Windows ONNX model: `b` (default), `s0`, `s2`, `l14` |
+| `RAWVIEWER_GPU_VIEW=1` | GPU single-image viewport (OpenGL zoom/pan; on by default in release builds) |
+| `RAWVIEWER_GPU_VIEW=0` | Force legacy scroll-area single-image view |
+| `RAWVIEWER_DISABLE_EDR=1` | macOS: disable EDR viewport and HDR/RAW 16-bit display path; use SDR tone mapping |
+| `RAWVIEWER_RAW_EDR=1` | **Default.** macOS: EDR for RAW when **RAW (High Quality)** workflow is selected; `0` to hard-disable. In-app: bottom-bar **EDR** button toggles it per-user, but resets to off every time you switch into RAW workflow. EDR decode is also idle-deferred: rapid navigation shows the fast SDR buffer immediately and only upgrades to EDR after you pause on an image, so browsing speed is unaffected either way |
+| `RAWVIEWER_LIBRAW_CONSISTENT_PREVIEW=1` | Same color pipeline for fit vs 100% zoom on RAW (default on) |
+| `RAWVIEWER_FAST_RAW_DECODE=0` | Disable the fast RAW decode path (LibRaw unpack + SIMD demosaic with exact color parity, shared unpack between half/full tiers; default on, auto-falls-back to rawpy for unsupported sensors) |
+| `RAWVIEWER_SIDECAR_ADJUST=1` | Apply saved XMP edits to browse/full-res pixels (default **off** — edits show in Adjust only; when on, CURRENT full loads paint a preview-sized edited interim before the full apply) |
+| `RAWVIEWER_UNPACK_STASH_SLOTS` | LibRaw unpack mosaic LRU size for half→full reuse (default `3`, range 1–8) |
+| `RAWVIEWER_USE_PROCESS_POOL=0` | Disable LibRaw process pool (leave unset for normal use) |
+| `RAWVIEWER_EXIF_BACKEND=auto` | `auto`, `pyexiv2`, or `exifread` |
+| `RAWVIEWER_SHARE_MENU=1` | macOS: Qt share menu (recommended) |
+| `RAWVIEWER_SHARE_TRY_NATIVE_PICKER=1` | macOS: try native share sheet first |
+| `RAWVIEWER_INDEX_DEFER_FACE_SCAN=1` | Defer face scan until after semantic index (default) |
+| `RAWVIEWER_SEMANTIC_PREP_WORKERS` | Parallel CPU workers before AI encode (RAM tier may set this) |
+| `RAWVIEWER_SEMANTIC_BATCH_AUTO=1` | Auto-tune AI batch/chunk size on index (default) |
+| `RAWVIEWER_SEMANTIC_BATCH_CANDIDATES` | Candidate batch sizes for auto-tune (default `8,16,32,64,128`) |
+| `RAWVIEWER_PREVIEW_CACHE_ITEMS` | Cap in-memory preview LRU count |
+| `RAWVIEWER_FULL_IMAGE_CACHE_ITEMS` | Sensor-res buffer LRU slots (default 8, max 32; higher = instant zoomed A↔B revisits at ~100–200 MB per slot) |
+| `RAWVIEWER_MEMORY_PREVIEW_MAX` | Max long edge for in-memory RAW/JPEG preview (pixels) |
+| `RAWVIEWER_IDLE_DISPLAY_PREFETCH=0` | Disable idle neighbor prefetch in single view |
+| `RAWVIEWER_SESSION_RESTORE_DEFER_PRELOAD=1` | **Default.** After relaunch, delay full decode and neighbor prefetch (see v2.4.1 release notes) |
+| `RAWVIEWER_SESSION_RESTORE_FULL_DECODE_DELAY_MS` | Milliseconds to wait after first paint before full decode on session restore (default `2500`) |
+| `RAWVIEWER_DISABLE_SESSION_RESTORE=1` | Do not reopen the last folder/file on launch |
 
-**macOS share (v2.2, single-image view only):**
+Full list and dev defaults: [`scripts/Launch/README.md`](scripts/Launch/README.md), [`docs/macos-sharing-v21-v22.md`](docs/macos-sharing-v21-v22.md).
 
-| Variable | Default in `launch_dev.sh` | Effect |
-|----------|------------------------------|--------|
-| `RAWVIEWER_SHARE_MENU` | `1` | Qt menu listing `NSSharingService` targets (recommended under Qt6) |
-| `RAWVIEWER_SHARE_TRY_NATIVE_PICKER` | off | Try `NSSharingServicePicker` first, then menu fallback |
-| `RAWVIEWER_SHARE_SHOW_AIRDROP` | off | Include AirDrop in the menu (in-app AirDrop is unreliable in the Qt host) |
-| `RAWVIEWER_SHARE_DEBUG` | off | Share diagnostics in status bar and `[SHARE]` logs |
+</details>
 
-Details: [`docs/macos-sharing-v21-v22.md`](docs/macos-sharing-v21-v22.md) and [`scripts/Launch/README.md`](scripts/Launch/README.md#macos--release-smoke-test-manual).
+### macOS version support
 
-### macOS — build and smoke test (v2.2)
+| Your Mac | Official `.zip` | Build from source |
+|----------|-----------------|-------------------|
+| macOS 13 Ventura (Intel) | ✅ | `build_macos_full.sh` or Pixi |
+| macOS 13 Ventura (Apple Silicon) | ✅ | Use **`build_macos_full.sh`** (Pixi needs 14+) |
+| macOS 14 Sonoma+ | ✅ | Pixi or `build_macos.sh` |
+| macOS 12 Monterey or older | ❌ | ❌ |
 
-```bash
-chmod +x scripts/Launch/shell/*.sh
-./scripts/Launch/shell/build_macos.sh    # or: pixi install && pixi run python build.py
-xattr -cr dist/RAWviewer.app
-open dist/RAWviewer.app
-```
+### Upcoming (development branch)
 
-**Dev run** (preflight checks for `pyexiv2` and semantic backend):
+Not in a release yet — tracked separately.
 
-```bash
-./scripts/Launch/shell/launch_dev.sh
-# Skip preflight: RAWVIEWER_TEST_PYEXIV2=0 RAWVIEWER_TEST_SEMANTIC=0 ./scripts/Launch/shell/launch_dev.sh
-```
+**Windows HDR / EDR** — v2.5+ ships macOS EDR for HDR stills and RAW (High Quality workflow). Windows still tone-maps HDR HEIC/TIFF and RAW to SDR. A future Windows path would use HDR-capable displays (10-bit / scRGB or HDR10 via Qt QRhi) for extended highlight headroom.
 
-Before tagging a macOS release: confirm app version **2.2**, single-view **share** menu works (Mail attach), and bundled `models/mobileclip2_coreml` if semantic search is required in the `.app`.
+**Multithreaded LibRaw (macOS dev builds)** — The PyPI rawpy wheel bundles a single-threaded LibRaw on macOS/Linux (Windows wheels already ship OpenMP). `scripts/build_libraw_openmp.sh` rebuilds LibRaw with OpenMP and swaps it into the Pixi env — roughly 1.5–2× faster unpack on CR3/RAF/pana8. Local dev-env only; re-apply after `pixi install`. Verify with `scripts/check_libraw_parallelism.py <raw file>`.
 
-## 🏗️ Building from Source
+**Future Development Plan:**
+- **Live Edit Synchronization**: Stabilize and implement real-time live updates of adjustment sidecars across gallery thumbnails and single-image non-RAW previews (currently a known issue where original/cached unedited embedded previews are shown due to cache sync delays).
+- **White balance preset support**: Add standard and custom WB presets.
+- **LUT support**: Allow users to load and apply custom color lookup tables.
+- **Masking for the editor**: Introduce local adjustments and selective masking.
+- **VLM connection**: Integrate with Vision-Language Models for automatic, intelligent image adjustments.
 
-### Prerequisites
-- [Pixi](https://pixi.sh/latest/) (Package manager for development and dependencies)
->>>>>>> rawviewer/main
-
-### Windows
-
-```batch
-scripts\launchers\build_windows.bat
-```
-
-Or: `pixi install` then `pixi run python build.py`
-
-### macOS
-
-```bash
-./scripts/launchers/build_macos.sh
-```
-
-Or: `pixi install` then `pixi run python build.py`
-
-### Dependencies & packaging
-
-Everything is installed with **`pixi install`** (see `pixi.toml`). Use **`pixi run start`**, **`pixi run verify-model`**, and **`pixi run python build.py`** so commands run inside that environment.
-
-**Packaging note:** `build.py` strips dev logs before PyInstaller runs. The Windows installer copies **`pixi.toml` and `pixi.lock`** and runs **`pixi install --locked`** on the user's machine so installs match the pinned environment.
+**Shipped in 3.0:** Fast RAW decode verified by multiple testing for speed improvements vs 2.5, full Adjust / Develop editing panel integrated for all users, star ratings, burst grouping / Compare (**C**). GPU **viewport** (OpenGL zoom/pan) is on by default (`RAWVIEWER_GPU_VIEW=0` to disable).
 
 ---
 
-## 🐛 Troubleshooting
+## For developers
 
-### Crash logs (Windows and macOS)
+Scripts and build matrix: [`scripts/Launch/README.md`](scripts/Launch/README.md)
 
-SkySpotter writes crash-related files to the **first writable folder** below. Look for:
-
-- `crash_report_YYYYMMDD_HHMMSS.txt` — uncaught Python exceptions
-- `fatal_dump_YYYYMMDD_HHMMSS.log` — low-level fatal crashes (access violation / segfault)
-
-| How you run SkySpotter | Where to look |
-|------------------------|---------------|
-| **From source (development)** | `<project>/src/logs/` first, then `<project>/logs/` |
-| **Windows installed app** | `%LOCALAPPDATA%\SkySpotter\logs\` (e.g. `C:\Users\<you>\AppData\Local\SkySpotter\logs\`) |
-| **macOS installed app** | `~/Library/Application Support/SkySpotter/logs/` |
-
-Optional: set `RAWVIEWER_FILE_LOG=1` when developing to enable extra file logging under `src/logs/`.
-
-### Windows
-
-- **"Windows protected your PC"**: Click "More info" → "Run anyway"
-- **Antivirus warnings**: Add SkySpotter to your antivirus exclusions
-- **Performance issues**: Try running as administrator
-- **"Open with another app" / bottom share button**: v2.2 implements the native Open with APIs (`OpenAs_RunDLLW`, `SHOpenWithDialog` + `OAIF_EXEC`), but the bottom-bar control is **hidden on Windows** in current `main`. Use Explorer **Open with** on the file until the in-app button is re-enabled (see `scripts/Launch/README.md`).
-- **AttributeError with stdout**: This is normal for windowed builds - the application runs without a console window
-- **Installer stuck on "Downloading MobileCLIP ONNX Models" / `No module named 'requests'`**:
-  - Fixed in recent builds (`requests` in `pixi.toml`). Re-run the installer from a fresh build, or in the install folder run `_internal\pixi\pixi.exe install` then retry.
-  - Public Hugging Face models download **without** an account or token.
-- **Crash code `-1073741819` / `0xC0000005` (access violation)**:
-  - This is a native crash (viewer, RAW decoder, or graphics driver layer), not always a Python exception.
-  - Check **`%LOCALAPPDATA%\SkySpotter\logs\`** for `fatal_dump_*.log` and `crash_report_*.txt` (see **Crash logs** above). If you run from a git checkout, also check `<project>\src\logs\`.
-
-### macOS
-
-- **Minimum supported macOS (official prebuilt app): 13.0 (Ventura)**
-  - macOS 12 and older may fail to launch the prebuilt binary; use a local Pixi build instead.
-
-- **"App is damaged and should be moved to the Trash" / "Apple could not verify SkySpotter is free of malware"**:
-  - **Why it happens**: Apple heavily restricts apps downloaded outside the App Store that aren't signed with a paid developer certificate. On newer macOS versions (especially Apple Silicon M1/M2/M3), macOS breaks the app's ad-hoc signature and aggressively blocks opening it.
-  - **The Fix (Fastest)**: Open your **Terminal** app and run the following command to remove the quarantine flag:
-    ```bash
-    xattr -cr /Applications/SkySpotter.app
-    ```
-    _(Note: If you placed the app somewhere other than the Applications folder, update the path accordingly)._
-- **"Symbol not found: (_mkfifoat)" or App crashes instantly on macOS 12 (Monterey) or older**:
-  - **Why it happens**: The pre-built release is compiled using a newer macOS 13+ SDK. Older macOS versions do not have the required system files to run it.
-  - **The Fix**: You must build the app locally (see the "Ultimate Fix" below).
-
-#### 🛠️ The Ultimate Fix: Build Locally (Solves Both Issues Above)
-
-If you are on macOS 12 or older, OR if you simply want to permanently bypass all Gatekeeper/Quarantine warnings forever, you can build the app directly on your own machine. Pixi pins a supported Python version for you:
-
-1. **Install Pixi** (Terminal: `curl -fsSL https://pixi.sh/install.sh | bash`).
-2. **Clone and build:**
-
-   ```bash
-   git clone https://github.com/markyip/SkySpotter.git
-   cd SkySpotter
-   pixi run python build.py
-   ```
-
-   This creates a compatible `SkySpotter.app` in `dist/`. You can also run `./scripts/launchers/build_macos.sh` if you prefer the shell wrapper.
-
-#### 🔧 Local Build Troubleshooting
-
-- **Build fails with `pip`, `pyexiv2`, or PyQt compile errors**
-  - **Why it happens**: Trying to install dependencies outside Pixi (unsupported).
-  - **The fix**: From the repo root run `pixi install`, then use `pixi run python build.py` or the `scripts/launchers/` build script. Remove any old manual virtualenv folders (`skyspotter_env`, `rawviewer_env`) if you created them earlier.
-- **Homebrew delays on macOS 12 Monterey or older**:
-  - Homebrew has officially dropped "binary bottle" support for Monterey. However, **it still works**. When the build script attempts to `brew install inih gettext`, Homebrew will simply compile them from source on your machine. This is completely normal but may take 2-3 extra minutes.
-<<<<<<< HEAD
-- **Permission Denied / Cannot Read Folder**: Modern macOS requires explicit permission for apps to access the Desktop or Documents.
-=======
-
-- **Share menu empty or native picker spins**: Use dev defaults (`RAWVIEWER_SHARE_MENU=1` via `launch_dev.sh`). Avoid opening the picker on mouse-up; see [`docs/macos-sharing-v21-v22.md`](docs/macos-sharing-v21-v22.md). For AirDrop, prefer Finder on the file.
-
-- **Permission Denied / Cannot Read Folder**: Modern macOS requires explicit permission for apps to access the Desktop or Documents. 
->>>>>>> rawviewer/main
-  1. Go to **System Settings** > **Privacy & Security** > **Full Disk Access**.
-  2. Click the **+** button and add `SkySpotter.app`.
-  3. Toggle it to **ON**.
-- **Gallery search only filters EXIF and aircraft labels:** This is expected. Phrases like "sunset" or "crowd" are not semantic image search—they only match if those words appear in metadata or an indexed aircraft label.
-- **Magic Wand hidden:** Wait until gallery indexing finishes. The wand appears once images are indexed (labeled types get their own folder; others can go to `Unclassified/`).
-- **"Exporting aircraft model" on first folder open:** Normal one-time setup on a new PC (often under a minute). Later opens of the same folder are much faster.
-
-## 🧠 Customizing the Classifier
-
-Train a **custom ViT classifier** on your own labeled folders—birds, animals, vehicles, military aircraft, or any other subjects. SkySpotter ships a default model under `models/gallery-classifier/skyspotter-military-aircraft-vit/`; **your trained checkpoint does not replace it until you copy the four weight files there** (or set `SkySpotter_GALLERY_CLASSIFIER_DIR`).
-
-### Workflow overview
-
-| Step | Folder / action | Purpose |
-|------|-----------------|--------|
-| 1. Label training photos | `training_data/classified_images/<class>/` | One subfolder per class |
-| 2. Train | `scripts/launchers/train_model.*` → `customized_model/` | Fine-tune ViT; rembg runs automatically |
-| 3. Test | `testing_data/test_images/` → `scripts/launchers/verify_model.*` | Confirm the checkpoint before gallery use |
-| 4. Promote | Copy into **`models/gallery-classifier/<id>/`** (or `app_model/`) | **Active model** for labels and Magic Wand |
-| — | `training_data/processed_images/` | Cached training PNGs (generated at step 2; do not edit) |
-
-### 1. Prepare labeled images
-
-Add images under `training_data/classified_images/`, one subfolder per class (see `training_data/classified_images/README.md`).
-
-### 2. Train (background removal is automatic)
-
-Training **always** runs `rembg` background removal and subject cropping on your source images before fine-tuning. You do not run a separate preprocessing step.
-
-Use the pixi environment (includes `rembg` and pinned `numpy` for numba):
-
-- **Windows:** `scripts\launchers\train_model.bat`
-- **macOS:** `./scripts/launchers/train_model.sh`
-
-Or directly:
+### Quick start
 
 ```bash
 pixi install
-pixi run python scripts/train_processed_aircraft.py
+pixi run start          # full profile (default)
 ```
 
-The checkpoint is written to **`customized_model/`** by default (`config.json`, `model.safetensors`, `preprocessor_config.json`, `labels.txt`).
+**Windows**
 
-Optional environment variables:
+| Task | Script |
+|------|--------|
+| Run (full) | `scripts\Launch\bat\launch_dev_full.bat` |
+| Run (lite) | `scripts\Launch\bat\launch_dev_lite.bat` |
+| Build Full installers | `scripts\Launch\bat\build_windows_full.bat` (CUDA) or `build_windows_full.bat directml` |
+| Build Lite installer | `scripts\Launch\bat\build_windows_lite.bat` |
+| Build both Full backends | `scripts\Launch\bat\build_windows_all.bat` |
 
-- `SkySpotter_TRAIN_DATA_PATH` — source labeled folders (default: `training_data/classified_images`)
-- `SkySpotter_TRAIN_OUTPUT_DIR` — checkpoint output (default: `customized_model`)
-- `SkySpotter_TRAIN_PROCESSED_PATH` — cached processed PNGs (default: `training_data/processed_images`)
+**macOS**
 
-**Training:** Uses your GPU automatically when the machine provides one; otherwise it runs on CPU.
+| Task | Script |
+|------|--------|
+| Run (full) | `./scripts/Launch/shell/launch_dev_full.sh` |
+| Run (lite) | `./scripts/Launch/shell/launch_dev_lite.sh` |
+| Build Full | `./scripts/Launch/shell/build_macos_full.sh` → `dist/SkySpotter.app` |
+| Build Lite | `./scripts/Launch/shell/build_macos_lite.sh` → `dist/RAWviewer_Lite.app` |
 
-### 3. Test your model (before using the gallery)
+Build outputs:
 
-Use held-out photos that were **not** in your training folders when possible, so you are checking generalization—not memorization.
+| Profile | Windows | macOS |
+|---------|---------|-------|
+| **Full / Unified** | `dist/RAWviewer_Setup.exe` (includes Full & Lite options) | `dist/SkySpotter-v3.0-macOS.zip` |
+| **Lite** | (Select Lite option in `RAWviewer_Setup.exe`) | `dist/SkySpotter-v3.0-macOS-Lite.zip` |
 
-**3a. Add test images**
+Dependencies are in `pixi.toml`. Packaging scripts use a local `rawviewer_env/` venv when building release artifacts.
 
-1. Copy sample photos into `testing_data/test_images/` (any mix of classes you trained).
-2. See `testing_data/test_images/README.md` for a short checklist.
+<details>
+<summary><strong>Build from source (commands)</strong></summary>
 
-**3b. Run verification**
+**Windows**
+```batch
+scripts\Launch\bat\build_windows_full.bat
+scripts\Launch\bat\build_windows_lite.bat
+```
 
-From the project root:
-
-| Platform | Command |
-|----------|---------|
-| **Windows** | `scripts\launchers\verify_model.bat` |
-| **macOS** | `./scripts/launchers/verify_model.sh` |
-| **Either** | `pixi run verify-model` |
-
-The script runs `scripts/batch_test_classifier.py` on **`customized_model/`** with the same rembg-style preprocessing as training.
-
-Optional overrides (set before running the `.bat` / `.sh`):
-
-- `SkySpotter_VERIFY_INPUT_DIR` — test image folder (default: `testing_data/test_images`)
-- `SkySpotter_VERIFY_MODEL_DIR` — checkpoint folder (default: `customized_model`)
-- `SkySpotter_VERIFY_OUTPUT_DIR` — results folder (default: `testing_data/test_output`)
-
-**3c. Review results**
-
-After a successful run, open:
-
-| Output | What to check |
-|--------|----------------|
-| `testing_data/test_output/pipeline_images/` | Subject crop looks correct (aircraft centered, background removed) |
-| `testing_data/test_output/top3_detection_scores.csv` | `top1_label` / `top1_score` match what you expect; compare `top2`/`top3` when unsure |
-
-In the CSV:
-
-- **`status`** — preprocessing outcome (e.g. crop too small, rembg issue).
-- **`top1_score`** — confidence for the best label (higher is stronger; very low scores may mean a bad crop or a class the model has not seen enough).
-- **`error`** — non-empty if that file failed entirely.
-
-If labels are wrong, add more training images for those classes and re-run **step 2**, then verify again. Repeat until you are happy with the CSV and pipeline images.
-
-**3d. Optional: test the gallery path**
-
-`scripts/poc_aircraft_detection.py` exercises the **same in-app classifier** the gallery uses. Use this only **after** you copy your checkpoint to step 4—not for the first check on `customized_model/`.
-
-### 4. Promote to the gallery when ready
-
-When verification looks good, **copy** these four files from `customized_model/` into `models/gallery-classifier/skyspotter-military-aircraft-vit/` (or legacy `app_model/`):
-
-- `config.json`
-- `model.safetensors`
-- `preprocessor_config.json`
-- `labels.txt`
-
-Restart SkySpotter (or reload the folder) so indexing picks up your model. Open a folder with aircraft photos and confirm labels or Magic Wand behavior in the app.
-
-### 5. Runtime behavior
-
-Gallery classification loads the first valid checkpoint among `models/gallery-classifier/skyspotter-military-aircraft-vit/`, legacy `app_model/`, or paths from `SkySpotter_GALLERY_CLASSIFIER_DIR` / `SkySpotter_APP_MODEL_DIR`. See `models/gallery-classifier/README.md`.
-
-**Clone from GitHub (developers):**
-
+**macOS**
 ```bash
-git clone https://github.com/markyip/SkySpotter.git
-cd SkySpotter
-git lfs install
-git lfs pull
+./scripts/Launch/shell/build_macos_full.sh
+./scripts/Launch/shell/build_macos_lite.sh
+# or: pixi install && pixi run python build.py --profile full
 ```
 
-## ⚠️ Known Issues
+</details>
 
-### Platform (v2.2)
-- **Windows:** In-app **Open with** picker is implemented but the bottom-bar button is not shown on `win32` in current `main`.
-- **macOS:** `NSSharingServicePicker` popover often fails under the Qt6 host; default product path is the **Qt share menu**, not the popover.
+### Architecture (brief)
 
-### Camera compatibility
-
-- **Newer camera models**: Support for the latest camera releases may be limited until LibRaw catches up.
-- **Proprietary RAW formats**: Some manufacturers' newest RAW formats may not be fully supported immediately after camera release.
-- **Firmware updates**: Camera firmware updates may change RAW formats and require LibRaw updates.
-
-## 🏛️ Architecture & Dependencies
-
-SkySpotter combines RAWviewer's viewer architecture with aviation-specific inference:
-
-- **ImageLoadManager**: Thread pool and priority queue for loading
-- **UnifiedImageProcessor**: Single path for RAW, JPEG, TIFF, and more
-- **Cache**: Memory-first by default; optional disk/SQLite via `SkySpotter_PERSISTENT_CACHE=1`
-- **Aircraft classifier**: Multi-threaded `QThreadPool` (up to 4 concurrent classification jobs in the gallery workflow)
-
-Gallery search uses a local index (EXIF + aircraft labels written while the folder is indexed).
-
-## 📄 License
-
-This project is licensed under the MIT License — see [LICENSE](LICENSE).
-
-**Third-party software and models** (ViT checkpoints, rembg / IS-Net, PyQt6, optional CLIP weights, etc.) are **not** covered by SkySpotter's MIT license alone. See **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)** for copyrights, attribution, and redistribution requirements.
-
-## 🤝 Contributing
-
-Contributions are welcome. Please open a Pull Request with a clear description of the change.
-
-## 📞 Support
-
-If you encounter issues:
-
-1. Attach crash logs from the folder that matches how you run the app:
-   - **Windows (installer):** `%LOCALAPPDATA%\SkySpotter\logs\`
-   - **macOS (`.app`):** `~/Library/Application Support/SkySpotter/logs/`
-   - **From source:** `<project>/src/logs/` or `<project>/logs/`
-   
-   Files: `crash_report_*.txt`, `fatal_dump_*.log` (see **Crash logs** under Troubleshooting).
-
-2. Search existing GitHub issues.
-3. Open a new issue with OS version, steps to reproduce, and relevant log excerpts.
+- **ImageLoadManager** — threaded load queue; folder changes cancel in-flight tasks (**v2.5.0**)
+- **UnifiedImageProcessor** — RAW/JPEG/TIFF via one path; **Fast RAW decode** shared unpack half/full (**v3.0.0**)
+- **Star ratings** — 1–5 + XMP; gallery min-rating filter (**v3.0.0**)
+- **Full Editing** — Adjust panel, XMP sidecars, PV2012-style develops (**v3.0.0**)
+- **Cache** — memory-first; optional disk cache via env; **RAM-tier defaults** at startup (`skyspotter_profile.py`)
+- **Semantic index** — SQLite + local embeddings (Core ML on macOS, ONNX on Windows; Full builds only); background passes abort when folder scope changes (**v2.5.0**)
+- **Gallery (JustifiedGallery)** — justified grid with zoom slider (relayout + upper-left scroll anchor); layout cache keyed to folder generation; gallery opens in capture-time order after EXIF sort; tile aspect reconciles decoded thumbnails with container EXIF before justified-row geometry is locked (**v2.5.0**)
+- **HDR / EDR (macOS)** — GPU viewport EDR layer + 16-bit HDR still decode; RAW EDR via linear LibRaw when RAW workflow is active (**v2.5.0**)
+- **RAW recovery preview** — **P** key, half-res linear decode + local tone recovery (`raw_tone_recovery.py`; **v2.5.0**)
+- **Clipping overlay** — **J** key on current pixmap (`exposure_clipping.py`; **v2.5.0**)
 
 ---
 
-## ☕ Thank you
+## License
 
-If SkySpotter has helped your workflow, a few things make a big difference:
+MIT — see [LICENSE](LICENSE).
 
-- **Share it** with photographer friends who shoot airshows or military aviation—more people trying the project helps it improve.
-- **Chip in** if you'd like to help fund my **RIAT tickets for next year**.
-- **Not an aviation photographer?** Try **[RAWviewer](https://github.com/markyip/RAWviewer)** for the same fast, local workflow with **semantic search** instead of aircraft recognition.
+## Contributing
 
-Enjoy organizing your airshow shots! 📸
+Pull requests welcome on [GitHub](https://github.com/markyip/SkySpotter).
+
+## Support
+
+1. Check [Troubleshooting](#troubleshooting) above  
+2. Search [existing issues](https://github.com/markyip/SkySpotter/issues)  
+3. Open a new issue with OS version, steps, and logs if possible  
+
+## ☕ Buy Me a Coffee
+
+If SkySpotter helps your workflow, you can [buy me a coffee](https://www.buymeacoffee.com/markyip) ☕
+
+---
+
+**Enjoy your photos.** 📸
