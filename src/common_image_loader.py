@@ -561,7 +561,7 @@ def is_tiff_file(file_path: str) -> bool:
             with Image.open(file_path) as test_img:
                 if test_img.format in ('TIFF', 'TIF'):
                     is_tiff = True
-        except:
+        except Exception:
             pass  # 不是 PIL 可讀文件或不是 TIFF
     
     return is_tiff
@@ -1495,7 +1495,7 @@ def get_image_aspect_ratio(file_path: str) -> float:
                 if h > 0:
                     return w / h
                 return 1.333
-        except:
+        except Exception:
              pass
 
     # 對於 TIFF 文件，使用 PIL
@@ -1506,7 +1506,7 @@ def get_image_aspect_ratio(file_path: str) -> float:
                 width, height = img.size
                 if height > 0:
                     return width / height
-        except:
+        except Exception:
             pass
     
     # 對於其他格式，嘗試 QImageReader（但不包括 RAW 和 TIFF）

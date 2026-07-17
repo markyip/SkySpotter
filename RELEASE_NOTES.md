@@ -53,6 +53,9 @@ It is built as a faster **browse / cull** release on top of 2.5: featuring **Fas
 - **Worker Pool Starvation**: Sidecar applies no longer starve the gallery thumbnail worker pool.
 - **Edit-base decoding**: Deduplicated concurrent edit-base decodes and fixed stale in-flight guards.
 - **Edit / load perf (post-3.0)**: Corrected-WB files stay on the fast EA edit-base path (no AHD fallback); unpack stash LRU; half-size edit-base cache; Adjust live-drag uses a 640px base + lite PV2012 (full quality on slider release); optional sidecar browse apply is progressive (preview interim then full).
+- **Adjust zoom vs lite preview (post-3.0)**: While Adjust is open, Fit may paint a 640px live-drag tier, but zooming to 100% restores the half-res settle buffer and does not queue a browse-path sensor decode; lite frames are not painted over a zoomed sharper buffer.
+- **Effects refinements (post-3.0)**: Vignette uses LR Amount sign + paint-overlay falloff with Midpoint; Chroma NR Amount slider; Dodge/Burn Effect Strength (stops) separate from Brush Flow; identity tone curves no longer block Reset.
+- **XMP presets (post-3.0)**: Managed `.xmp` library in Adjust (alongside Creative LUT).
 - **Tile EXIF parses**: Stopped unnecessary per-tile RAW EXIF parses during edited-preview delivery to improve speed.
 
 #### 🎨 Polish
@@ -66,7 +69,13 @@ It is built as a faster **browse / cull** release on top of 2.5: featuring **Fas
 - Lite runtime default: `RAWVIEWER_PREFER_GPU_DECODE=0`. Full (CUDA) still prefers GPU demosaic when the backend is present.
 
 #### 🎨 App icon
-- New darkroom flat icon: 2×2 gallery tiles + Adjust tone-curve tile (EMBER accent). Hi-res `icons/appicon.png` (2048²) for splash/README; platform `.icns`/`.ico` for the app; simplified `favicon.ico` for small sizes.
+- Aviation aperture + F-35 silhouette (transparent corners for README). Hi-res `icons/appicon.png` (2048²) for splash/README; platform `.icns`/`.ico` for the app; simplified `favicon.ico` for small sizes.
+
+#### ⚡ Nav / Adjust path speedups (upstream `b99a226`)
+- Avoid UI-thread disk thumbs and half→full cache pollution; cancel stale gallery/decode work.
+- Keep Dodge & Burn masks in-memory until save.
+- Regroup Detail into **Noise Reduction / Effects / Local**, with a clearer **Export** control.
+- WB dropper display-to-edit mapping fix; smooth-zoom full-decode retry after a refused queue; Adjust zoom / effects / presets hardening.
 
 ### Environment variables (new / notable)
 
@@ -82,6 +91,7 @@ It is built as a faster **browse / cull** release on top of 2.5: featuring **Fas
 1. Optional: run **`clear_cache`** once if tiles look stale after the cache version bump.
 2. Open a mix of ARW / CR3 / NEF (including HE\*): arrow through, zoom to 100%, confirm orientation.
 3. Rate with **1–5**, filter gallery by stars, confirm sidecars.
+4. Open Adjust (**E**): try WB presets, Crop (Transform), Dodge/Burn with Edge Assist, Vignette/Midpoint/Dehaze; after a Fit slider drag, double-click 100% and confirm status stays on the half-res settle size (not 640×427).
 
 ### ⚠️ Known Issues & Upcoming Features
 
