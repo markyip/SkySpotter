@@ -98,6 +98,7 @@ It is built as a faster **browse / cull** release on top of 2.5: featuring **Fas
 - **Known Issue (Unstable Live Preview Updates)**: In the gallery view and single-image non-RAW mode, edited thumbnails/single images can sometimes display the original unedited embedded version instead of the edited version. This occurs due to cache synchronization delays and worker-thread queue performance under heavy load.
 - **Known Issue (Unsupported RAW Formats for Editing)**: Nikon HE-NEF (High Efficiency) files cannot unpack the RAW image data, so SkySpotter can only show the embedded JPEG and they remain browse-only. The Adjust/Develop editing panel is disabled for these formats.
 - **Upcoming Feature (Real-Time Live Edit Synchronization)**: True real-time live updates of adjustments to gallery view tiles and single-image non-RAW previews is planned for a future update to ensure smooth and stable visual synchronization.
+- **Upcoming Feature (Local Masks — Brush / Gradient with Per-Mask Adjustments)**: A generalization of the Dodge & Burn mask into a list of local mask groups — painted brush, linear gradient, and radial gradient — each carrying its own subset of adjustments (Exposure, Temp/Tint, Contrast, Saturation, Clarity, Dehaze, Shadows/Highlights) applied as mask-weighted corrections, with inside/outside asymmetry via an invert toggle. Masks persist to XMP (gradients as parameters, brushes as bitmaps). Design draft: [`docs/LOCAL_MASKS_PLAN.md`](docs/LOCAL_MASKS_PLAN.md).
 
 ---
 
