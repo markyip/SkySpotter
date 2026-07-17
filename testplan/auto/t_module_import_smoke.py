@@ -28,7 +28,7 @@ if sys.platform != "win32":
 _SKIP_MODULES = frozenset(_SKIP_MODULES)
 
 # Packages whose submodules we walk.
-_PACKAGES = ("rawviewer_app", "rawviewer_ui")
+_PACKAGES = ("rawviewer_app", "SkySpotter_ui")
 
 
 def _module_name_from_path(py_path: Path, root: Path) -> str:
