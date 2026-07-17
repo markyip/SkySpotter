@@ -9,7 +9,6 @@ harder.
 from __future__ import annotations
 
 import os
-import time
 
 
 def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
@@ -55,15 +54,3 @@ def wheel_fast_gain() -> float:
 
 def trackpad_gain() -> float:
     return _env_float("RAWVIEWER_TRACKPAD_GAIN", 1.6, minimum=0.25)
-
-
-def wheel_notch_gain(now: float | None = None, last_notch_t: float = 0.0) -> tuple[float, float]:
-    """Return (gain, now_t) for a mouse-wheel notch; ramps toward fast gain on rapid spins."""
-    now_t = time.perf_counter() if now is None else float(now)
-    gain = wheel_base_gain()
-    dt_notch = now_t - last_notch_t if last_notch_t > 0.0 else 1.0
-    if dt_notch < 0.12:
-        # 0 at 120ms → 1 at ~30ms
-        speed = max(0.0, min(1.0, (0.12 - dt_notch) / 0.09))
-        gain *= 1.0 + (wheel_fast_gain() - 1.0) * speed
-    return gain, now_t

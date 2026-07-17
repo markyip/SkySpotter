@@ -2125,14 +2125,14 @@ def mlmultiarray_to_numpy_f32(multi_array: Any) -> Optional[np.ndarray]:
         if count <= 0:
             return np.zeros((0,), dtype=np.float32)
         dtype = int(multi_array.dataType())
-        # Apple MLMultiArrayDataType: Float16=16, Float32=65568, Double=65552
+        # Apple MLMultiArrayDataType: Float16=65552, Float32=65568, Double=65600
         if dtype == 65568:
             np_dtype: Any = np.float32
             itemsize = 4
-        elif dtype == 65552:
+        elif dtype == 65600:
             np_dtype = np.float64
             itemsize = 8
-        elif dtype == 16:
+        elif dtype == 65552:
             np_dtype = np.float16
             itemsize = 2
         else:
