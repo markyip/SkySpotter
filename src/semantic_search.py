@@ -1249,9 +1249,9 @@ def _load_index_source_image(
 
 @dataclass
 class SearchHit:
-    detected_aircraft: str = ""
     file_path: str
     score: float
+    detected_aircraft: str = ""
     file_name: str = ""
     capture_time: str = ""
     camera_model: str = ""
